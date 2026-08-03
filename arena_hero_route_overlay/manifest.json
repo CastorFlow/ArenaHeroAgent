@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Arena Hero Agent Route Overlay",
-  "version": "1.1.0",
-  "description": "Adjustable read-only Agent routes, unit labels, resources, and grid coordinates.",
+  "version": "1.2.0",
+  "description": "Agent routes, unit labels, resources, live status bar, stats panel, and mode/recall controls.",
   "minimum_chrome_version": "111",
   "permissions": [
     "storage"

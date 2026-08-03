@@ -95,6 +95,7 @@ def play(
     max_turns: int | None = None,
     memory_path: Path = Path(".arena_hero_memory.json"),
     telemetry_path: Path = Path("arena_hero_telemetry.jsonl"),
+    stats_path: Path = Path(".arena_hero_stats.json"),
 ) -> None:
     completed_turns = 0
     strategy = strategy_module
@@ -136,6 +137,7 @@ def play(
 
             completed_turns += 1
             memory.save(memory_path)
+            memory.write_stats(stats_path, turn)
             _append_telemetry(telemetry_path, summary, accepted=True)
             decision_text = " | ".join(summary.decisions[:8]) or "wait"
             print(
@@ -176,6 +178,11 @@ def main() -> int:
         type=Path,
         default=Path(os.environ.get("ARENA_HERO_TELEMETRY_FILE", "arena_hero_telemetry.jsonl")),
     )
+    parser.add_argument(
+        "--stats-file",
+        type=Path,
+        default=Path(os.environ.get("ARENA_HERO_STATS_FILE", ".arena_hero_stats.json")),
+    )
     args = parser.parse_args()
 
     if args.max_turns is not None and args.max_turns < 1:
@@ -189,6 +196,7 @@ def main() -> int:
             max_turns=args.max_turns,
             memory_path=args.memory_file,
             telemetry_path=args.telemetry_file,
+            stats_path=args.stats_file,
         )
     except KeyboardInterrupt:
         print("Stopped by user.", flush=True)

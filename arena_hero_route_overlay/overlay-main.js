@@ -14,6 +14,8 @@
     context: null,
     camera: null,
     payload: { version: 2, tick: 0, routes: [], units: [], resources: [] },
+    stats: null,
+    control: { mode: "develop", recall: false },
     settings: core.normalizeSettings({}),
     serviceOnline: false,
     pointer: null,
@@ -25,6 +27,13 @@
     settingsPanel: null,
     settingsOpen: false,
     settingInputs: new Map(),
+    statusBar: null,
+    modeButton: null,
+    recallButton: null,
+    statsButton: null,
+    statsPanel: null,
+    statsOpen: false,
+    statusElements: new Map(),
   };
 
   function arenaPageVisible() {
@@ -59,7 +68,7 @@
       width: "0",
       height: "0",
       pointerEvents: "none",
-      zIndex: "2147483000",
+      zIndex: "9000",
       display: "none",
     });
     document.documentElement.appendChild(canvas);
@@ -164,7 +173,7 @@
       display: "none",
       alignItems: "center",
       gap: "6px",
-      zIndex: "2147483002",
+      zIndex: "9500",
       pointerEvents: "auto",
     });
 
@@ -197,7 +206,7 @@
       color: "#d9e1eb",
       font: "12px system-ui, -apple-system, Segoe UI, sans-serif",
       boxShadow: "0 8px 28px rgba(0,0,0,0.42)",
-      zIndex: "2147483002",
+      zIndex: "9500",
       pointerEvents: "auto",
       userSelect: "none",
     });
@@ -247,7 +256,271 @@
     state.routeToggle = routeToggle;
     state.settingsButton = settingsButton;
     state.settingsPanel = panel;
+    createStatusBar();
+    createStatsPanel();
     syncControls();
+  }
+
+  function createStatusBar() {
+    if (state.statusBar || !document.documentElement) {
+      return;
+    }
+    const bar = controlContainer("div");
+    Object.assign(bar.style, {
+      position: "fixed",
+      display: "none",
+      alignItems: "center",
+      gap: "8px",
+      padding: "4px 10px",
+      border: "1px solid rgba(255,255,255,0.2)",
+      borderRadius: "7px",
+      background: "rgba(8,11,18,0.92)",
+      color: "#d9e1eb",
+      font: "600 12px system-ui, -apple-system, Segoe UI, sans-serif",
+      boxShadow: "0 2px 10px rgba(0,0,0,0.28)",
+      zIndex: "9500",
+      pointerEvents: "auto",
+      userSelect: "none",
+    });
+
+    const modeButton = document.createElement("button");
+    modeButton.type = "button";
+    applyButtonStyle(modeButton);
+    modeButton.title = "切换发展模式：发育（经济优先）/ 侵略（战斗优先）";
+    modeButton.addEventListener("click", () => {
+      const next = state.control.mode === "aggress" ? "develop" : "aggress";
+      window.postMessage(
+        { channel: CHANNEL, kind: "control:update", payload: { mode: next } },
+        "*",
+      );
+    });
+
+    const recallButton = document.createElement("button");
+    recallButton.type = "button";
+    applyButtonStyle(recallButton);
+    recallButton.title = "一键召回：所有游侠/先锋回核心防守（再点一次解除）";
+    recallButton.addEventListener("click", () => {
+      window.postMessage(
+        {
+          channel: CHANNEL,
+          kind: "control:update",
+          payload: { recall: !state.control.recall },
+        },
+        "*",
+      );
+    });
+
+    const makeStatus = (key, title) => {
+      const span = document.createElement("span");
+      span.title = title;
+      span.style.color = "#aeb9c6";
+      bar.appendChild(span);
+      state.statusElements.set(`bar:${key}`, span);
+      return span;
+    };
+
+    makeStatus("tick", "当前 Tick");
+    makeStatus("resources", "资源 / 容量");
+    makeStatus("population", "人口 工/先/游");
+    makeStatus("enemies", "可见敌人数量");
+    makeStatus("core", "核心 HP / 盾");
+    makeStatus("beacon", "信标状态");
+
+    const statsButton = document.createElement("button");
+    statsButton.type = "button";
+    statsButton.textContent = "📊 统计";
+    statsButton.title = "显示/隐藏统计面板";
+    applyButtonStyle(statsButton);
+    statsButton.addEventListener("click", () => {
+      state.statsOpen = !state.statsOpen;
+      syncControls();
+    });
+
+    bar.append(modeButton, recallButton);
+    bar.appendChild(statsButton);
+
+    document.documentElement.appendChild(bar);
+    state.statusBar = bar;
+    state.modeButton = modeButton;
+    state.recallButton = recallButton;
+    state.statsButton = statsButton;
+    syncControls();
+  }
+
+  function createStatsPanel() {
+    if (state.statsPanel || !document.documentElement) {
+      return;
+    }
+    const panel = controlContainer("div");
+    Object.assign(panel.style, {
+      position: "fixed",
+      display: "none",
+      width: "340px",
+      maxHeight: "72vh",
+      overflowY: "auto",
+      padding: "10px 12px 12px",
+      border: "1px solid rgba(255,255,255,0.2)",
+      borderRadius: "9px",
+      background: "rgba(8,11,18,0.96)",
+      color: "#d9e1eb",
+      font: "12px system-ui, -apple-system, Segoe UI, sans-serif",
+      boxShadow: "0 8px 28px rgba(0,0,0,0.42)",
+      zIndex: "9500",
+      pointerEvents: "auto",
+      userSelect: "none",
+    });
+
+    const header = document.createElement("div");
+    Object.assign(header.style, {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      marginBottom: "8px",
+    });
+    const title = document.createElement("span");
+    title.textContent = "战况统计";
+    Object.assign(title.style, { fontWeight: "700", fontSize: "13px" });
+    const close = document.createElement("button");
+    close.type = "button";
+    close.textContent = "✕";
+    close.title = "关闭统计面板";
+    applyButtonStyle(close);
+    Object.assign(close.style, {
+      height: "24px",
+      lineHeight: "22px",
+      padding: "0 8px",
+    });
+    close.addEventListener("click", () => {
+      state.statsOpen = false;
+      syncControls();
+    });
+    header.append(title, close);
+    panel.appendChild(header);
+
+    const sections = [
+      {
+        heading: "实时快照",
+        rows: [
+          ["tick", "Tick"],
+          ["mode", "模式"],
+          ["recall", "召回状态"],
+          ["resources", "资源 / 容量"],
+          ["population", "人口 (工/先/游)"],
+          ["core", "核心 HP / 盾"],
+          ["visible_enemies", "可见敌人"],
+          ["owns_beacon", "持有信标"],
+        ],
+      },
+      {
+        heading: "累计统计",
+        rows: [
+          ["total_resources_harvested", "累计采集资源"],
+          ["total_resources_deposited", "累计提交资源"],
+          ["total_resources_captured", "掠夺敌人资源"],
+          ["enemy_cores_destroyed", "摧毁敌方核心"],
+          ["units_built", "单位建造数"],
+          ["units_lost", "单位损失数"],
+          ["harvest_count", "采集次数"],
+          ["deposit_count", "提交次数"],
+          ["shoot_count", "射击次数"],
+          ["core_events", "核心事件数"],
+          ["up_time", "存活回合数"],
+        ],
+      },
+    ];
+
+    for (const section of sections) {
+      const heading = document.createElement("div");
+      heading.textContent = section.heading;
+      Object.assign(heading.style, {
+        fontWeight: "700",
+        fontSize: "12px",
+        color: "#8fbbae",
+        margin: "8px 0 4px",
+      });
+      panel.appendChild(heading);
+      for (const [key, label] of section.rows) {
+        const row = document.createElement("div");
+        Object.assign(row.style, {
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          minHeight: "22px",
+          borderBottom: "1px solid rgba(255,255,255,0.06)",
+        });
+        const name = document.createElement("span");
+        name.textContent = label;
+        name.style.color = "#aeb9c6";
+        const value = document.createElement("span");
+        value.style.fontFamily = "ui-monospace, SFMono-Regular, Consolas, monospace";
+        value.style.color = "#eef2f7";
+        value.textContent = "-";
+        row.append(name, value);
+        panel.appendChild(row);
+        state.statusElements.set(`stats:${key}`, value);
+      }
+    }
+
+    document.documentElement.appendChild(panel);
+    state.statsPanel = panel;
+    syncControls();
+  }
+
+  function renderStatusBar() {
+    const stats = state.stats;
+    const setText = (key, text) => {
+      const element = state.statusElements.get(key);
+      if (element) {
+        element.textContent = text;
+      }
+    };
+    if (!stats) {
+      setText("bar:tick", "Tick -");
+      setText("bar:resources", "资源 -");
+      setText("bar:population", "人口 -");
+      setText("bar:enemies", "敌 -");
+      setText("bar:core", "HP -");
+      setText("bar:beacon", "信标 -");
+      return;
+    }
+    const mode = stats.mode === "aggress" ? "侵略" : "发育";
+    setText("bar:tick", `Tick ${stats.tick}`);
+    setText("bar:resources", `资源 ${stats.resources}/${stats.capacity}`);
+    setText(
+      "bar:population",
+      `人口 ${stats.workers}/${stats.vanguards}/${stats.rangers}`,
+    );
+    setText("bar:enemies", `敌 ${stats.visible_enemies}`);
+    setText("bar:core", `HP ${stats.core_hp}/${stats.core_shield}`);
+    setText("bar:beacon", stats.owns_beacon ? "信标✓" : "信标✗");
+
+    const pairs = {
+      "stats:tick": String(stats.tick),
+      "stats:mode": mode,
+      "stats:recall": state.control.recall ? "已召回" : "正常",
+      "stats:resources": `${stats.resources}/${stats.capacity}`,
+      "stats:population": `${stats.workers}/${stats.vanguards}/${stats.rangers}`,
+      "stats:core": `${stats.core_hp}/${stats.core_shield}`,
+      "stats:visible_enemies": String(stats.visible_enemies),
+      "stats:owns_beacon": stats.owns_beacon ? "是" : "否",
+      "stats:total_resources_harvested": String(stats.total_resources_harvested),
+      "stats:total_resources_deposited": String(stats.total_resources_deposited),
+      "stats:total_resources_captured": String(stats.total_resources_captured),
+      "stats:enemy_cores_destroyed": String(stats.enemy_cores_destroyed),
+      "stats:units_built": String(stats.units_built),
+      "stats:units_lost": String(stats.units_lost),
+      "stats:harvest_count": String(stats.harvest_count),
+      "stats:deposit_count": String(stats.deposit_count),
+      "stats:shoot_count": String(stats.shoot_count),
+      "stats:core_events": String(stats.core_events),
+      "stats:up_time": String(stats.up_time),
+    };
+    for (const [key, text] of Object.entries(pairs)) {
+      const element = state.statusElements.get(key);
+      if (element) {
+        element.textContent = text;
+      }
+    }
   }
 
   function updateSettings(update) {
@@ -275,6 +548,19 @@
     if (state.settingsPanel) {
       state.settingsPanel.style.display = state.settingsOpen ? "block" : "none";
     }
+    if (state.modeButton) {
+      const mode = state.control.mode;
+      state.modeButton.textContent = mode === "aggress" ? "⚔ 侵略" : "🌱 发育";
+      state.modeButton.style.color = mode === "aggress" ? "#d98a7a" : "#9bcbbd";
+    }
+    if (state.recallButton) {
+      const recall = state.control.recall;
+      state.recallButton.textContent = recall ? "🛡 召回中" : "一键召回";
+      state.recallButton.style.color = recall ? "#e0b25c" : "#8f9cad";
+    }
+    if (state.statsPanel) {
+      state.statsPanel.style.display = state.statsOpen ? "block" : "none";
+    }
     for (const [key, binding] of state.settingInputs) {
       const value = state.settings[key];
       if (binding.kind === "checkbox") {
@@ -295,10 +581,16 @@
     if (state.settingsPanel) {
       state.settingsPanel.style.display = visible && state.settingsOpen ? "block" : "none";
     }
+    if (state.statusBar) {
+      state.statusBar.style.display = visible ? "flex" : "none";
+    }
+    if (state.statsPanel) {
+      state.statsPanel.style.display = visible && state.statsOpen ? "block" : "none";
+    }
   }
 
   function positionControls(rect) {
-    if (!state.toolbar || !state.settingsPanel) {
+    if (!state.toolbar || !state.settingsPanel || !state.statusBar) {
       return;
     }
     const left = Math.max(8, rect.left + 10);
@@ -307,6 +599,17 @@
     state.toolbar.style.top = `${top}px`;
     state.settingsPanel.style.left = `${left}px`;
     state.settingsPanel.style.top = `${top + 37}px`;
+    // 状态栏放在右上角
+    const statusBarWidth = 600;
+    const barLeft = Math.max(8, rect.right - statusBarWidth - 10);
+    state.statusBar.style.left = `${barLeft}px`;
+    state.statusBar.style.top = `${Math.max(8, rect.top + 10)}px`;
+    // 统计面板紧跟状态栏下方
+    const panelLeft = Math.max(8, rect.right - 360 - 10);
+    if (state.statsPanel) {
+      state.statsPanel.style.left = `${panelLeft}px`;
+      state.statsPanel.style.top = `${Math.max(8, rect.top + 46)}px`;
+    }
   }
 
   function findMapCanvas(now) {
@@ -734,6 +1037,7 @@
     const hover = hoverCell(rect);
     drawHover(state.context, rect, hover);
     drawHud(state.context, rect, hover);
+    renderStatusBar();
     requestAnimationFrame(render);
   }
 
@@ -746,6 +1050,16 @@
       }
       if (message.kind === "routes" && message.payload && typeof message.payload === "object") {
         state.payload = message.payload;
+      } else if (message.kind === "stats" && message.payload && typeof message.payload === "object") {
+        state.stats = message.payload;
+        renderStatusBar();
+      } else if (message.kind === "control" && message.payload && typeof message.payload === "object") {
+        state.control = {
+          mode: message.payload.mode === "aggress" ? "aggress" : "develop",
+          recall: Boolean(message.payload.recall),
+        };
+        syncControls();
+        renderStatusBar();
       } else if (message.kind === "status") {
         state.serviceOnline = Boolean(message.payload && message.payload.online);
       } else if (message.kind === "settings") {

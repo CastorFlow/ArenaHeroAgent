@@ -17,6 +17,34 @@ EMPTY_ROUTES = {
     "units": [],
     "resources": [],
 }
+EMPTY_STATS = {
+    "tick": 0,
+    "mode": "develop",
+    "recall": False,
+    "resources": 0,
+    "capacity": 0,
+    "population": 0,
+    "workers": 0,
+    "vanguards": 0,
+    "rangers": 0,
+    "core_hp": 0,
+    "core_shield": 0,
+    "visible_enemies": 0,
+    "owns_beacon": False,
+    "ticks_since_last_tick": 0,
+    "total_resources_harvested": 0,
+    "total_resources_deposited": 0,
+    "total_resources_captured": 0,
+    "enemy_cores_destroyed": 0,
+    "up_time": 0,
+    "units_lost": 0,
+    "units_built": 0,
+    "core_events": 0,
+    "harvest_count": 0,
+    "deposit_count": 0,
+    "shoot_count": 0,
+}
+VALID_MODES = {"develop", "aggress"}
 
 
 def _position(value: Any) -> list[int] | None:
@@ -129,12 +157,58 @@ def load_routes(path: Path) -> dict[str, Any]:
         return dict(EMPTY_ROUTES)
 
 
+def load_stats(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return dict(EMPTY_STATS)
+        return data
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return dict(EMPTY_STATS)
+
+
+def load_control(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {"mode": "develop", "recall": False}
+        mode = data.get("mode", "develop")
+        if mode not in VALID_MODES:
+            mode = "develop"
+        recall = data.get("recall", False)
+        return {"mode": mode, "recall": bool(recall)}
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {"mode": "develop", "recall": False}
+
+
+def save_control(path: Path, mode: str, recall: bool) -> dict[str, Any]:
+    if mode not in VALID_MODES:
+        raise ValueError(f"mode must be one of {sorted(VALID_MODES)}")
+    payload = {"mode": mode, "recall": bool(recall)}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+    return payload
+
+
 class RouteOverlayServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address: tuple[str, int], routes_path: Path) -> None:
+    def __init__(
+        self,
+        address: tuple[str, int],
+        routes_path: Path,
+        stats_path: Path,
+        control_path: Path,
+    ) -> None:
         self.routes_path = routes_path
+        self.stats_path = stats_path
+        self.control_path = control_path
         super().__init__(address, RouteOverlayHandler)
 
 
@@ -152,7 +226,7 @@ class RouteOverlayHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.end_headers()
         self.wfile.write(body)
 
@@ -164,12 +238,52 @@ class RouteOverlayHandler(BaseHTTPRequestHandler):
         if endpoint == "/routes":
             self._send_json(load_routes(self.server.routes_path), HTTPStatus.OK)
             return
+        if endpoint == "/stats":
+            self._send_json(load_stats(self.server.stats_path), HTTPStatus.OK)
+            return
+        if endpoint == "/control":
+            self._send_json(
+                load_control(self.server.control_path),
+                HTTPStatus.OK,
+            )
+            return
         self._send_json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
+
+    def do_POST(self) -> None:
+        endpoint = self.path.partition("?")[0]
+        if endpoint != "/control":
+            self._send_json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if length > 4096:
+            self._send_json({"error": "payload_too_large"}, HTTPStatus.BAD_REQUEST)
+            return
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send_json({"error": "invalid_json"}, HTTPStatus.BAD_REQUEST)
+            return
+        if not isinstance(data, dict):
+            self._send_json({"error": "invalid_payload"}, HTTPStatus.BAD_REQUEST)
+            return
+        current = load_control(self.server.control_path)
+        mode = data.get("mode", current["mode"])
+        recall = data.get("recall", current["recall"])
+        try:
+            payload = save_control(self.server.control_path, mode, recall)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        self._send_json(payload, HTTPStatus.OK)
 
     def do_OPTIONS(self) -> None:
         self.send_response(HTTPStatus.NO_CONTENT)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
@@ -180,9 +294,16 @@ class RouteOverlayHandler(BaseHTTPRequestHandler):
 def create_server(
     routes_path: Path,
     *,
+    stats_path: Path | None = None,
+    control_path: Path | None = None,
     port: int = DEFAULT_PORT,
 ) -> RouteOverlayServer:
-    return RouteOverlayServer((LOOPBACK_HOST, port), routes_path.resolve())
+    return RouteOverlayServer(
+        (LOOPBACK_HOST, port),
+        routes_path.resolve(),
+        (stats_path or routes_path.with_name(".arena_hero_stats.json")).resolve(),
+        (control_path or routes_path.with_name(".arena_hero_control.json")).resolve(),
+    )
 
 
 def main() -> int:
@@ -192,12 +313,27 @@ def main() -> int:
         type=Path,
         default=Path(".arena_hero_routes.json"),
     )
+    parser.add_argument(
+        "--stats-file",
+        type=Path,
+        default=Path(".arena_hero_stats.json"),
+    )
+    parser.add_argument(
+        "--control-file",
+        type=Path,
+        default=Path(".arena_hero_control.json"),
+    )
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
 
-    server = create_server(args.routes_file, port=args.port)
+    server = create_server(
+        args.routes_file,
+        stats_path=args.stats_file,
+        control_path=args.control_file,
+        port=args.port,
+    )
     print(
         f"Arena Hero route overlay listening on http://{LOOPBACK_HOST}:{args.port}",
         flush=True,

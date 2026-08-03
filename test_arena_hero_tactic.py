@@ -36,6 +36,8 @@ from arena_hero import (
 
 from arena_hero_tactic import choose_actions
 from arena_hero_strategy import (
+    MODE_AGGRESS,
+    MODE_DEVELOP,
     PlannedMove,
     ROUTES_FILENAME,
     SmartTactic,
@@ -1603,6 +1605,213 @@ class BalancedTacticTests(unittest.TestCase):
                 for item in summary.decisions
             )
         )
+
+
+class ModeAndRecallTests(unittest.TestCase):
+    """发育/侵略双模式 + 一键召回 + stats 写入。"""
+
+    def _write_control(
+        self,
+        path: Path,
+        *,
+        mode: str | None = None,
+        recall: bool | None = None,
+    ) -> None:
+        data: dict = {}
+        if mode is not None:
+            data["mode"] = mode
+        if recall is not None:
+            data["recall"] = recall
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+    def test_aggress_mode_spawns_rangers_over_workers(self) -> None:
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            self._write_control(control_path, mode="aggress")
+            turn, _ = make_turn(
+                own_core=core((0, 0)),
+                units=(
+                    worker(WORKER_LOW, (6, 0)),
+                    worker(WORKER_HIGH, (7, 0)),
+                    worker(WORKER_THIRD, (8, 0)),
+                    worker(WORKER_FOURTH, (9, 0)),
+                    vanguard((3, 3)),
+                    vanguard((4, 3), VANGUARD_TWO_ID),
+                    ranger((3, 4)),
+                    ranger((4, 4), RANGER_TWO_ID),
+                ),
+                resources=30,
+            )
+            SmartTactic(TacticMemory(), control_path=control_path).choose_actions(turn)
+
+            self.assertIsInstance(turn.plan.core_action, SpawnAction)
+            self.assertEqual(turn.plan.core_action.unit_type, UnitType.RANGER)
+
+    def test_develop_mode_prioritizes_workers(self) -> None:
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            self._write_control(control_path, mode="develop")
+            turn, _ = make_turn(
+                own_core=core((0, 0)),
+                units=(
+                    worker(WORKER_LOW, (6, 0)),
+                    worker(WORKER_HIGH, (7, 0)),
+                    worker(WORKER_THIRD, (8, 0)),
+                    worker(WORKER_FOURTH, (9, 0)),
+                    vanguard((3, 3)),
+                    vanguard((4, 3), VANGUARD_TWO_ID),
+                    ranger((3, 4)),
+                    ranger((4, 4), RANGER_TWO_ID),
+                ),
+                resources=30,
+            )
+            SmartTactic(TacticMemory(), control_path=control_path).choose_actions(turn)
+
+            self.assertIsInstance(turn.plan.core_action, SpawnAction)
+            self.assertEqual(turn.plan.core_action.unit_type, UnitType.WORKER)
+
+    def test_aggress_vanguard_advances_toward_beacon_when_no_enemies(self) -> None:
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            self._write_control(control_path, mode="aggress")
+            turn, _ = make_turn(
+                own_core=core((5, 5)),
+                units=(vanguard((10, 10)),),
+            )
+            SmartTactic(TacticMemory(), control_path=control_path).choose_actions(turn)
+
+            action = turn.plan.unit_actions.get(VANGUARD_ID)
+            self.assertIsInstance(action, MoveAction)
+
+    def test_aggress_ranger_advances_toward_beacon_when_no_enemies(self) -> None:
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            self._write_control(control_path, mode="aggress")
+            turn, _ = make_turn(
+                own_core=core((5, 5)),
+                units=(ranger((10, 10)),),
+            )
+            SmartTactic(TacticMemory(), control_path=control_path).choose_actions(turn)
+
+            action = turn.plan.unit_actions.get(RANGER_ID)
+            self.assertIsInstance(action, MoveAction)
+
+    def test_recall_vanguards_return_to_core(self) -> None:
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            self._write_control(control_path, recall=True)
+            turn, _ = make_turn(
+                own_core=core((5, 5)),
+                units=(vanguard((20, 20)), ranger((21, 21))),
+            )
+            SmartTactic(TacticMemory(), control_path=control_path).choose_actions(turn)
+
+            action = turn.plan.unit_actions.get(VANGUARD_ID)
+            self.assertIsInstance(action, MoveAction)
+
+    def test_recall_rangers_return_to_patrol(self) -> None:
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            self._write_control(control_path, recall=True)
+            turn, _ = make_turn(
+                own_core=core((5, 5)),
+                units=(ranger((21, 21)),),
+            )
+            SmartTactic(TacticMemory(), control_path=control_path).choose_actions(turn)
+
+            action = turn.plan.unit_actions.get(RANGER_ID)
+            self.assertIsInstance(action, MoveAction)
+
+    def test_recall_production_prefers_defense(self) -> None:
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            self._write_control(control_path, recall=True)
+            turn, _ = make_turn(
+                own_core=core((0, 0)),
+                units=(
+                    worker(WORKER_LOW, (6, 0)),
+                    worker(WORKER_HIGH, (7, 0)),
+                    worker(WORKER_THIRD, (8, 0)),
+                    worker(WORKER_FOURTH, (9, 0)),
+                    worker(WORKER_FIFTH, (10, 0)),
+                    worker(WORKER_SIXTH, (11, 0)),
+                ),
+                resources=30,
+            )
+            SmartTactic(TacticMemory(), control_path=control_path).choose_actions(turn)
+
+            self.assertIsInstance(turn.plan.core_action, SpawnAction)
+            self.assertEqual(turn.plan.core_action.unit_type, UnitType.VANGUARD)
+
+    def test_load_control_absent_keeps_default(self) -> None:
+        memory = TacticMemory()
+        memory.load_control(Path("/nonexistent/control.json"))
+        self.assertEqual(memory.mode, MODE_DEVELOP)
+        self.assertFalse(memory.recall)
+
+    def test_load_control_switches_mode_and_recall(self) -> None:
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            self._write_control(control_path, mode="aggress", recall=True)
+            memory = TacticMemory()
+            memory.load_control(control_path)
+            self.assertEqual(memory.mode, MODE_AGGRESS)
+            self.assertTrue(memory.recall)
+
+    def test_write_stats_round_trip(self) -> None:
+        memory = TacticMemory()
+        turn, _ = make_turn(
+            own_core=core((5, 5)),
+            units=(worker(WORKER_LOW, (6, 5)),),
+            resources=3,
+        )
+        with TemporaryDirectory() as directory:
+            stats_path = Path(directory) / "stats.json"
+            memory.write_stats(stats_path, turn)
+            payload = json.loads(stats_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["tick"], turn.tick)
+        self.assertEqual(payload["workers"], 1)
+        self.assertEqual(payload["vanguards"], 0)
+        self.assertEqual(payload["rangers"], 0)
+        self.assertEqual(payload["resources"], 3)
+        self.assertEqual(payload["mode"], MODE_DEVELOP)
+        self.assertFalse(payload["recall"])
+        self.assertIn("total_resources_harvested", payload)
+        self.assertIn("enemy_cores_destroyed", payload)
+
+    def test_write_stats_records_cumulative_resources(self) -> None:
+        memory = TacticMemory()
+        harvest = ResolutionEvent(
+            event_id=UUID("00000000-0000-4000-8000-000000000301"),
+            tick=8,
+            event_type="HARVEST_SUCCEEDED",
+            actor_id=WORKER_LOW,
+            position=(6, 5),
+            values={"amount": 2, "source": "RESOURCE_NODE"},
+        )
+        deposit = ResolutionEvent(
+            event_id=UUID("00000000-0000-4000-8000-000000000302"),
+            tick=9,
+            event_type="DEPOSIT_SUCCEEDED",
+            actor_id=WORKER_LOW,
+            values={"amount": 2},
+        )
+        turn, _ = make_turn(
+            tick=9,
+            own_core=core((5, 5)),
+            units=(worker(WORKER_LOW, (5, 5), cargo=2),),
+            resources=2,
+            events=(harvest, deposit),
+        )
+        memory.observe(turn)
+        with TemporaryDirectory() as directory:
+            stats_path = Path(directory) / "stats.json"
+            memory.write_stats(stats_path, turn)
+            payload = json.loads(stats_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["total_resources_harvested"], 2)
+        self.assertEqual(payload["total_resources_deposited"], 2)
 
 
 if __name__ == "__main__":

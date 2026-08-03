@@ -29,7 +29,17 @@ Chunk = tuple[int, int]
 CHUNK_SIZE = 32
 ROUTES_FILENAME = ".arena_hero_routes.json"
 RECOVERY_TARGETS_FILENAME = ".arena_hero_recovery_targets.json"
+CONTROL_FILENAME = ".arena_hero_control.json"
+STATS_FILENAME = ".arena_hero_stats.json"
 ROUTE_OVERLAY_VERSION = 2
+
+MODE_DEVELOP = "develop"
+MODE_AGGRESS = "aggress"
+MODE_VALUES = {MODE_DEVELOP, MODE_AGGRESS}
+# 侵略模式：战斗单位优先，工人仅保底经济
+AGGRESS_BASE_WORKERS = 4
+AGGRESS_TARGET_VANGUARDS = 3
+AGGRESS_TARGET_RANGERS = 6
 CORE_VISION_RADIUS = 5
 UNIT_VISION_RADIUS = {
     UnitType.WORKER: 3,
@@ -147,6 +157,13 @@ class TacticMemory:
     core_heading: Direction | None = None
     last_core_move_tick: int = 0
     last_tick: int = 0
+    mode: str = MODE_DEVELOP
+    recall: bool = False
+    control_mtime: int = 0
+    total_resources_harvested: int = 0
+    total_resources_deposited: int = 0
+    total_resources_captured: int = 0
+    enemy_cores_destroyed: int = 0
     current_routes: dict[str, PlannedRoute] = field(default_factory=dict, repr=False)
     current_units: dict[str, OverlayUnit] = field(default_factory=dict, repr=False)
     current_resource_cells: set[Position] = field(default_factory=set, repr=False)
@@ -247,6 +264,20 @@ class TacticMemory:
             memory.core_heading = Direction(heading) if heading is not None else None
             memory.last_core_move_tick = int(data.get("last_core_move_tick", 0))
             memory.last_tick = int(data.get("last_tick", 0))
+            memory.mode = data.get("mode", MODE_DEVELOP)
+            if memory.mode not in MODE_VALUES:
+                memory.mode = MODE_DEVELOP
+            memory.recall = bool(data.get("recall", False))
+            memory.total_resources_harvested = int(
+                data.get("total_resources_harvested", 0)
+            )
+            memory.total_resources_deposited = int(
+                data.get("total_resources_deposited", 0)
+            )
+            memory.total_resources_captured = int(
+                data.get("total_resources_captured", 0)
+            )
+            memory.enemy_cores_destroyed = int(data.get("enemy_cores_destroyed", 0))
             return memory
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             return cls()
@@ -308,6 +339,12 @@ class TacticMemory:
             ),
             "last_core_move_tick": self.last_core_move_tick,
             "last_tick": self.last_tick,
+            "mode": self.mode,
+            "recall": self.recall,
+            "total_resources_harvested": self.total_resources_harvested,
+            "total_resources_deposited": self.total_resources_deposited,
+            "total_resources_captured": self.total_resources_captured,
+            "enemy_cores_destroyed": self.enemy_cores_destroyed,
         }
         temporary = path.with_suffix(path.suffix + ".tmp")
         temporary.write_text(
@@ -469,6 +506,7 @@ class TacticMemory:
                     else "UNKNOWN"
                 )
                 amount = event.resource_amount or 0
+                self.total_resources_harvested += amount
                 self.observations.append(
                     f"harvest_result source={source} amount={amount} at={event.position}"
                 )
@@ -485,6 +523,10 @@ class TacticMemory:
                     self.worker_goals.pop(actor_key, None)
             elif event.event_type == "DEPOSIT_SUCCEEDED" and actor_key is not None:
                 self.worker_goals.pop(actor_key, None)
+                self.total_resources_deposited += event.resource_amount or 0
+            elif event.event_type == "CORE_RESOURCES_CAPTURED":
+                self.total_resources_captured += event.resource_amount or 0
+                self.enemy_cores_destroyed += 1
 
         self.known_obstacles.update(turn.obstacle_cells)
         for position in turn.resource_cells:
@@ -582,6 +624,69 @@ class TacticMemory:
         )
         self.decision_totals[f"resource_recovery:{reason}"] += 1
         return True
+
+    def load_control(self, path: Path) -> None:
+        try:
+            if not path.is_file():
+                return
+            mtime = path.stat().st_mtime_ns
+            if mtime == self.control_mtime:
+                return
+            data = json.loads(path.read_text(encoding="utf-8"))
+            mode = data.get("mode", self.mode)
+            if mode in MODE_VALUES:
+                self.mode = mode
+            self.recall = bool(data.get("recall", self.recall))
+            self.control_mtime = mtime
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+
+    def write_stats(self, path: Path, turn: Turn) -> None:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            duration = 0
+            if self.last_tick > 0:
+                duration = int(turn.tick - self.last_tick)
+            payload = {
+                "tick": turn.tick,
+                "mode": self.mode,
+                "recall": self.recall,
+                "resources": turn.resources,
+                "capacity": turn.resource_capacity,
+                "population": len(turn.units),
+                "workers": len(turn.workers),
+                "vanguards": len(turn.vanguards),
+                "rangers": len(turn.rangers),
+                "core_hp": turn.core.hp if turn.core else 0,
+                "core_shield": turn.core.shield if turn.core else 0,
+                "visible_enemies": len(turn.visible_enemies),
+                "owns_beacon": _owns_beacon(turn),
+                "ticks_since_last_tick": duration,
+                "total_resources_harvested": self.total_resources_harvested,
+                "total_resources_deposited": self.total_resources_deposited,
+                "total_resources_captured": self.total_resources_captured,
+                "enemy_cores_destroyed": self.enemy_cores_destroyed,
+                "up_time": self.event_totals.get("UP_TIME", 0),
+                "units_lost": self.event_totals.get("UNIT_LOST", 0),
+                "units_built": self.event_totals.get("UNIT_BUILT", 0),
+                "core_events": int(
+                    self.event_totals.get("CORE_RESOURCES_CAPTURED", 0)
+                    + self.event_totals.get("CORE_RESOURCE_OVERFLOW_DESTROYED", 0)
+                    + self.event_totals.get("CORE_MOVE_STARTED", 0)
+                    + self.event_totals.get("CORE_MOVE_CANCELLED", 0)
+                ),
+                "harvest_count": self.decision_totals.get("worker:harvest", 0),
+                "deposit_count": self.decision_totals.get("worker:deposit", 0),
+                "shoot_count": self.decision_totals.get("ranger:shoot", 0),
+            }
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            temporary.replace(path)
+        except OSError:
+            pass
 
 
 def _distance(left: Position, right: Position) -> int:
@@ -1010,10 +1115,17 @@ class MovementPlanner:
 
 
 class SmartTactic:
-    def __init__(self, memory: TacticMemory | None = None) -> None:
+    def __init__(
+        self,
+        memory: TacticMemory | None = None,
+        *,
+        control_path: Path | None = None,
+    ) -> None:
         self.memory = memory or TacticMemory()
+        self.control_path = control_path or Path(CONTROL_FILENAME)
 
     def choose_actions(self, turn: Turn) -> DecisionSummary:
+        self.memory.load_control(self.control_path)
         self.memory.observe(turn)
         previous_events = Counter(event.event_type for event in turn.events)
         decisions = list(self.memory.observations)
@@ -1870,6 +1982,159 @@ class SmartTactic:
         acted_units: set[UUID],
         decisions: list[str],
     ) -> None:
+        if self.memory.recall:
+            self._choose_vanguards_recall(turn, planner, acted_units, decisions)
+        elif self.memory.mode == MODE_AGGRESS:
+            self._choose_vanguards_aggress(turn, planner, acted_units, decisions)
+        else:
+            self._choose_vanguards_defend(turn, planner, acted_units, decisions)
+
+    def _sweep_targets(self, vanguard: Vanguard, turn: Turn) -> Direction | None:
+        sweep_options: list[tuple[int, int, Direction]] = []
+        for direction in DIRECTION_ORDER:
+            target_cell = _destination(vanguard.position, direction)
+            targets = [
+                enemy
+                for enemy in turn.visible_enemies
+                if enemy.position == target_cell
+            ]
+            if targets:
+                weight = sum(
+                    5 if isinstance(enemy, CoreView)
+                    else 3 if enemy.unit_type is UnitType.RANGER
+                    else 2 if enemy.unit_type is UnitType.VANGUARD
+                    else 1
+                    for enemy in targets
+                )
+                sweep_options.append((weight, len(targets), direction))
+        if not sweep_options:
+            return None
+        return max(
+            sweep_options,
+            key=lambda item: (item[0], item[1], -DIRECTION_RANK[item[2]]),
+        )[2]
+
+    def _pick_assault_target(self, turn: Turn) -> Position | None:
+        if not turn.visible_enemies:
+            return None
+        origin = turn.core.position if turn.core is not None else (0, 0)
+        cores = [enemy for enemy in turn.visible_enemies if isinstance(enemy, CoreView)]
+        if cores:
+            nearest = min(cores, key=lambda enemy: _distance(origin, enemy.position))
+            return nearest.position
+        nearest = min(
+            turn.visible_enemies,
+            key=lambda enemy: (
+                _enemy_role_priority(enemy),
+                _distance(origin, enemy.position),
+                enemy.id.bytes,
+            ),
+        )
+        return nearest.position
+
+    def _choose_vanguards_aggress(
+        self,
+        turn: Turn,
+        planner: MovementPlanner,
+        acted_units: set[UUID],
+        decisions: list[str],
+    ) -> None:
+        for vanguard in sorted(turn.vanguards, key=_uuid_key):
+            if vanguard.id in acted_units:
+                continue
+            direction = self._sweep_targets(vanguard, turn)
+            if direction is not None:
+                vanguard.sweep(direction)
+                decisions.append(
+                    f"vanguard:{_short_id(vanguard.id)} sweep {direction.value} reason=aggress"
+                )
+                self.memory.decision_totals["vanguard:sweep"] += 1
+                continue
+            if turn.core is not None:
+                # 家被摸：先救家再出击
+                threatening = [
+                    enemy
+                    for enemy in turn.visible_enemies
+                    if _distance(enemy.position, turn.core.position) <= 5
+                ]
+                if threatening:
+                    target = min(
+                        threatening,
+                        key=lambda enemy: (
+                            _enemy_role_priority(enemy),
+                            _distance(vanguard.position, enemy.position),
+                            enemy.id.bytes,
+                        ),
+                    )
+                    planner.toward(vanguard, target.position, "aggress_defend_core")
+                    continue
+            # 主动出击：优先敌人 Core，其次最近敌人
+            combat_target = self._pick_assault_target(turn)
+            if combat_target is not None:
+                planner.toward(vanguard, combat_target, "assault_enemy")
+                decisions.append(
+                    f"vanguard:{_short_id(vanguard.id)} assault target={combat_target}"
+                )
+                self.memory.decision_totals["vanguard:assault"] += 1
+                continue
+            # 无可见敌人：向信标方向推进开路
+            if (
+                turn.core is None
+                or _distance(vanguard.position, turn.core.position) > 1
+            ):
+                planner.toward(
+                    vanguard,
+                    turn.beacon.position,
+                    "aggress_advance_beacon",
+                )
+                self.memory.decision_totals["vanguard:advance"] += 1
+
+    def _choose_vanguards_recall(
+        self,
+        turn: Turn,
+        planner: MovementPlanner,
+        acted_units: set[UUID],
+        decisions: list[str],
+    ) -> None:
+        for vanguard in sorted(turn.vanguards, key=_uuid_key):
+            if vanguard.id in acted_units:
+                continue
+            direction = self._sweep_targets(vanguard, turn)
+            if direction is not None:
+                vanguard.sweep(direction)
+                decisions.append(
+                    f"vanguard:{_short_id(vanguard.id)} sweep {direction.value} reason=recall"
+                )
+                self.memory.decision_totals["vanguard:sweep"] += 1
+                continue
+            if turn.core is not None:
+                threatening = [
+                    enemy
+                    for enemy in turn.visible_enemies
+                    if _distance(enemy.position, turn.core.position) <= 8
+                ]
+                if threatening:
+                    target = min(
+                        threatening,
+                        key=lambda enemy: (
+                            _enemy_role_priority(enemy),
+                            _distance(vanguard.position, enemy.position),
+                            enemy.id.bytes,
+                        ),
+                    )
+                    planner.toward(vanguard, target.position, "recall_intercept")
+                    continue
+                if _distance(vanguard.position, turn.core.position) > 1:
+                    planner.toward(vanguard, turn.core.position, "recall_guard_core")
+                    self.memory.decision_totals["vanguard:recall"] += 1
+
+    def _choose_vanguards_defend(
+        self,
+        turn: Turn,
+        planner: MovementPlanner,
+        acted_units: set[UUID],
+        decisions: list[str],
+    ) -> None:
         for vanguard in sorted(turn.vanguards, key=_uuid_key):
             if vanguard.id in acted_units:
                 continue
@@ -1919,6 +2184,150 @@ class SmartTactic:
                     planner.toward(vanguard, turn.core.position, "guard_core")
 
     def _choose_rangers(
+        self,
+        turn: Turn,
+        planner: MovementPlanner,
+        acted_units: set[UUID],
+        decisions: list[str],
+    ) -> None:
+        if self.memory.recall:
+            self._choose_rangers_recall(turn, planner, acted_units, decisions)
+        elif self.memory.mode == MODE_AGGRESS:
+            self._choose_rangers_aggress(turn, planner, acted_units, decisions)
+        else:
+            self._choose_rangers_defend(turn, planner, acted_units, decisions)
+
+    def _choose_rangers_aggress(
+        self,
+        turn: Turn,
+        planner: MovementPlanner,
+        acted_units: set[UUID],
+        decisions: list[str],
+    ) -> None:
+        assigned_damage: Counter[UUID] = Counter()
+        for ranger in sorted(turn.rangers, key=_uuid_key):
+            if ranger.id in acted_units:
+                continue
+            legal_targets = [
+                enemy
+                for enemy in turn.visible_enemies
+                if _is_legal_ranger_shot(ranger.position, enemy.position, planner.obstacles)
+            ]
+            if legal_targets:
+                target = min(
+                    legal_targets,
+                    key=lambda enemy: (
+                        1 if assigned_damage[enemy.id] >= _effective_hp(enemy) else 0,
+                        0 if isinstance(enemy, CoreView) else 1,
+                        _enemy_role_priority(enemy),
+                        _effective_hp(enemy),
+                        _distance(ranger.position, enemy.position),
+                        enemy.id.bytes,
+                    ),
+                )
+                ranger.shoot(target)
+                assigned_damage[target.id] += 1
+                decisions.append(
+                    f"ranger:{_short_id(ranger.id)} shoot target={_short_id(target.id)} "
+                    f"expected={target.position} role=aggress"
+                )
+                self.memory.decision_totals["ranger:shoot"] += 1
+                continue
+            # 移动：向敌人（Core 优先）推进到射程内
+            combat_target = self._pick_assault_target(turn)
+            if combat_target is not None:
+                firing_cells = self._firing_cells(combat_target, planner.obstacles)
+                if firing_cells:
+                    firing_cell = min(
+                        firing_cells,
+                        key=lambda position: (
+                            planner.threat.get(position, 0),
+                            _distance(ranger.position, position),
+                            position,
+                        ),
+                    )
+                    planner.toward(ranger, firing_cell, "aggress_seek_firing")
+                else:
+                    planner.toward(ranger, combat_target, "aggress_approach")
+                self.memory.decision_totals["ranger:assault"] += 1
+                continue
+            # 无敌人：向信标方向推进
+            firing_cells = self._firing_cells(turn.beacon.position, planner.obstacles)
+            if firing_cells:
+                firing_cell = min(
+                    firing_cells,
+                    key=lambda position: (
+                        planner.threat.get(position, 0),
+                        _distance(ranger.position, position),
+                        position,
+                    ),
+                )
+                planner.toward(ranger, firing_cell, "aggress_advance_beacon")
+            else:
+                planner.toward(ranger, turn.beacon.position, "aggress_advance_beacon")
+            self.memory.decision_totals["ranger:advance"] += 1
+
+    def _choose_rangers_recall(
+        self,
+        turn: Turn,
+        planner: MovementPlanner,
+        acted_units: set[UUID],
+        decisions: list[str],
+    ) -> None:
+        assigned_damage: Counter[UUID] = Counter()
+        ordered_rangers = sorted(
+            turn.rangers,
+            key=lambda ranger: (
+                self.memory.unit_labels.get(
+                    str(ranger.id),
+                    UnitLabel(UnitType.RANGER.value, 1_000_000),
+                ).number,
+                ranger.id.bytes,
+            ),
+        )
+        patrol_rangers = ordered_rangers[: min(CORE_PATROL_RANGER_COUNT * 2, len(ordered_rangers))]
+        patrol_slots = self._core_patrol_slots(turn, planner, patrol_rangers)
+        for ranger in ordered_rangers:
+            if ranger.id in acted_units:
+                continue
+            legal_targets = [
+                enemy
+                for enemy in turn.visible_enemies
+                if _is_legal_ranger_shot(ranger.position, enemy.position, planner.obstacles)
+                and (
+                    turn.core is None
+                    or _distance(enemy.position, turn.core.position) <= 6
+                )
+            ]
+            if legal_targets:
+                target = min(
+                    legal_targets,
+                    key=lambda enemy: (
+                        1 if assigned_damage[enemy.id] >= _effective_hp(enemy) else 0,
+                        _enemy_role_priority(enemy),
+                        _effective_hp(enemy),
+                        _distance(ranger.position, enemy.position),
+                        enemy.id.bytes,
+                    ),
+                )
+                ranger.shoot(target)
+                assigned_damage[target.id] += 1
+                decisions.append(
+                    f"ranger:{_short_id(ranger.id)} shoot target={_short_id(target.id)} "
+                    f"expected={target.position} role=recall"
+                )
+                self.memory.decision_totals["ranger:shoot"] += 1
+                continue
+            patrol_slot = patrol_slots.get(ranger.id)
+            if patrol_slot is not None and ranger.position != patrol_slot:
+                if planner.toward(ranger, patrol_slot, "ranger_recall_patrol"):
+                    self.memory.decision_totals["ranger:recall"] += 1
+                    continue
+            if turn.core is not None and _distance(ranger.position, turn.core.position) > 2:
+                planner.toward(ranger, turn.core.position, "ranger_recall_core")
+                self.memory.decision_totals["ranger:recall"] += 1
+
+    def _choose_rangers_defend(
         self,
         turn: Turn,
         planner: MovementPlanner,
@@ -2190,56 +2599,90 @@ class SmartTactic:
             and len(turn.units) < 16
         )
 
+        mode = self.memory.mode
+        recall = self.memory.recall
+
         if can_spawn:
-            if workers < 3 and budget >= 5:
-                spawn = UnitType.WORKER
-            elif near_threat and vanguards < 2 and budget >= 10:
-                spawn = UnitType.VANGUARD
-            elif near_threat and rangers < 2 and budget >= 12:
-                spawn = UnitType.RANGER
-            elif workers < 5 and budget >= 5:
-                spawn = UnitType.WORKER
-            elif rangers < 2 and budget >= 12:
-                spawn = UnitType.RANGER
-            elif vanguards < 1 and budget >= 10:
-                spawn = UnitType.VANGUARD
-            elif workers < 6 and budget >= 5:
-                spawn = UnitType.WORKER
-            elif (
-                rangers < 3
-                and budget >= 12
-                and (
-                    not near_threat
-                    or projected_resources - 12 >= DEFENSE_REPLACEMENT_RESERVE
-                )
-            ):
-                spawn = UnitType.RANGER
-            elif (
-                vanguards < 3
-                and budget >= 10
-                and projected_resources - 10 >= DEFENSE_REPLACEMENT_RESERVE
-            ):
-                spawn = UnitType.VANGUARD
-            elif (
-                workers < 8
-                and not near_threat
-                and budget >= 5
-                and projected_resources - 5 >= DEFENSE_REPLACEMENT_RESERVE
-            ):
-                spawn = UnitType.WORKER
-            elif (
-                rangers < 4
-                and budget >= 12
-                and projected_resources - 12 >= DEFENSE_REPLACEMENT_RESERVE
-            ):
-                spawn = UnitType.RANGER
-            elif (
-                vanguards < 4
-                and rangers >= 4
-                and budget >= 10
-                and projected_resources - 10 >= DEFENSE_REPLACEMENT_RESERVE
-            ):
-                spawn = UnitType.VANGUARD
+            if recall:
+                # 召回模式：全力补防御
+                if vanguards < 2 and budget >= 10:
+                    spawn = UnitType.VANGUARD
+                elif rangers < 3 and budget >= 12:
+                    spawn = UnitType.RANGER
+                elif workers < AGGRESS_BASE_WORKERS and budget >= 5:
+                    spawn = UnitType.WORKER
+            elif mode == MODE_DEVELOP:
+                # 发育模式：经济优先，战斗单位仅保底防御（保留 reserve 原则）
+                if workers < 3 and budget >= 5:
+                    spawn = UnitType.WORKER
+                elif near_threat and vanguards < 2 and budget >= 10:
+                    spawn = UnitType.VANGUARD
+                elif near_threat and rangers < 2 and budget >= 12:
+                    spawn = UnitType.RANGER
+                elif workers < 5 and budget >= 5:
+                    spawn = UnitType.WORKER
+                elif rangers < 2 and budget >= 12:
+                    spawn = UnitType.RANGER
+                elif vanguards < 1 and budget >= 10:
+                    spawn = UnitType.VANGUARD
+                elif workers < 6 and budget >= 5:
+                    spawn = UnitType.WORKER
+                elif (
+                    rangers < 3
+                    and budget >= 12
+                    and (
+                        not near_threat
+                        or projected_resources - 12 >= DEFENSE_REPLACEMENT_RESERVE
+                    )
+                ):
+                    spawn = UnitType.RANGER
+                elif (
+                    vanguards < 3
+                    and budget >= 10
+                    and projected_resources - 10 >= DEFENSE_REPLACEMENT_RESERVE
+                ):
+                    spawn = UnitType.VANGUARD
+                elif (
+                    workers < 8
+                    and not near_threat
+                    and budget >= 5
+                    and projected_resources - 5 >= DEFENSE_REPLACEMENT_RESERVE
+                ):
+                    spawn = UnitType.WORKER
+                elif (
+                    rangers < 4
+                    and budget >= 12
+                    and projected_resources - 12 >= DEFENSE_REPLACEMENT_RESERVE
+                ):
+                    spawn = UnitType.RANGER
+                elif (
+                    vanguards < 4
+                    and rangers >= 4
+                    and budget >= 10
+                    and projected_resources - 10 >= DEFENSE_REPLACEMENT_RESERVE
+                ):
+                    spawn = UnitType.VANGUARD
+            elif mode == MODE_AGGRESS:
+                # 侵略模式：战斗单位优先，工人仅保底经济
+                if workers < AGGRESS_BASE_WORKERS and budget >= 5:
+                    spawn = UnitType.WORKER
+                elif near_threat and vanguards < 1 and budget >= 10:
+                    spawn = UnitType.VANGUARD
+                elif rangers < AGGRESS_TARGET_RANGERS and budget >= 12:
+                    spawn = UnitType.RANGER
+                elif vanguards < AGGRESS_TARGET_VANGUARDS and budget >= 10:
+                    spawn = UnitType.VANGUARD
+                elif rangers < 8 and budget >= 12:
+                    spawn = UnitType.RANGER
+                elif vanguards < 5 and budget >= 10:
+                    spawn = UnitType.VANGUARD
+                elif (
+                    workers < 6
+                    and not near_threat
+                    and budget >= 5
+                    and projected_resources - 5 >= DEFENSE_REPLACEMENT_RESERVE
+                ):
+                    spawn = UnitType.WORKER
 
         if spawn is not None:
             core.spawn(spawn)

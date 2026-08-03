@@ -9,20 +9,33 @@
     window.postMessage({ channel: CHANNEL, kind, payload }, "*");
   }
 
+  function send(message, callback) {
+    chrome.runtime.sendMessage(message, (response) => {
+      const failed = Boolean(chrome.runtime.lastError) || !response || !response.ok;
+      callback(failed, response && response.payload);
+    });
+  }
+
   function poll() {
-    chrome.runtime.sendMessage(
-      { type: "ARENA_HERO_OVERLAY_GET_ROUTES" },
-      (response) => {
-        const failed = Boolean(chrome.runtime.lastError) || !response || !response.ok;
-        if (failed) {
-          publish("status", { online: false });
-        } else {
-          publish("routes", response.payload);
-          publish("status", { online: true });
-        }
-        window.setTimeout(poll, POLL_INTERVAL_MS);
-      },
-    );
+    send({ type: "ARENA_HERO_OVERLAY_GET_ROUTES" }, (failed, payload) => {
+      if (failed) {
+        publish("status", { online: false });
+      } else {
+        publish("routes", payload);
+        publish("status", { online: true });
+      }
+    });
+    send({ type: "ARENA_HERO_OVERLAY_GET_STATS" }, (failed, payload) => {
+      if (!failed) {
+        publish("stats", payload);
+      }
+    });
+    send({ type: "ARENA_HERO_OVERLAY_GET_CONTROL" }, (failed, payload) => {
+      if (!failed) {
+        publish("control", payload);
+      }
+    });
+    window.setTimeout(poll, POLL_INTERVAL_MS);
   }
 
   function loadSettings() {
@@ -35,19 +48,46 @@
     });
   }
 
+  function handleControlUpdate(message) {
+    if (
+      !message.payload ||
+      typeof message.payload !== "object" ||
+      message.kind !== "control:update"
+    ) {
+      return;
+    }
+    send(
+      {
+        type: "ARENA_HERO_OVERLAY_SET_CONTROL",
+        update: {
+          mode: message.payload.mode,
+          recall: message.payload.recall,
+        },
+      },
+      (failed, payload) => {
+        if (!failed && payload) {
+          publish("control", payload);
+        }
+      },
+    );
+  }
+
   window.addEventListener("message", (event) => {
     const message = event.data;
     if (
       event.source !== window ||
       !message ||
       message.channel !== CHANNEL ||
-      message.kind !== "settings:update" ||
       !message.payload ||
       typeof message.payload !== "object"
     ) {
       return;
     }
-    chrome.storage.local.set({ [SETTINGS_KEY]: message.payload });
+    if (message.kind === "settings:update") {
+      chrome.storage.local.set({ [SETTINGS_KEY]: message.payload });
+    } else if (message.kind === "control:update") {
+      handleControlUpdate(message);
+    }
   });
 
   chrome.storage.onChanged.addListener((changes, areaName) => {
