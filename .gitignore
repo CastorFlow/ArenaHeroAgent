@@ -9,3 +9,5 @@ arena_hero_telemetry.jsonl
 .arena_hero_recovery_targets.json
 .arena_hero_stats.json
 .arena_hero_control.json
+
+*.tmp
