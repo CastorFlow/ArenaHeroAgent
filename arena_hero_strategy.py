@@ -51,6 +51,10 @@ MAX_POPULATION = 19
 CORE_MIGRATION_ENABLED = False
 # 发育探索半径封顶：资源 4 tick 刷新，守点循环采集优于长途探索
 DEVELOP_WIDE_SEARCH_MAX_RADIUS = 24
+# 卡住判定：单位连续这么多 tick 位置未变化且仍有移动目标 → 视为迷路
+STUCK_TICKS = 16
+# 单位满血值
+MAX_HP = {UnitType.WORKER: 2, UnitType.VANGUARD: 4, UnitType.RANGER: 2}
 AGGRESS_DEFENDER_VANGUARDS = 1
 AGGRESS_DEFENDER_RANGERS = 1
 ASSAULT_SIGHTING_MAX_AGE = 20
@@ -196,6 +200,10 @@ class TacticMemory:
     current_units: dict[str, OverlayUnit] = field(default_factory=dict, repr=False)
     current_resource_cells: set[Position] = field(default_factory=set, repr=False)
     observations: list[str] = field(default_factory=list, repr=False)
+    unit_positions: dict[str, Position] = field(default_factory=dict, repr=False)
+    last_position_tick: dict[str, int] = field(default_factory=dict, repr=False)
+    enemy_positions: dict[str, Position] = field(default_factory=dict, repr=False)
+    enemy_prev: dict[str, Position] = field(default_factory=dict, repr=False)
 
     @classmethod
     def load(cls, path: Path) -> TacticMemory:
@@ -682,6 +690,31 @@ class TacticMemory:
         }
         if len(self.visited) > 10_000:
             self.visited = Counter(dict(self.visited.most_common(10_000)))
+        # 追踪单位位置（用于卡住检测：位置变化时刷新 tick）
+        for unit in turn.units:
+            uid = str(unit.id)
+            previous = self.unit_positions.get(uid)
+            self.unit_positions[uid] = unit.position
+            if previous != unit.position:
+                self.last_position_tick[uid] = turn.tick
+        # 追踪敌人位置（用于预判射击）
+        for enemy in turn.visible_enemies:
+            eid = str(enemy.id)
+            if eid in self.enemy_positions:
+                self.enemy_prev[eid] = self.enemy_positions[eid]
+            self.enemy_positions[eid] = enemy.position
+            if isinstance(enemy, CoreView):
+                self.enemy_prev.pop(eid, None)
+        for eid in list(self.enemy_positions):
+            if eid not in {str(e.id) for e in turn.visible_enemies}:
+                self.enemy_positions.pop(eid, None)
+                self.enemy_prev.pop(eid, None)
+        # 清理已不存在的单位卡住追踪
+        live_ids = {str(u.id) for u in turn.units}
+        for uid in list(self.last_position_tick):
+            if uid not in live_ids:
+                self.last_position_tick.pop(uid, None)
+                self.unit_positions.pop(uid, None)
         self.last_tick = turn.tick
 
     def remember_move(self, unit: Unit, destination: Position, tick: int) -> None:
@@ -1270,6 +1303,7 @@ class SmartTactic:
             decisions,
         )
         incoming_deposit = self._choose_workers(turn, planner, acted_units, decisions)
+        self._choose_healing(turn, planner, acted_units, decisions)
         self._choose_vanguards(turn, planner, acted_units, decisions)
         self._choose_rangers(turn, planner, acted_units, decisions)
         self._choose_core(turn, planner, core_acted, incoming_deposit, decisions)
@@ -1313,14 +1347,39 @@ class SmartTactic:
         if not needs_core_space:
             return
 
+        near_cargo = any(
+            worker.cargo and _distance(worker.position, core.position) <= 3
+            for worker in turn.workers
+        )
+        core_neighborhood = {core.position} | {
+            _destination(core.position, direction) for direction in DIRECTION_ORDER
+        }
         blockers = [
             unit
             for unit in turn.units
-            if unit.position == core.position
+            if (
+                unit.position == core.position
+                or (near_cargo and unit.position in core_neighborhood)
+            )
             and unit.id not in acted_units
             and not (isinstance(unit, Worker) and unit.cargo)
+            and unit.hp >= MAX_HP.get(unit.unit_type, 0)
         ]
-        for blocker in sorted(blockers, key=_uuid_key):
+        blockers.sort(
+            key=lambda unit: (
+                0 if unit.position == core.position else 1,
+                min(
+                    (
+                        _distance(unit.position, worker.position)
+                        for worker in turn.workers
+                        if worker.cargo
+                    ),
+                    default=0,
+                ),
+                unit.id.bytes,
+            )
+        )
+        for blocker in blockers:
             strategic_goal = turn.beacon.position
             if strategic_goal == core.position:
                 direction = self.memory.core_heading or Direction.UP
@@ -1525,6 +1584,23 @@ class SmartTactic:
             empty_workers.append(worker)
 
         unassigned = {worker.id: worker for worker in empty_workers}
+        # 迷路检测：有移动目标但超过 STUCK_TICKS 无法挪动 → 清除目标重新分配
+        stuck_cleared = 0
+        for worker_id, worker in list(unassigned.items()):
+            goal = self.memory.worker_goals.get(str(worker.id))
+            if goal is None or goal.position == worker.position:
+                continue
+            last_moved = self.memory.last_position_tick.get(str(worker.id), turn.tick)
+            if turn.tick - last_moved > STUCK_TICKS:
+                self.memory.clear_worker_goal(worker)
+                decisions.append(
+                    f"worker:{_short_id(worker.id)} stuck_clear "
+                    f"goal={goal.position} stuck_ticks={turn.tick - last_moved}"
+                )
+                self.memory.decision_totals["worker:stuck_clear"] += 1
+                stuck_cleared += 1
+        if stuck_cleared:
+            decisions.append(f"worker_stuck_cleared count={stuck_cleared}")
         harvested_cells: set[Position] = set()
         for position in sorted(turn.resource_cells):
             contenders = sorted(
@@ -2209,6 +2285,40 @@ class SmartTactic:
 
         return min(candidates, key=score)
 
+    def _choose_healing(
+        self,
+        turn: Turn,
+        planner: MovementPlanner,
+        acted_units: set[UUID],
+        decisions: list[str],
+    ) -> None:
+        core = turn.core
+        if core is None:
+            return
+        for unit in sorted(turn.units, key=_uuid_key):
+            if unit.id in acted_units:
+                continue
+            max_hp = MAX_HP.get(unit.unit_type)
+            if max_hp is None or unit.hp >= max_hp:
+                continue
+            if unit.position == core.position:
+                if turn.resources >= 1:
+                    unit.heal()
+                    acted_units.add(unit.id)
+                    decisions.append(
+                        f"{unit.unit_type.value.lower()}:{_short_id(unit.id)} heal "
+                        f"hp={unit.hp}/{max_hp}"
+                    )
+                    self.memory.decision_totals["unit:heal"] += 1
+                continue
+            if planner.toward(unit, core.position, "heal_return"):
+                acted_units.add(unit.id)
+                decisions.append(
+                    f"{unit.unit_type.value.lower()}:{_short_id(unit.id)} heal_return "
+                    f"hp={unit.hp}/{max_hp}"
+                )
+                self.memory.decision_totals["unit:heal_return"] += 1
+
     def _choose_vanguards(
         self,
         turn: Turn,
@@ -2334,6 +2444,44 @@ class SmartTactic:
             )
 
         return min(candidates, key=score)
+
+    def _predicted_enemy_cell(
+        self,
+        turn: Turn,
+        enemy: UnitView | CoreView,
+    ) -> Position:
+        """预判敌人下一 tick 位置：沿最近一次移动方向外推一格。"""
+        current = enemy.position
+        if isinstance(enemy, CoreView):
+            return current
+        prev = self.memory.enemy_prev.get(str(enemy.id))
+        if prev is None:
+            return current
+        dx = current[0] - prev[0]
+        dy = current[1] - prev[1]
+        if abs(dx) > 1 or abs(dy) > 1 or (dx != 0 and dy != 0):
+            return current
+        return (current[0] + dx, current[1] + dy)
+
+    def _ranger_shot_candidates(
+        self,
+        turn: Turn,
+        ranger: Ranger,
+        planner: MovementPlanner,
+    ) -> list[tuple[UnitView | CoreView, Position]]:
+        """返回 (敌人, 射击格) 候选：预判格优先，当前位置兜底。"""
+        candidates: list[tuple[UnitView | CoreView, Position]] = []
+        for enemy in turn.visible_enemies:
+            predicted = self._predicted_enemy_cell(turn, enemy)
+            if _is_legal_ranger_shot(ranger.position, predicted, planner.obstacles):
+                candidates.append((enemy, predicted))
+            elif _is_legal_ranger_shot(
+                ranger.position,
+                enemy.position,
+                planner.obstacles,
+            ):
+                candidates.append((enemy, enemy.position))
+        return candidates
 
     def _choose_vanguards_aggress(
         self,
@@ -2527,37 +2675,38 @@ class SmartTactic:
         for ranger in ordered:
             if ranger.id in acted_units:
                 continue
-            legal_targets = [
-                enemy
-                for enemy in turn.visible_enemies
-                if _is_legal_ranger_shot(ranger.position, enemy.position, planner.obstacles)
-                and (
-                    ranger.id not in defender_ids
-                    or turn.core is None
-                    or _distance(enemy.position, turn.core.position)
-                    <= RANGER_DEFENSE_LEASH_RADIUS
-                )
-            ]
-            if legal_targets:
-                target = min(
-                    legal_targets,
-                    key=lambda enemy: (
-                        1 if assigned_damage[enemy.id] >= _effective_hp(enemy) else 0,
-                        0 if isinstance(enemy, CoreView) else 1,
-                        _enemy_role_priority(enemy),
-                        _effective_hp(enemy),
-                        _distance(ranger.position, enemy.position),
-                        enemy.id.bytes,
+            shot_candidates = self._ranger_shot_candidates(turn, ranger, planner)
+            if ranger.id in defender_ids:
+                shot_candidates = [
+                    (enemy, cell)
+                    for enemy, cell in shot_candidates
+                    if (
+                        turn.core is None
+                        or _distance(enemy.position, turn.core.position)
+                        <= RANGER_DEFENSE_LEASH_RADIUS
+                    )
+                ]
+            if shot_candidates:
+                target, cell = min(
+                    shot_candidates,
+                    key=lambda pair: (
+                        1 if assigned_damage[pair[0].id] >= _effective_hp(pair[0]) else 0,
+                        0 if isinstance(pair[0], CoreView) else 1,
+                        _enemy_role_priority(pair[0]),
+                        _effective_hp(pair[0]),
+                        _distance(ranger.position, pair[0].position),
+                        pair[0].id.bytes,
                     ),
                 )
-                ranger.shoot(target)
+                ranger.shoot(target, expected_cell=cell)
                 assigned_damage[target.id] += 1
                 decisions.append(
                     f"ranger:{_short_id(ranger.id)} shoot target={_short_id(target.id)} "
-                    f"expected={target.position} role=aggress"
+                    f"expected={cell} role=aggress"
                 )
                 self.memory.decision_totals["ranger:shoot"] += 1
                 continue
+            # 移动：向敌人（Core 优先）推进到射程内
             if ranger.id in defender_ids:
                 patrol_slot = patrol_slots.get(ranger.id)
                 if patrol_slot is not None and ranger.position != patrol_slot:
@@ -2612,31 +2761,30 @@ class SmartTactic:
         for ranger in ordered_rangers:
             if ranger.id in acted_units:
                 continue
-            legal_targets = [
-                enemy
-                for enemy in turn.visible_enemies
-                if _is_legal_ranger_shot(ranger.position, enemy.position, planner.obstacles)
-                and (
+            shot_candidates = [
+                (enemy, cell)
+                for enemy, cell in self._ranger_shot_candidates(turn, ranger, planner)
+                if (
                     turn.core is None
                     or _distance(enemy.position, turn.core.position) <= 6
                 )
             ]
-            if legal_targets:
-                target = min(
-                    legal_targets,
-                    key=lambda enemy: (
-                        1 if assigned_damage[enemy.id] >= _effective_hp(enemy) else 0,
-                        _enemy_role_priority(enemy),
-                        _effective_hp(enemy),
-                        _distance(ranger.position, enemy.position),
-                        enemy.id.bytes,
+            if shot_candidates:
+                target, cell = min(
+                    shot_candidates,
+                    key=lambda pair: (
+                        1 if assigned_damage[pair[0].id] >= _effective_hp(pair[0]) else 0,
+                        _enemy_role_priority(pair[0]),
+                        _effective_hp(pair[0]),
+                        _distance(ranger.position, pair[0].position),
+                        pair[0].id.bytes,
                     ),
                 )
-                ranger.shoot(target)
+                ranger.shoot(target, expected_cell=cell)
                 assigned_damage[target.id] += 1
                 decisions.append(
                     f"ranger:{_short_id(ranger.id)} shoot target={_short_id(target.id)} "
-                    f"expected={target.position} role=recall"
+                    f"expected={cell} role=recall"
                 )
                 self.memory.decision_totals["ranger:shoot"] += 1
                 continue
@@ -2718,30 +2866,26 @@ class SmartTactic:
         ):
             if ranger.id in acted_units:
                 continue
-            legal_targets = [
-                enemy
-                for enemy in turn.visible_enemies
-                if _is_legal_ranger_shot(ranger.position, enemy.position, planner.obstacles)
-            ]
-            if not legal_targets:
+            shot_candidates = self._ranger_shot_candidates(turn, ranger, planner)
+            if not shot_candidates:
                 idle.append(ranger)
                 continue
-            target = min(
-                legal_targets,
-                key=lambda enemy: (
-                    1 if assigned_damage[enemy.id] >= _effective_hp(enemy) else 0,
-                    0 if turn.core is not None and _distance(enemy.position, turn.core.position) <= 5 else 1,
-                    _enemy_role_priority(enemy),
-                    _effective_hp(enemy),
-                    _distance(ranger.position, enemy.position),
-                    enemy.id.bytes,
+            target, cell = min(
+                shot_candidates,
+                key=lambda pair: (
+                    1 if assigned_damage[pair[0].id] >= _effective_hp(pair[0]) else 0,
+                    0 if turn.core is not None and _distance(pair[0].position, turn.core.position) <= 5 else 1,
+                    _enemy_role_priority(pair[0]),
+                    _effective_hp(pair[0]),
+                    _distance(ranger.position, pair[0].position),
+                    pair[0].id.bytes,
                 ),
             )
-            ranger.shoot(target)
+            ranger.shoot(target, expected_cell=cell)
             assigned_damage[target.id] += 1
             decisions.append(
                 f"ranger:{_short_id(ranger.id)} shoot target={_short_id(target.id)} "
-                f"expected={target.position} "
+                f"expected={cell} "
                 f"role={'core_patrol' if ranger.id in patrol_ids else 'mobile'}"
             )
             self.memory.decision_totals["ranger:shoot"] += 1

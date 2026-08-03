@@ -1988,5 +1988,143 @@ class ModeAndRecallTests(unittest.TestCase):
             )
 
 
+class StuckHealPredictionTests(unittest.TestCase):
+    """迷路检测 + core 让路 + 回血 + 预判射击。"""
+
+    def test_stuck_worker_clears_goal(self) -> None:
+        memory = TacticMemory()
+        memory.unit_positions[str(WORKER_LOW)] = (3, 0)
+        memory.last_position_tick[str(WORKER_LOW)] = 0
+        memory.worker_goals[str(WORKER_LOW)] = WorkerGoal("frontier", (10, 0), 0)
+        turn, _ = make_turn(
+            tick=20,
+            own_core=core((0, 0)),
+            units=(worker(WORKER_LOW, (3, 0)),),
+        )
+
+        summary = SmartTactic(memory).choose_actions(turn)
+
+        self.assertTrue(
+            any("stuck_clear" in item for item in summary.decisions)
+        )
+        # 旧目标（created_tick=0）已被清除；若重新分配，则是本 tick 的新目标
+        goal = memory.worker_goals.get(str(WORKER_LOW))
+        if goal is not None:
+            self.assertGreaterEqual(goal.created_tick, 20)
+
+    def test_moving_worker_keeps_goal(self) -> None:
+        # 位置在变化（非卡住）→ 目标保留
+        memory = TacticMemory()
+        memory.unit_positions[str(WORKER_LOW)] = (2, 0)
+        memory.last_position_tick[str(WORKER_LOW)] = 18
+        memory.worker_goals[str(WORKER_LOW)] = WorkerGoal("frontier", (10, 0), 0)
+        turn, _ = make_turn(
+            tick=20,
+            own_core=core((0, 0)),
+            units=(worker(WORKER_LOW, (3, 0)),),
+        )
+
+        SmartTactic(memory).choose_actions(turn)
+
+        self.assertIn(str(WORKER_LOW), memory.worker_goals)
+
+    def test_core_vacates_blocker_in_neighborhood_for_cargo(self) -> None:
+        # cargo worker 在 core 3 格内时，挡在 core 邻格的战斗单位被挪开
+        turn, _ = make_turn(
+            own_core=core((0, 0)),
+            units=(
+                worker(WORKER_LOW, (1, 0), cargo=2),
+                vanguard((0, 1)),  # 挡在 core 邻格
+            ),
+            resources=0,
+        )
+
+        summary = SmartTactic(TacticMemory()).choose_actions(turn)
+
+        self.assertTrue(
+            any("core_logistics_space" in item for item in summary.decisions)
+        )
+        self.assertIn(VANGUARD_ID, turn.plan.unit_actions)
+
+    def test_damaged_unit_returns_to_core(self) -> None:
+        damaged = UnitView(
+            kind="UNIT",
+            id=RANGER_ID,
+            controlled=True,
+            position=(6, 0),
+            hp=1,
+            unit_type=UnitType.RANGER,
+        )
+        turn, _ = make_turn(
+            own_core=core((0, 0)),
+            units=(damaged,),
+            resources=5,
+        )
+
+        summary = SmartTactic(TacticMemory()).choose_actions(turn)
+
+        action = turn.plan.unit_actions.get(RANGER_ID)
+        self.assertIsInstance(action, MoveAction)
+        self.assertTrue(
+            any("heal_return" in item for item in summary.decisions)
+        )
+
+    def test_unit_heals_at_core(self) -> None:
+        damaged = UnitView(
+            kind="UNIT",
+            id=RANGER_ID,
+            controlled=True,
+            position=(0, 0),
+            hp=1,
+            unit_type=UnitType.RANGER,
+        )
+        turn, _ = make_turn(
+            own_core=core((0, 0)),
+            units=(damaged,),
+            resources=5,
+            obstacle_cells=((1, 0), (0, -1), (0, 1)),  # 四周堵住确保不 move
+        )
+
+        summary = SmartTactic(TacticMemory()).choose_actions(turn)
+
+        action = turn.plan.unit_actions.get(RANGER_ID)
+        self.assertIsInstance(action, HealAction)
+        self.assertTrue(any(" heal " in item for item in summary.decisions))
+
+    def test_ranger_leads_moving_enemy(self) -> None:
+        # 敌人 (5,5)->(6,5) 向右移动，预判下一格 (7,5)；ranger 在 (10,5) 射程 3 只够预判格
+        memory = TacticMemory()
+        memory.enemy_positions[str(ENEMY_RANGER_ID)] = (5, 5)
+        memory.enemy_prev[str(ENEMY_RANGER_ID)] = (5, 5)
+        turn, _ = make_turn(
+            own_core=core((0, 0)),
+            units=(ranger((10, 5)),),
+            enemies=(enemy_ranger((6, 5)),),
+        )
+
+        SmartTactic(memory).choose_actions(turn)
+
+        action = turn.plan.unit_actions.get(RANGER_ID)
+        self.assertIsInstance(action, ShootAction)
+        self.assertEqual(action.expected_cell, (7, 5))
+
+    def test_ranger_shoots_stationary_enemy_current_cell(self) -> None:
+        # 敌人未移动（prev==current）→ 打当前位置
+        memory = TacticMemory()
+        memory.enemy_positions[str(ENEMY_RANGER_ID)] = (7, 5)
+        memory.enemy_prev[str(ENEMY_RANGER_ID)] = (7, 5)
+        turn, _ = make_turn(
+            own_core=core((0, 0)),
+            units=(ranger((10, 5)),),
+            enemies=(enemy_ranger((7, 5)),),
+        )
+
+        SmartTactic(memory).choose_actions(turn)
+
+        action = turn.plan.unit_actions.get(RANGER_ID)
+        self.assertIsInstance(action, ShootAction)
+        self.assertEqual(action.expected_cell, (7, 5))
+
+
 if __name__ == "__main__":
     unittest.main()
