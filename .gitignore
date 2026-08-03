@@ -13,3 +13,7 @@ arena_hero_telemetry.jsonl
 *.tmp
 
 *.test-backup
+
+.env
+agent.log
+agent_err.log
