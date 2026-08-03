@@ -36,10 +36,25 @@ ROUTE_OVERLAY_VERSION = 2
 MODE_DEVELOP = "develop"
 MODE_AGGRESS = "aggress"
 MODE_VALUES = {MODE_DEVELOP, MODE_AGGRESS}
+DEVELOP_TARGET_WORKERS = 12
+DEVELOP_TARGET_VANGUARDS = 2
+DEVELOP_TARGET_RANGERS = 2
+DEVELOP_SEARCH_INITIAL_RADIUS = 10
+DEVELOP_SEARCH_STEP = 12
 # 侵略模式：战斗单位优先，工人仅保底经济
 AGGRESS_BASE_WORKERS = 4
 AGGRESS_TARGET_VANGUARDS = 3
 AGGRESS_TARGET_RANGERS = 6
+# 人口上限（游戏规则 19）
+MAX_POPULATION = 19
+# core 是否允许自动迁移（false = 固定不动）
+CORE_MIGRATION_ENABLED = False
+# 发育探索半径封顶：资源 4 tick 刷新，守点循环采集优于长途探索
+DEVELOP_WIDE_SEARCH_MAX_RADIUS = 24
+AGGRESS_DEFENDER_VANGUARDS = 1
+AGGRESS_DEFENDER_RANGERS = 1
+ASSAULT_SIGHTING_MAX_AGE = 20
+ASSAULT_FRONTIER_RADII = (14, 22, 30)
 CORE_VISION_RADIUS = 5
 UNIT_VISION_RADIUS = {
     UnitType.WORKER: 3,
@@ -90,6 +105,13 @@ class WorkerGoal:
     kind: str
     position: Position
     created_tick: int
+
+
+@dataclass(frozen=True)
+class EnemySighting:
+    position: Position
+    seen_tick: int
+    is_core: bool
 
 
 @dataclass(frozen=True)
@@ -145,6 +167,8 @@ class TacticMemory:
     visited: Counter[Position] = field(default_factory=Counter)
     temporary_blocks: dict[Position, int] = field(default_factory=dict)
     worker_goals: dict[str, WorkerGoal] = field(default_factory=dict)
+    worker_search_radius: dict[str, int] = field(default_factory=dict)
+    enemy_sightings: dict[str, EnemySighting] = field(default_factory=dict)
     planned_moves: dict[str, PlannedMove] = field(default_factory=dict)
     event_totals: Counter[str] = field(default_factory=Counter)
     decision_totals: Counter[str] = field(default_factory=Counter)
@@ -164,6 +188,10 @@ class TacticMemory:
     total_resources_deposited: int = 0
     total_resources_captured: int = 0
     enemy_cores_destroyed: int = 0
+    first_observed_tick: int = 0
+    observed_turns: int = 0
+    units_lost: int = 0
+    current_tick_interval: int = field(default=0, repr=False)
     current_routes: dict[str, PlannedRoute] = field(default_factory=dict, repr=False)
     current_units: dict[str, OverlayUnit] = field(default_factory=dict, repr=False)
     current_resource_cells: set[Position] = field(default_factory=set, repr=False)
@@ -219,6 +247,19 @@ class TacticMemory:
                     created_tick=int(value[3]),
                 )
                 for unit_id, value in data.get("worker_goals", {}).items()
+            }
+            memory.worker_search_radius = {
+                str(unit_id): max(0, int(radius))
+                for unit_id, radius in data.get("worker_search_radius", {}).items()
+            }
+            memory.enemy_sightings = {
+                object_id: EnemySighting(
+                    position=(int(value[0]), int(value[1])),
+                    seen_tick=int(value[2]),
+                    is_core=bool(value[3]),
+                )
+                for object_id, value in data.get("enemy_sightings", {}).items()
+                if isinstance(value, list) and len(value) == 4
             }
             memory.planned_moves = {
                 unit_id: PlannedMove(
@@ -278,6 +319,9 @@ class TacticMemory:
                 data.get("total_resources_captured", 0)
             )
             memory.enemy_cores_destroyed = int(data.get("enemy_cores_destroyed", 0))
+            memory.first_observed_tick = int(data.get("first_observed_tick", 0))
+            memory.observed_turns = int(data.get("observed_turns", 0))
+            memory.units_lost = int(data.get("units_lost", 0))
             return memory
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             return cls()
@@ -306,6 +350,16 @@ class TacticMemory:
             "worker_goals": {
                 unit_id: [goal.kind, goal.position[0], goal.position[1], goal.created_tick]
                 for unit_id, goal in sorted(self.worker_goals.items())
+            },
+            "worker_search_radius": dict(sorted(self.worker_search_radius.items())),
+            "enemy_sightings": {
+                object_id: [
+                    sighting.position[0],
+                    sighting.position[1],
+                    sighting.seen_tick,
+                    sighting.is_core,
+                ]
+                for object_id, sighting in sorted(self.enemy_sightings.items())
             },
             "planned_moves": {
                 unit_id: [move.destination[0], move.destination[1], move.tick]
@@ -345,6 +399,9 @@ class TacticMemory:
             "total_resources_deposited": self.total_resources_deposited,
             "total_resources_captured": self.total_resources_captured,
             "enemy_cores_destroyed": self.enemy_cores_destroyed,
+            "first_observed_tick": self.first_observed_tick,
+            "observed_turns": self.observed_turns,
+            "units_lost": self.units_lost,
         }
         temporary = path.with_suffix(path.suffix + ".tmp")
         temporary.write_text(
@@ -409,6 +466,13 @@ class TacticMemory:
         temporary.replace(path)
 
     def observe(self, turn: Turn) -> None:
+        previous_unit_ids = set(self.unit_labels)
+        self.current_tick_interval = (
+            max(0, turn.tick - self.last_tick) if self.last_tick > 0 else 0
+        )
+        if self.first_observed_tick <= 0:
+            self.first_observed_tick = turn.tick
+        self.observed_turns += 1
         self.observations.clear()
         self.current_routes.clear()
         self.current_units.clear()
@@ -421,6 +485,7 @@ class TacticMemory:
         ):
             self.core_heading = turn.core.view.move_direction
         live_unit_ids = {str(unit.id) for unit in turn.units}
+        self.units_lost += len(previous_unit_ids - live_unit_ids)
         self.unit_labels = {
             unit_id: label
             for unit_id, label in self.unit_labels.items()
@@ -455,6 +520,11 @@ class TacticMemory:
         self.worker_goals = {
             unit_id: goal
             for unit_id, goal in self.worker_goals.items()
+            if unit_id in live_worker_ids
+        }
+        self.worker_search_radius = {
+            unit_id: radius
+            for unit_id, radius in self.worker_search_radius.items()
             if unit_id in live_worker_ids
         }
 
@@ -529,6 +599,22 @@ class TacticMemory:
                 self.enemy_cores_destroyed += 1
 
         self.known_obstacles.update(turn.obstacle_cells)
+        visible_enemy_ids = {str(enemy.id) for enemy in turn.visible_enemies}
+        for enemy in turn.visible_enemies:
+            self.enemy_sightings[str(enemy.id)] = EnemySighting(
+                position=enemy.position,
+                seen_tick=turn.tick,
+                is_core=isinstance(enemy, CoreView),
+            )
+        self.enemy_sightings = {
+            object_id: sighting
+            for object_id, sighting in self.enemy_sightings.items()
+            if turn.tick - sighting.seen_tick <= ASSAULT_SIGHTING_MAX_AGE
+            and not (
+                object_id not in visible_enemy_ids
+                and _currently_visible(turn, sighting.position, self.known_obstacles)
+            )
+        }
         for position in turn.resource_cells:
             self.resource_last_seen[position] = turn.tick
 
@@ -644,9 +730,15 @@ class TacticMemory:
     def write_stats(self, path: Path, turn: Turn) -> None:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            duration = 0
-            if self.last_tick > 0:
-                duration = int(turn.tick - self.last_tick)
+            core_position = list(turn.core.position) if turn.core is not None else None
+            core_state = (
+                turn.core.view.state.value if turn.core is not None else "RESPAWNING"
+            )
+            elapsed_ticks = (
+                max(0, turn.tick - self.first_observed_tick + 1)
+                if self.first_observed_tick > 0
+                else 0
+            )
             payload = {
                 "tick": turn.tick,
                 "mode": self.mode,
@@ -659,16 +751,45 @@ class TacticMemory:
                 "rangers": len(turn.rangers),
                 "core_hp": turn.core.hp if turn.core else 0,
                 "core_shield": turn.core.shield if turn.core else 0,
+                "core_state": core_state,
+                "core_position": core_position,
+                "beacon_position": list(turn.beacon.position),
+                "beacon_status": (
+                    turn.beacon.status.value
+                    if turn.beacon.status is not None
+                    else "UNCLAIMED"
+                ),
                 "visible_enemies": len(turn.visible_enemies),
                 "owns_beacon": _owns_beacon(turn),
-                "ticks_since_last_tick": duration,
+                "visible_resource_cells": len(turn.resource_cells),
+                "known_resource_cells": len(self.resource_last_seen),
+                "known_obstacle_cells": len(self.known_obstacles),
+                "visited_cells": len(self.visited),
+                "worker_cargo": sum(worker.cargo for worker in turn.workers),
+                "active_routes": len(self.current_routes),
+                "complete_routes": sum(
+                    1 for route in self.current_routes.values() if route.complete
+                ),
+                "remembered_enemies": len(self.enemy_sightings),
+                "exploring_workers": sum(
+                    1
+                    for goal in self.worker_goals.values()
+                    if goal.kind == "develop_frontier"
+                ),
+                "max_worker_search_radius": max(
+                    self.worker_search_radius.values(),
+                    default=0,
+                ),
+                "tick_interval": self.current_tick_interval,
+                "observed_turns": self.observed_turns,
+                "elapsed_ticks": elapsed_ticks,
                 "total_resources_harvested": self.total_resources_harvested,
                 "total_resources_deposited": self.total_resources_deposited,
                 "total_resources_captured": self.total_resources_captured,
                 "enemy_cores_destroyed": self.enemy_cores_destroyed,
-                "up_time": self.event_totals.get("UP_TIME", 0),
-                "units_lost": self.event_totals.get("UNIT_LOST", 0),
-                "units_built": self.event_totals.get("UNIT_BUILT", 0),
+                "up_time": elapsed_ticks,
+                "units_lost": self.units_lost,
+                "units_built": self.event_totals.get("CORE_SPAWN_SUCCEEDED", 0),
                 "core_events": int(
                     self.event_totals.get("CORE_RESOURCES_CAPTURED", 0)
                     + self.event_totals.get("CORE_RESOURCE_OVERFLOW_DESTROYED", 0)
@@ -678,6 +799,12 @@ class TacticMemory:
                 "harvest_count": self.decision_totals.get("worker:harvest", 0),
                 "deposit_count": self.decision_totals.get("worker:deposit", 0),
                 "shoot_count": self.decision_totals.get("ranger:shoot", 0),
+                "move_failures": self.event_totals.get("UNIT_MOVE_FAILED", 0),
+                "manual_overrides": self.decision_totals.get(
+                    "manual_override:move", 0
+                ),
+                "event_totals": dict(sorted(self.event_totals.items())),
+                "decision_totals": dict(sorted(self.decision_totals.items())),
             }
             temporary = path.with_suffix(path.suffix + ".tmp")
             temporary.write_text(
@@ -1325,7 +1452,13 @@ class SmartTactic:
         candidates: list[Unit] = list(turn.vanguards)
         if len(turn.rangers) > 1:
             candidates.extend(turn.rangers)
-        if len(turn.workers) > 4:
+        develop_needs_resource_search = (
+            self.memory.mode == MODE_DEVELOP
+            and not turn.resource_cells
+            and not self.memory.resource_last_seen
+            and not self.memory.recovery_targets
+        )
+        if len(turn.workers) > 4 and not develop_needs_resource_search:
             candidates.extend(worker for worker in turn.workers if not worker.cargo)
         if not candidates:
             return False
@@ -1412,6 +1545,23 @@ class SmartTactic:
         self._trim_refilled_chunk_goals(turn, unassigned, decisions)
         available_resources = set(turn.resource_cells) - harvested_cells
         reserved_targets: set[Position] = set()
+
+        full_capacity = turn.resources >= turn.resource_capacity
+        develop_wide_search = (
+            self.memory.mode == MODE_DEVELOP
+            and not full_capacity
+            and not turn.resource_cells
+            and not self.memory.resource_last_seen
+            and not self.memory.recovery_targets
+        )
+        if develop_wide_search:
+            for worker in unassigned.values():
+                goal = self.memory.worker_goals.get(str(worker.id))
+                if goal is not None and goal.kind not in {
+                    "develop_frontier",
+                    "refilled_chunk",
+                }:
+                    self.memory.clear_worker_goal(worker)
 
         # Keep a still-visible resource assignment stable instead of switching
         # to whichever point happens to be one step closer on this Tick.
@@ -1503,10 +1653,18 @@ class SmartTactic:
                     "last_seen_resource:strategic_trimmed"
                 ] += 1
                 continue
-            if goal.kind == "frontier" and turn.tick - goal.created_tick > 24:
+            if (
+                goal.kind in {"frontier", "develop_frontier"}
+                and turn.tick - goal.created_tick > 24
+            ):
                 self.memory.clear_worker_goal(worker)
                 continue
             reserved_targets.add(goal.position)
+            if goal.kind == "develop_frontier":
+                self.memory.worker_search_radius[str(worker.id)] = max(
+                    self.memory.worker_search_radius.get(str(worker.id), 0),
+                    _distance(turn.core.position, goal.position),
+                )
             if planner.toward(
                 worker,
                 goal.position,
@@ -1514,6 +1672,8 @@ class SmartTactic:
                 avoid=(turn.core.position,),
             ):
                 unassigned.pop(worker_id, None)
+                if goal.kind == "develop_frontier":
+                    self.memory.decision_totals["worker:develop_explore"] += 1
 
         remembered_resources = {
             position
@@ -1539,26 +1699,44 @@ class SmartTactic:
             kind="last_seen_resource",
         )
 
-        self._assign_refilled_chunks(
-            turn,
-            planner,
-            unassigned,
-            reserved_targets,
-        )
+        if not full_capacity:
+            self._assign_refilled_chunks(
+                turn,
+                planner,
+                unassigned,
+                reserved_targets,
+            )
 
         for worker_id, worker in list(unassigned.items()):
-            target = self._frontier_target(turn, worker, reserved_targets, planner)
+            if full_capacity:
+                # 满仓：不派新探索目标，工人就地驻守等待 core 腾空间
+                continue
+            target = self._frontier_target(
+                turn,
+                worker,
+                reserved_targets,
+                planner,
+                wide_search=develop_wide_search,
+            )
             if target is None:
                 continue
-            self.memory.set_worker_goal(worker, "frontier", target, turn.tick)
+            goal_kind = "develop_frontier" if develop_wide_search else "frontier"
+            self.memory.set_worker_goal(worker, goal_kind, target, turn.tick)
+            if develop_wide_search:
+                self.memory.worker_search_radius[str(worker.id)] = max(
+                    self.memory.worker_search_radius.get(str(worker.id), 0),
+                    _distance(turn.core.position, target),
+                )
             reserved_targets.add(target)
             if planner.toward(
                 worker,
                 target,
-                "frontier",
+                goal_kind,
                 avoid=(turn.core.position,),
             ):
                 unassigned.pop(worker_id, None)
+                if develop_wide_search:
+                    self.memory.decision_totals["worker:develop_explore"] += 1
         return incoming_deposit
 
     def _assign_worker_targets(
@@ -1828,6 +2006,14 @@ class SmartTactic:
                 if refill_tick <= turn.tick
                 and turn.tick - self.memory.chunk_last_probe.get(chunk, -1000) >= 8
                 and chunk not in active_chunks
+                and _distance(
+                    turn.core.position,
+                    self.memory.chunk_anchors.get(
+                        chunk,
+                        (chunk[0] * CHUNK_SIZE + 16, chunk[1] * CHUNK_SIZE + 16),
+                    ),
+                )
+                <= REFILL_PROBE_CORE_LEASH_DISTANCE
             ),
             key=lambda chunk: (
                 0
@@ -1928,12 +2114,55 @@ class SmartTactic:
         worker: Worker,
         reserved_targets: set[Position],
         planner: MovementPlanner,
+        *,
+        wide_search: bool = False,
     ) -> Position | None:
         assert turn.core is not None
-        sector = worker.id.int % 4
-        preferred_signs = ((1, 1), (-1, 1), (-1, -1), (1, -1))[sector]
+        label = self.memory.unit_labels.get(str(worker.id))
+        worker_number = label.number if label is not None else worker.id.int
+        preferred_vectors = (
+            (1, 0),
+            (1, 1),
+            (0, 1),
+            (-1, 1),
+            (-1, 0),
+            (-1, -1),
+            (0, -1),
+            (1, -1),
+        )
+        preferred_vector = preferred_vectors[(worker_number - 1) % 8]
         candidates: set[Position] = set()
-        for radius in (5, 8, 11):
+        if wide_search:
+            completed_radius = self.memory.worker_search_radius.get(
+                str(worker.id),
+                0,
+            )
+            current_radius = _distance(turn.core.position, worker.position)
+            if completed_radius > 0:
+                next_radius = max(
+                    completed_radius + DEVELOP_SEARCH_STEP,
+                    current_radius + DEVELOP_SEARCH_STEP,
+                )
+            else:
+                next_radius = max(
+                    DEVELOP_SEARCH_INITIAL_RADIUS,
+                    (
+                        current_radius + DEVELOP_SEARCH_STEP
+                        if current_radius >= DEVELOP_SEARCH_INITIAL_RADIUS
+                        else DEVELOP_SEARCH_INITIAL_RADIUS
+                    ),
+                )
+            next_radius = min(next_radius, DEVELOP_WIDE_SEARCH_MAX_RADIUS)
+            radii = tuple(
+                radius
+                for radius in (next_radius, next_radius + 8, next_radius + 16)
+                if radius <= DEVELOP_WIDE_SEARCH_MAX_RADIUS
+            )
+            if not radii:
+                return None
+        else:
+            radii = (5, 8, 11)
+        for radius in radii:
             for dx in range(-radius, radius + 1):
                 dy = radius - abs(dx)
                 candidates.add((turn.core.position[0] + dx, turn.core.position[1] + dy))
@@ -1948,15 +2177,20 @@ class SmartTactic:
         def score(position: Position) -> tuple[float, Position]:
             dx = position[0] - turn.core.position[0]
             dy = position[1] - turn.core.position[1]
-            sector_penalty = 0 if dx * preferred_signs[0] >= 0 and dy * preferred_signs[1] >= 0 else 8
+            distance = max(1, abs(dx) + abs(dy))
+            alignment = dx * preferred_vector[0] + dy * preferred_vector[1]
+            vector_scale = max(1, abs(preferred_vector[0]) + abs(preferred_vector[1]))
+            direction_penalty = (
+                distance - alignment / vector_scale
+            ) * (5 if wide_search else 2)
             heading_penalty = 0.0
-            if self.memory.core_heading is not None:
+            if not wide_search and self.memory.core_heading is not None:
                 heading_x, heading_y = self.memory.core_heading.delta
                 forward = dx * heading_x + dy * heading_y
                 heading_penalty = max(0.0, 3.0 - forward) * 2.5
             crowd_penalty = sum(max(0, 6 - _distance(position, other)) for other in reserved_targets)
             beacon_progress = 0
-            if not owns_beacon:
+            if not wide_search and not owns_beacon:
                 beacon_progress = (
                     core_beacon_distance
                     - _distance(position, turn.beacon.position)
@@ -1964,7 +2198,7 @@ class SmartTactic:
             value = (
                 self.memory.visited.get(position, 0) * 20
                 + planner.threat.get(position, 0) * 20
-                + sector_penalty
+                + direction_penalty
                 + heading_penalty
                 + crowd_penalty
                 + _distance(worker.position, position) * 0.2
@@ -2015,22 +2249,91 @@ class SmartTactic:
         )[2]
 
     def _pick_assault_target(self, turn: Turn) -> Position | None:
-        if not turn.visible_enemies:
-            return None
         origin = turn.core.position if turn.core is not None else (0, 0)
-        cores = [enemy for enemy in turn.visible_enemies if isinstance(enemy, CoreView)]
-        if cores:
-            nearest = min(cores, key=lambda enemy: _distance(origin, enemy.position))
+        if turn.visible_enemies:
+            cores = [
+                enemy for enemy in turn.visible_enemies if isinstance(enemy, CoreView)
+            ]
+            if cores:
+                nearest = min(
+                    cores,
+                    key=lambda enemy: (_distance(origin, enemy.position), enemy.id.bytes),
+                )
+                return nearest.position
+            nearest = min(
+                turn.visible_enemies,
+                key=lambda enemy: (
+                    _enemy_role_priority(enemy),
+                    _distance(origin, enemy.position),
+                    enemy.id.bytes,
+                ),
+            )
             return nearest.position
-        nearest = min(
-            turn.visible_enemies,
-            key=lambda enemy: (
-                _enemy_role_priority(enemy),
-                _distance(origin, enemy.position),
-                enemy.id.bytes,
+
+        if not self.memory.enemy_sightings:
+            return None
+        sighting = min(
+            self.memory.enemy_sightings.values(),
+            key=lambda candidate: (
+                0 if candidate.is_core else 1,
+                turn.tick - candidate.seen_tick,
+                _distance(origin, candidate.position),
+                candidate.position,
             ),
         )
-        return nearest.position
+        return sighting.position
+
+    def _assault_frontier_target(
+        self,
+        turn: Turn,
+        planner: MovementPlanner,
+    ) -> Position | None:
+        if turn.core is not None:
+            origin = turn.core.position
+        elif turn.units:
+            origin = min(turn.units, key=_uuid_key).position
+        else:
+            return None
+
+        sector = (turn.tick // 64) % 4
+        preferred_signs = ((1, 1), (-1, 1), (-1, -1), (1, -1))[sector]
+        candidates: set[Position] = set()
+        for radius in ASSAULT_FRONTIER_RADII:
+            for dx in range(-radius, radius + 1):
+                dy = radius - abs(dx)
+                candidates.add((origin[0] + dx, origin[1] + dy))
+                candidates.add((origin[0] + dx, origin[1] - dy))
+        candidates.difference_update(planner.obstacles)
+        if not candidates:
+            return None
+
+        owns_beacon = _owns_beacon(turn)
+        core_beacon_distance = _distance(origin, turn.beacon.position)
+
+        def score(position: Position) -> tuple[float, Position]:
+            dx = position[0] - origin[0]
+            dy = position[1] - origin[1]
+            sector_penalty = (
+                0
+                if dx * preferred_signs[0] >= 0 and dy * preferred_signs[1] >= 0
+                else 18
+            )
+            beacon_progress = 0
+            if not owns_beacon:
+                beacon_progress = core_beacon_distance - _distance(
+                    position, turn.beacon.position
+                )
+            return (
+                self.memory.visited.get(position, 0) * 30
+                + planner.threat.get(position, 0) * 25
+                + sector_penalty
+                + _distance(origin, position) * 0.03
+                - _chunk_quota(_chunk_of(position)) * 0.2
+                - beacon_progress * 1.5,
+                position,
+            )
+
+        return min(candidates, key=score)
 
     def _choose_vanguards_aggress(
         self,
@@ -2039,7 +2342,15 @@ class SmartTactic:
         acted_units: set[UUID],
         decisions: list[str],
     ) -> None:
-        for vanguard in sorted(turn.vanguards, key=_uuid_key):
+        ordered = sorted(turn.vanguards, key=_uuid_key)
+        defender_count = min(
+            AGGRESS_DEFENDER_VANGUARDS,
+            max(0, len(ordered) - 1),
+        )
+        defender_ids = {unit.id for unit in ordered[:defender_count]}
+        combat_target = self._pick_assault_target(turn)
+        frontier_target = self._assault_frontier_target(turn, planner)
+        for vanguard in ordered:
             if vanguard.id in acted_units:
                 continue
             direction = self._sweep_targets(vanguard, turn)
@@ -2068,8 +2379,14 @@ class SmartTactic:
                     )
                     planner.toward(vanguard, target.position, "aggress_defend_core")
                     continue
-            # 主动出击：优先敌人 Core，其次最近敌人
-            combat_target = self._pick_assault_target(turn)
+            if vanguard.id in defender_ids:
+                if (
+                    turn.core is not None
+                    and _distance(vanguard.position, turn.core.position) > 2
+                ):
+                    planner.toward(vanguard, turn.core.position, "aggress_core_guard")
+                self.memory.decision_totals["vanguard:aggress_guard"] += 1
+                continue
             if combat_target is not None:
                 planner.toward(vanguard, combat_target, "assault_enemy")
                 decisions.append(
@@ -2077,17 +2394,9 @@ class SmartTactic:
                 )
                 self.memory.decision_totals["vanguard:assault"] += 1
                 continue
-            # 无可见敌人：向信标方向推进开路
-            if (
-                turn.core is None
-                or _distance(vanguard.position, turn.core.position) > 1
-            ):
-                planner.toward(
-                    vanguard,
-                    turn.beacon.position,
-                    "aggress_advance_beacon",
-                )
-                self.memory.decision_totals["vanguard:advance"] += 1
+            if frontier_target is not None:
+                planner.toward(vanguard, frontier_target, "aggress_frontier")
+                self.memory.decision_totals["vanguard:frontier"] += 1
 
     def _choose_vanguards_recall(
         self,
@@ -2205,13 +2514,29 @@ class SmartTactic:
         decisions: list[str],
     ) -> None:
         assigned_damage: Counter[UUID] = Counter()
-        for ranger in sorted(turn.rangers, key=_uuid_key):
+        ordered = sorted(turn.rangers, key=_uuid_key)
+        defender_count = min(
+            AGGRESS_DEFENDER_RANGERS,
+            max(0, len(ordered) - 1),
+        )
+        defenders = ordered[:defender_count]
+        defender_ids = {unit.id for unit in defenders}
+        patrol_slots = self._core_patrol_slots(turn, planner, defenders)
+        combat_target = self._pick_assault_target(turn)
+        frontier_target = self._assault_frontier_target(turn, planner)
+        for ranger in ordered:
             if ranger.id in acted_units:
                 continue
             legal_targets = [
                 enemy
                 for enemy in turn.visible_enemies
                 if _is_legal_ranger_shot(ranger.position, enemy.position, planner.obstacles)
+                and (
+                    ranger.id not in defender_ids
+                    or turn.core is None
+                    or _distance(enemy.position, turn.core.position)
+                    <= RANGER_DEFENSE_LEASH_RADIUS
+                )
             ]
             if legal_targets:
                 target = min(
@@ -2233,8 +2558,17 @@ class SmartTactic:
                 )
                 self.memory.decision_totals["ranger:shoot"] += 1
                 continue
-            # 移动：向敌人（Core 优先）推进到射程内
-            combat_target = self._pick_assault_target(turn)
+            if ranger.id in defender_ids:
+                patrol_slot = patrol_slots.get(ranger.id)
+                if patrol_slot is not None and ranger.position != patrol_slot:
+                    planner.toward(ranger, patrol_slot, "aggress_core_patrol")
+                elif (
+                    turn.core is not None
+                    and _distance(ranger.position, turn.core.position) > 2
+                ):
+                    planner.toward(ranger, turn.core.position, "aggress_core_guard")
+                self.memory.decision_totals["ranger:aggress_guard"] += 1
+                continue
             if combat_target is not None:
                 firing_cells = self._firing_cells(combat_target, planner.obstacles)
                 if firing_cells:
@@ -2251,21 +2585,9 @@ class SmartTactic:
                     planner.toward(ranger, combat_target, "aggress_approach")
                 self.memory.decision_totals["ranger:assault"] += 1
                 continue
-            # 无敌人：向信标方向推进
-            firing_cells = self._firing_cells(turn.beacon.position, planner.obstacles)
-            if firing_cells:
-                firing_cell = min(
-                    firing_cells,
-                    key=lambda position: (
-                        planner.threat.get(position, 0),
-                        _distance(ranger.position, position),
-                        position,
-                    ),
-                )
-                planner.toward(ranger, firing_cell, "aggress_advance_beacon")
-            else:
-                planner.toward(ranger, turn.beacon.position, "aggress_advance_beacon")
-            self.memory.decision_totals["ranger:advance"] += 1
+            if frontier_target is not None:
+                planner.toward(ranger, frontier_target, "aggress_frontier")
+                self.memory.decision_totals["ranger:frontier"] += 1
 
     def _choose_rangers_recall(
         self,
@@ -2596,7 +2918,7 @@ class SmartTactic:
         spawn: UnitType | None = None
         can_spawn = (
             planner.final_occupancy(core.position) < 2
-            and len(turn.units) < 16
+            and len(turn.units) < MAX_POPULATION
         )
 
         mode = self.memory.mode
@@ -2612,55 +2934,38 @@ class SmartTactic:
                 elif workers < AGGRESS_BASE_WORKERS and budget >= 5:
                     spawn = UnitType.WORKER
             elif mode == MODE_DEVELOP:
-                # 发育模式：经济优先，战斗单位仅保底防御（保留 reserve 原则）
-                if workers < 3 and budget >= 5:
+                # 发育模式：12 名工人扩张经济，仅留 2+2 的核心守军。
+                if workers < 4 and budget >= 5:
                     spawn = UnitType.WORKER
-                elif near_threat and vanguards < 2 and budget >= 10:
-                    spawn = UnitType.VANGUARD
-                elif near_threat and rangers < 2 and budget >= 12:
-                    spawn = UnitType.RANGER
-                elif workers < 5 and budget >= 5:
-                    spawn = UnitType.WORKER
-                elif rangers < 2 and budget >= 12:
-                    spawn = UnitType.RANGER
                 elif vanguards < 1 and budget >= 10:
                     spawn = UnitType.VANGUARD
-                elif workers < 6 and budget >= 5:
-                    spawn = UnitType.WORKER
-                elif (
-                    rangers < 3
-                    and budget >= 12
-                    and (
-                        not near_threat
-                        or projected_resources - 12 >= DEFENSE_REPLACEMENT_RESERVE
-                    )
-                ):
+                elif rangers < 1 and budget >= 12:
                     spawn = UnitType.RANGER
                 elif (
-                    vanguards < 3
-                    and budget >= 10
-                    and projected_resources - 10 >= DEFENSE_REPLACEMENT_RESERVE
-                ):
-                    spawn = UnitType.VANGUARD
-                elif (
-                    workers < 8
-                    and not near_threat
-                    and budget >= 5
-                    and projected_resources - 5 >= DEFENSE_REPLACEMENT_RESERVE
-                ):
-                    spawn = UnitType.WORKER
-                elif (
-                    rangers < 4
+                    near_threat
+                    and rangers < 4
                     and budget >= 12
                     and projected_resources - 12 >= DEFENSE_REPLACEMENT_RESERVE
                 ):
                     spawn = UnitType.RANGER
                 elif (
-                    vanguards < 4
-                    and rangers >= 4
+                    near_threat
+                    and vanguards < 4
                     and budget >= 10
                     and projected_resources - 10 >= DEFENSE_REPLACEMENT_RESERVE
                 ):
+                    spawn = UnitType.VANGUARD
+                elif near_threat:
+                    pass
+                elif (
+                    workers < DEVELOP_TARGET_WORKERS
+                    and budget >= 5
+                    and projected_resources - 5 >= DEFENSE_REPLACEMENT_RESERVE
+                ):
+                    spawn = UnitType.WORKER
+                elif rangers < DEVELOP_TARGET_RANGERS and budget >= 12:
+                    spawn = UnitType.RANGER
+                elif vanguards < DEVELOP_TARGET_VANGUARDS and budget >= 10:
                     spawn = UnitType.VANGUARD
             elif mode == MODE_AGGRESS:
                 # 侵略模式：战斗单位优先，工人仅保底经济
@@ -2695,12 +3000,13 @@ class SmartTactic:
             decisions.append(f"core repair_shield reason=spare_resources shield={core.shield}")
             self.memory.decision_totals["core:repair"] += 1
         else:
-            self._choose_core_migration(
-                turn,
-                planner,
-                incoming_deposit,
-                decisions,
-            )
+            if CORE_MIGRATION_ENABLED:
+                self._choose_core_migration(
+                    turn,
+                    planner,
+                    incoming_deposit,
+                    decisions,
+                )
 
     def _choose_core_migration(
         self,

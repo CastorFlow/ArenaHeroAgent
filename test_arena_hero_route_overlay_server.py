@@ -96,6 +96,11 @@ class RouteOverlayServerTests(unittest.TestCase):
                         "owns_beacon": False,
                         "total_resources_harvested": 12,
                         "total_resources_deposited": 10,
+                        "event_totals": {
+                            "CORE_SPAWN_SUCCEEDED": 2,
+                            "API_KEY": 99,
+                        },
+                        "api_key": "must-not-leak",
                     }
                 ),
                 encoding="utf-8",
@@ -111,6 +116,8 @@ class RouteOverlayServerTests(unittest.TestCase):
                 self.assertEqual(payload["mode"], "aggress")
                 self.assertEqual(payload["workers"], 3)
                 self.assertEqual(payload["total_resources_harvested"], 12)
+                self.assertEqual(payload["event_totals"], {"CORE_SPAWN_SUCCEEDED": 2})
+                self.assertNotIn("api_key", payload)
             finally:
                 server.shutdown()
                 server.server_close()
@@ -180,6 +187,32 @@ class RouteOverlayServerTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=2)
 
+    def test_control_rejects_web_page_origin(self) -> None:
+        with TemporaryDirectory() as directory:
+            routes_path = Path(directory) / ".arena_hero_routes.json"
+            routes_path.write_text("{}", encoding="utf-8")
+            server = create_server(routes_path, port=0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address
+            try:
+                request = Request(
+                    f"http://{host}:{port}/control",
+                    data=json.dumps({"mode": "aggress"}).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Origin": "https://example.com",
+                    },
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as raised:
+                    urlopen(request, timeout=2)
+                self.assertEqual(raised.exception.code, 403)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
     def test_manifest_is_read_only_and_scoped(self) -> None:
         extension = Path(__file__).with_name("arena_hero_route_overlay")
         manifest = json.loads((extension / "manifest.json").read_text(encoding="utf-8"))
@@ -195,8 +228,10 @@ class RouteOverlayServerTests(unittest.TestCase):
         self.assertNotIn("api.arenahero.io", source)
         self.assertIn("chrome.storage.local", source)
         self.assertIn("alt+shift+r", source)
+        self.assertIn("alt+shift+1", source)
         self.assertIn("showresources", source)
         self.assertIn("showunitlabels", source)
+        self.assertIn("officialdialogvisible", source)
 
 
 if __name__ == "__main__":

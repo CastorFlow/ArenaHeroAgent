@@ -34,10 +34,42 @@
     statsPanel: null,
     statsOpen: false,
     statusElements: new Map(),
+    statsCounterContainers: new Map(),
   };
 
   function arenaPageVisible() {
     return location.hostname === "app.arenahero.io" && location.pathname.startsWith("/arena");
+  }
+
+  function officialDialogVisible() {
+    const selector = [
+      '[role="dialog"]',
+      '[role="alertdialog"]',
+      '[role="menu"]',
+      '[role="listbox"]',
+      '[aria-modal="true"]',
+      '[data-radix-popper-content-wrapper]',
+      '[data-state="open"][class*="dialog" i]',
+      '[data-state="open"][class*="modal" i]',
+      '[class*="modal" i]',
+    ].join(",");
+    for (const element of document.querySelectorAll(selector)) {
+      if (!(element instanceof HTMLElement) || element.closest(`[${OVERLAY_ATTRIBUTE}]`)) {
+        continue;
+      }
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      if (
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        Number(style.opacity || "1") > 0 &&
+        rect.width > 40 &&
+        rect.height > 30
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   function applyButtonStyle(button) {
@@ -68,7 +100,7 @@
       width: "0",
       height: "0",
       pointerEvents: "none",
-      zIndex: "9000",
+      zIndex: "80",
       display: "none",
     });
     document.documentElement.appendChild(canvas);
@@ -78,6 +110,7 @@
 
   function controlContainer(tagName) {
     const element = document.createElement(tagName);
+    element.setAttribute(OVERLAY_ATTRIBUTE, "control");
     element.addEventListener("pointerenter", () => {
       state.pointerOverControls = true;
     });
@@ -173,7 +206,7 @@
       display: "none",
       alignItems: "center",
       gap: "6px",
-      zIndex: "9500",
+      zIndex: "90",
       pointerEvents: "auto",
     });
 
@@ -206,7 +239,7 @@
       color: "#d9e1eb",
       font: "12px system-ui, -apple-system, Segoe UI, sans-serif",
       boxShadow: "0 8px 28px rgba(0,0,0,0.42)",
-      zIndex: "9500",
+      zIndex: "90",
       pointerEvents: "auto",
       userSelect: "none",
     });
@@ -218,7 +251,7 @@
       marginBottom: "4px",
     });
     const shortcut = document.createElement("div");
-    shortcut.textContent = "快捷键：Alt+Shift+R 显示/隐藏路线";
+    shortcut.textContent = "快捷键：Alt+Shift+R 路线 · Alt+Shift+1 发育 · Alt+Shift+2 侵略 · Alt+Shift+C 召回";
     Object.assign(shortcut.style, {
       color: "#8f9cad",
       fontSize: "11px",
@@ -278,36 +311,28 @@
       color: "#d9e1eb",
       font: "600 12px system-ui, -apple-system, Segoe UI, sans-serif",
       boxShadow: "0 2px 10px rgba(0,0,0,0.28)",
-      zIndex: "9500",
+      zIndex: "90",
       pointerEvents: "auto",
       userSelect: "none",
+      flexWrap: "wrap",
+      maxWidth: "calc(100vw - 16px)",
     });
 
     const modeButton = document.createElement("button");
     modeButton.type = "button";
     applyButtonStyle(modeButton);
-    modeButton.title = "切换发展模式：发育（经济优先）/ 侵略（战斗优先）";
+    modeButton.title = "切换发展模式：发育（Alt+Shift+1）/ 侵略（Alt+Shift+2）";
     modeButton.addEventListener("click", () => {
       const next = state.control.mode === "aggress" ? "develop" : "aggress";
-      window.postMessage(
-        { channel: CHANNEL, kind: "control:update", payload: { mode: next } },
-        "*",
-      );
+      updateControl({ mode: next });
     });
 
     const recallButton = document.createElement("button");
     recallButton.type = "button";
     applyButtonStyle(recallButton);
-    recallButton.title = "一键召回：所有游侠/先锋回核心防守（再点一次解除）";
+    recallButton.title = "一键召回（Alt+Shift+C）：所有游侠/先锋回核心防守，再点一次解除";
     recallButton.addEventListener("click", () => {
-      window.postMessage(
-        {
-          channel: CHANNEL,
-          kind: "control:update",
-          payload: { recall: !state.control.recall },
-        },
-        "*",
-      );
+      updateControl({ recall: !state.control.recall });
     });
 
     const makeStatus = (key, title) => {
@@ -328,7 +353,7 @@
 
     const statsButton = document.createElement("button");
     statsButton.type = "button";
-    statsButton.textContent = "📊 统计";
+    statsButton.textContent = "统计";
     statsButton.title = "显示/隐藏统计面板";
     applyButtonStyle(statsButton);
     statsButton.addEventListener("click", () => {
@@ -355,7 +380,7 @@
     Object.assign(panel.style, {
       position: "fixed",
       display: "none",
-      width: "340px",
+      width: "min(390px, calc(100vw - 16px))",
       maxHeight: "72vh",
       overflowY: "auto",
       padding: "10px 12px 12px",
@@ -365,7 +390,7 @@
       color: "#d9e1eb",
       font: "12px system-ui, -apple-system, Segoe UI, sans-serif",
       boxShadow: "0 8px 28px rgba(0,0,0,0.42)",
-      zIndex: "9500",
+      zIndex: "90",
       pointerEvents: "auto",
       userSelect: "none",
     });
@@ -407,8 +432,17 @@
           ["resources", "资源 / 容量"],
           ["population", "人口 (工/先/游)"],
           ["core", "核心 HP / 盾"],
+          ["core_position", "核心坐标"],
+          ["beacon_position", "信标坐标"],
           ["visible_enemies", "可见敌人"],
           ["owns_beacon", "持有信标"],
+          ["visible_resource_cells", "当前可见矿点"],
+          ["known_resource_cells", "记忆矿点"],
+          ["worker_cargo", "工人携带资源"],
+          ["exploring_workers", "向外探索工人"],
+          ["max_worker_search_radius", "最远探索半径"],
+          ["active_routes", "规划路线 / 完整路线"],
+          ["tick_interval", "回合间隔"],
         ],
       },
       {
@@ -423,6 +457,9 @@
           ["harvest_count", "采集次数"],
           ["deposit_count", "提交次数"],
           ["shoot_count", "射击次数"],
+          ["move_failures", "移动失败"],
+          ["manual_overrides", "Manual 覆盖"],
+          ["observed_turns", "已观察回合"],
           ["core_events", "核心事件数"],
           ["up_time", "存活回合数"],
         ],
@@ -459,6 +496,23 @@
         panel.appendChild(row);
         state.statusElements.set(`stats:${key}`, value);
       }
+    }
+
+    for (const [key, headingText] of [
+      ["event_totals", "全部事件计数"],
+      ["decision_totals", "全部策略决策计数"],
+    ]) {
+      const heading = document.createElement("div");
+      heading.textContent = headingText;
+      Object.assign(heading.style, {
+        fontWeight: "700",
+        fontSize: "12px",
+        color: "#8fbbae",
+        margin: "10px 0 4px",
+      });
+      const container = document.createElement("div");
+      panel.append(heading, container);
+      state.statsCounterContainers.set(key, container);
     }
 
     document.documentElement.appendChild(panel);
@@ -501,8 +555,17 @@
       "stats:resources": `${stats.resources}/${stats.capacity}`,
       "stats:population": `${stats.workers}/${stats.vanguards}/${stats.rangers}`,
       "stats:core": `${stats.core_hp}/${stats.core_shield}`,
+      "stats:core_position": formatPosition(stats.core_position),
+      "stats:beacon_position": formatPosition(stats.beacon_position),
       "stats:visible_enemies": String(stats.visible_enemies),
       "stats:owns_beacon": stats.owns_beacon ? "是" : "否",
+      "stats:visible_resource_cells": String(stats.visible_resource_cells),
+      "stats:known_resource_cells": String(stats.known_resource_cells),
+      "stats:worker_cargo": String(stats.worker_cargo),
+      "stats:exploring_workers": String(stats.exploring_workers),
+      "stats:max_worker_search_radius": String(stats.max_worker_search_radius),
+      "stats:active_routes": `${stats.active_routes}/${stats.complete_routes}`,
+      "stats:tick_interval": `${stats.tick_interval} tick`,
       "stats:total_resources_harvested": String(stats.total_resources_harvested),
       "stats:total_resources_deposited": String(stats.total_resources_deposited),
       "stats:total_resources_captured": String(stats.total_resources_captured),
@@ -512,6 +575,9 @@
       "stats:harvest_count": String(stats.harvest_count),
       "stats:deposit_count": String(stats.deposit_count),
       "stats:shoot_count": String(stats.shoot_count),
+      "stats:move_failures": String(stats.move_failures),
+      "stats:manual_overrides": String(stats.manual_overrides),
+      "stats:observed_turns": String(stats.observed_turns),
       "stats:core_events": String(stats.core_events),
       "stats:up_time": String(stats.up_time),
     };
@@ -521,6 +587,57 @@
         element.textContent = text;
       }
     }
+    renderCounterStats("event_totals", stats.event_totals);
+    renderCounterStats("decision_totals", stats.decision_totals);
+  }
+
+  function formatPosition(value) {
+    return Array.isArray(value) && value.length === 2
+      ? `[${value[0]}, ${value[1]}]`
+      : "-";
+  }
+
+  function renderCounterStats(key, values) {
+    const container = state.statsCounterContainers.get(key);
+    if (!container) {
+      return;
+    }
+    container.replaceChildren();
+    const entries = values && typeof values === "object"
+      ? Object.entries(values).sort(([left], [right]) => left.localeCompare(right))
+      : [];
+    if (!entries.length) {
+      const empty = document.createElement("div");
+      empty.textContent = "暂无数据";
+      empty.style.color = "#7f8996";
+      empty.style.padding = "4px 0";
+      container.appendChild(empty);
+      return;
+    }
+    for (const [label, count] of entries) {
+      const row = document.createElement("div");
+      Object.assign(row.style, {
+        display: "flex",
+        justifyContent: "space-between",
+        gap: "12px",
+        minHeight: "21px",
+        borderBottom: "1px solid rgba(255,255,255,0.05)",
+      });
+      const name = document.createElement("span");
+      name.textContent = label;
+      name.style.color = "#aeb9c6";
+      name.style.overflowWrap = "anywhere";
+      const value = document.createElement("span");
+      value.textContent = String(count);
+      value.style.fontFamily = "ui-monospace, SFMono-Regular, Consolas, monospace";
+      value.style.color = "#eef2f7";
+      row.append(name, value);
+      container.appendChild(row);
+    }
+  }
+
+  function updateControl(payload) {
+    window.postMessage({ channel: CHANNEL, kind: "control:update", payload }, "*");
   }
 
   function updateSettings(update) {
@@ -550,12 +667,12 @@
     }
     if (state.modeButton) {
       const mode = state.control.mode;
-      state.modeButton.textContent = mode === "aggress" ? "⚔ 侵略" : "🌱 发育";
+      state.modeButton.textContent = mode === "aggress" ? "侵略模式" : "发育模式";
       state.modeButton.style.color = mode === "aggress" ? "#d98a7a" : "#9bcbbd";
     }
     if (state.recallButton) {
       const recall = state.control.recall;
-      state.recallButton.textContent = recall ? "🛡 召回中" : "一键召回";
+      state.recallButton.textContent = recall ? "召回中" : "一键召回";
       state.recallButton.style.color = recall ? "#e0b25c" : "#8f9cad";
     }
     if (state.statsPanel) {
@@ -600,12 +717,12 @@
     state.settingsPanel.style.left = `${left}px`;
     state.settingsPanel.style.top = `${top + 37}px`;
     // 状态栏放在右上角
-    const statusBarWidth = 600;
+    const statusBarWidth = Math.min(720, Math.max(260, rect.width - 20));
     const barLeft = Math.max(8, rect.right - statusBarWidth - 10);
     state.statusBar.style.left = `${barLeft}px`;
     state.statusBar.style.top = `${Math.max(8, rect.top + 10)}px`;
     // 统计面板紧跟状态栏下方
-    const panelLeft = Math.max(8, rect.right - 360 - 10);
+    const panelLeft = Math.max(8, rect.right - Math.min(390, rect.width - 20) - 10);
     if (state.statsPanel) {
       state.statsPanel.style.left = `${panelLeft}px`;
       state.statsPanel.style.top = `${Math.max(8, rect.top + 46)}px`;
@@ -996,7 +1113,12 @@
   function render(now) {
     createOverlay();
     createControls();
-    if (!state.overlay || !state.context || !arenaPageVisible()) {
+    if (
+      !state.overlay ||
+      !state.context ||
+      !arenaPageVisible() ||
+      officialDialogVisible()
+    ) {
       if (state.overlay) {
         state.overlay.style.display = "none";
       }
@@ -1086,6 +1208,15 @@
     if (!editing && event.altKey && event.shiftKey && event.code === "KeyR") {
       event.preventDefault();
       toggleRoutes();
+    } else if (!editing && event.altKey && event.shiftKey && event.code === "Digit1") {
+      event.preventDefault();
+      updateControl({ mode: "develop" });
+    } else if (!editing && event.altKey && event.shiftKey && event.code === "Digit2") {
+      event.preventDefault();
+      updateControl({ mode: "aggress" });
+    } else if (!editing && event.altKey && event.shiftKey && event.code === "KeyC") {
+      event.preventDefault();
+      updateControl({ recall: !state.control.recall });
     }
   });
   window.addEventListener("blur", () => {

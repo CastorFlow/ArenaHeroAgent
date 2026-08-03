@@ -11,3 +11,5 @@ arena_hero_telemetry.jsonl
 .arena_hero_control.json
 
 *.tmp
+
+*.test-backup

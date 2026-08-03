@@ -36,6 +36,8 @@ from arena_hero import (
 
 from arena_hero_tactic import choose_actions
 from arena_hero_strategy import (
+    CONTROL_FILENAME,
+    DEVELOP_WIDE_SEARCH_MAX_RADIUS,
     MODE_AGGRESS,
     MODE_DEVELOP,
     PlannedMove,
@@ -46,8 +48,19 @@ from arena_hero_strategy import (
     WorkerGoal,
     _chunk_of,
     _chunk_quota,
+    _distance,
     _refill_tick_at_or_after,
 )
+
+# 隔离真实 control 文件：测试默认应跑在 develop 模式，不受项目目录里的
+# .arena_hero_control.json（可能被玩家设为 aggress/recall）影响。
+_control_backup = Path(CONTROL_FILENAME + ".test-backup")
+if Path(CONTROL_FILENAME).is_file() and not _control_backup.exists():
+    Path(CONTROL_FILENAME).replace(_control_backup)
+    _restore_control_file = lambda: _control_backup.replace(Path(CONTROL_FILENAME))
+    import atexit
+
+    atexit.register(_restore_control_file)
 
 
 CORE_ID = UUID("00000000-0000-4000-8000-000000000100")
@@ -670,7 +683,7 @@ class BalancedTacticTests(unittest.TestCase):
 
         self.assertNotIsInstance(turn.plan.core_action, SpawnAction)
 
-    def test_core_uses_final_population_slot_for_third_vanguard_with_reserve(
+    def test_develop_mode_uses_next_population_slot_for_worker_growth(
         self,
     ) -> None:
         turn, _ = make_turn(
@@ -694,7 +707,7 @@ class BalancedTacticTests(unittest.TestCase):
         SmartTactic(TacticMemory()).choose_actions(turn)
 
         self.assertIsInstance(turn.plan.core_action, SpawnAction)
-        self.assertEqual(turn.plan.core_action.unit_type, UnitType.VANGUARD)
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.WORKER)
 
     def test_core_expands_workers_after_defense_is_fully_staffed(self) -> None:
         turn, _ = make_turn(
@@ -771,7 +784,7 @@ class BalancedTacticTests(unittest.TestCase):
         self.assertIsInstance(turn.plan.core_action, SpawnAction)
         self.assertEqual(turn.plan.core_action.unit_type, UnitType.RANGER)
 
-    def test_core_adds_fourth_ranger_after_economy_and_base_defense(self) -> None:
+    def test_develop_mode_prefers_ninth_worker_over_fourth_ranger(self) -> None:
         turn, _ = make_turn(
             own_core=core((0, 0)),
             units=(
@@ -796,9 +809,9 @@ class BalancedTacticTests(unittest.TestCase):
         SmartTactic(TacticMemory()).choose_actions(turn)
 
         self.assertIsInstance(turn.plan.core_action, SpawnAction)
-        self.assertEqual(turn.plan.core_action.unit_type, UnitType.RANGER)
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.WORKER)
 
-    def test_core_adds_fourth_vanguard_after_fourth_ranger(self) -> None:
+    def test_develop_mode_prefers_ninth_worker_over_fourth_vanguard(self) -> None:
         turn, _ = make_turn(
             own_core=core((0, 0)),
             units=(
@@ -824,9 +837,9 @@ class BalancedTacticTests(unittest.TestCase):
         SmartTactic(TacticMemory()).choose_actions(turn)
 
         self.assertIsInstance(turn.plan.core_action, SpawnAction)
-        self.assertEqual(turn.plan.core_action.unit_type, UnitType.VANGUARD)
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.WORKER)
 
-    def test_core_keeps_reserve_before_fourth_ranger(self) -> None:
+    def test_develop_mode_expands_workers_while_preserving_reserve(self) -> None:
         turn, _ = make_turn(
             own_core=core((0, 0)),
             units=(
@@ -850,7 +863,8 @@ class BalancedTacticTests(unittest.TestCase):
 
         SmartTactic(TacticMemory()).choose_actions(turn)
 
-        self.assertNotIsInstance(turn.plan.core_action, SpawnAction)
+        self.assertIsInstance(turn.plan.core_action, SpawnAction)
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.WORKER)
 
     def test_core_stops_expansion_at_population_sixteen(self) -> None:
         turn, _ = make_turn(
@@ -878,7 +892,8 @@ class BalancedTacticTests(unittest.TestCase):
 
         SmartTactic(TacticMemory()).choose_actions(turn)
 
-        self.assertNotIsInstance(turn.plan.core_action, SpawnAction)
+        # 人口上限已改为 19，16 人时可以继续生产
+        self.assertIsInstance(turn.plan.core_action, SpawnAction)
 
     def test_memory_learns_failed_terrain_destination(self) -> None:
         memory = TacticMemory(
@@ -1140,8 +1155,8 @@ class BalancedTacticTests(unittest.TestCase):
 
         SmartTactic(memory).choose_actions(turn)
 
-        self.assertIsInstance(turn.plan.core_action, StartMoveAction)
-        self.assertEqual(turn.plan.core_action.direction, Direction.RIGHT)
+        # Core 迁移已默认关闭，core 保持固定
+        self.assertIsNone(turn.plan.core_action)
 
     def test_workers_receive_distinct_nearest_resource_assignments(self) -> None:
         turn, _ = make_turn(
@@ -1223,10 +1238,9 @@ class BalancedTacticTests(unittest.TestCase):
 
         SmartTactic(memory).choose_actions(turn)
 
-        self.assertIsInstance(turn.plan.core_action, StartMoveAction)
-        self.assertEqual(turn.plan.core_action.direction, Direction.RIGHT)
-        self.assertEqual(memory.core_heading, Direction.RIGHT)
-        self.assertEqual(memory.last_core_move_tick, 8)
+        # Core 迁移已默认关闭，core 保持固定
+        self.assertIsNone(turn.plan.core_action)
+        self.assertIsNone(memory.core_heading)
 
     def test_cargo_worker_at_exactly_five_cells_blocks_core_migration(self) -> None:
         turn, _ = make_turn(
@@ -1246,9 +1260,8 @@ class BalancedTacticTests(unittest.TestCase):
 
         summary = SmartTactic(TacticMemory()).choose_actions(turn)
 
-        self.assertIsInstance(turn.plan.core_action, StartMoveAction)
-        self.assertEqual(turn.plan.core_action.direction, Direction.RIGHT)
-        self.assertTrue(any("reason=rendezvous_cargo" in item for item in summary.decisions))
+        # Core 迁移已默认关闭（CORE_MIGRATION_ENABLED=False），core 保持固定
+        self.assertIsNone(turn.plan.core_action)
 
     def test_core_waits_when_only_legal_step_moves_away_from_beacon(self) -> None:
         turn, _ = make_turn(
@@ -1271,14 +1284,8 @@ class BalancedTacticTests(unittest.TestCase):
 
         summary = SmartTactic(TacticMemory()).choose_actions(turn)
 
-        self.assertIsInstance(turn.plan.core_action, StartMoveAction)
-        self.assertIn(
-            turn.plan.core_action.direction,
-            {Direction.UP, Direction.RIGHT},
-        )
-        self.assertTrue(
-            any("beacon=(10, -10)" in item for item in summary.decisions)
-        )
+        # Core 迁移已默认关闭，core 保持固定
+        self.assertIsNone(turn.plan.core_action)
 
     def test_core_does_not_immediately_reverse_for_multiple_distant_cargo_workers(
         self,
@@ -1299,8 +1306,8 @@ class BalancedTacticTests(unittest.TestCase):
 
         SmartTactic(memory).choose_actions(turn)
 
-        self.assertIsInstance(turn.plan.core_action, StartMoveAction)
-        self.assertEqual(turn.plan.core_action.direction, Direction.UP)
+        # Core 迁移已默认关闭，core 保持固定
+        self.assertIsNone(turn.plan.core_action)
 
     def test_enemy_within_eight_cells_blocks_core_migration(self) -> None:
         memory = TacticMemory(
@@ -1436,7 +1443,9 @@ class BalancedTacticTests(unittest.TestCase):
         self.assertFalse(any("last_seen_resource" in item for item in summary.decisions))
         self.assertEqual(memory.worker_goals[str(WORKER_LOW)].kind, "frontier")
 
-    def test_frontier_exploration_reduces_beacon_distance(self) -> None:
+    def test_develop_resource_search_uses_worker_sector_instead_of_beacon_bias(
+        self,
+    ) -> None:
         memory = TacticMemory()
         beacon_position = (20, -20)
         turn, _ = make_turn(
@@ -1448,12 +1457,9 @@ class BalancedTacticTests(unittest.TestCase):
         SmartTactic(memory).choose_actions(turn)
 
         goal = memory.worker_goals[str(WORKER_LOW)]
-        core_distance = abs(beacon_position[0]) + abs(beacon_position[1])
-        goal_distance = abs(goal.position[0] - beacon_position[0]) + abs(
-            goal.position[1] - beacon_position[1]
-        )
-        self.assertEqual(goal.kind, "frontier")
-        self.assertLess(goal_distance, core_distance)
+        self.assertEqual(goal.kind, "develop_frontier")
+        self.assertGreater(goal.position[0], 0)
+        self.assertEqual(goal.position[1], 0)
 
     def test_long_backward_refill_probe_is_replaced_by_beacon_frontier(self) -> None:
         memory = TacticMemory(
@@ -1670,7 +1676,53 @@ class ModeAndRecallTests(unittest.TestCase):
             self.assertIsInstance(turn.plan.core_action, SpawnAction)
             self.assertEqual(turn.plan.core_action.unit_type, UnitType.WORKER)
 
-    def test_aggress_vanguard_advances_toward_beacon_when_no_enemies(self) -> None:
+    def test_develop_mode_sends_empty_workers_to_eight_resource_search_sectors(
+        self,
+    ) -> None:
+        units = (
+            worker(WORKER_LOW, (1, 0)),
+            worker(WORKER_HIGH, (1, 1)),
+            worker(WORKER_THIRD, (0, 1)),
+            worker(WORKER_FOURTH, (-1, 1)),
+            worker(WORKER_FIFTH, (-1, 0)),
+            worker(WORKER_SIXTH, (-1, -1)),
+            worker(WORKER_SEVENTH, (0, -1)),
+            worker(WORKER_EIGHTH, (1, -1)),
+        )
+        turn, _ = make_turn(
+            tick=16,
+            own_core=core((0, 0)),
+            units=units,
+        )
+        memory = TacticMemory(mode=MODE_DEVELOP)
+
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            self._write_control(control_path, mode="develop")
+            SmartTactic(
+                memory,
+                control_path=control_path,
+            ).choose_actions(turn)
+
+        goals = [memory.worker_goals[str(worker_view.id)] for worker_view in units]
+        sectors = {
+            (
+                (goal.position[0] > 0) - (goal.position[0] < 0),
+                (goal.position[1] > 0) - (goal.position[1] < 0),
+            )
+            for goal in goals
+        }
+        self.assertTrue(all(goal.kind == "develop_frontier" for goal in goals))
+        self.assertEqual(len(sectors), 8)
+        self.assertTrue(
+            all(
+                isinstance(turn.plan.unit_actions.get(worker_view.id), MoveAction)
+                for worker_view in units
+            )
+        )
+        self.assertEqual(memory.decision_totals["worker:develop_explore"], 8)
+
+    def test_aggress_vanguard_explores_frontier_when_no_enemies(self) -> None:
         with TemporaryDirectory() as directory:
             control_path = Path(directory) / ".arena_hero_control.json"
             self._write_control(control_path, mode="aggress")
@@ -1683,7 +1735,7 @@ class ModeAndRecallTests(unittest.TestCase):
             action = turn.plan.unit_actions.get(VANGUARD_ID)
             self.assertIsInstance(action, MoveAction)
 
-    def test_aggress_ranger_advances_toward_beacon_when_no_enemies(self) -> None:
+    def test_aggress_ranger_explores_frontier_when_no_enemies(self) -> None:
         with TemporaryDirectory() as directory:
             control_path = Path(directory) / ".arena_hero_control.json"
             self._write_control(control_path, mode="aggress")
@@ -1695,6 +1747,51 @@ class ModeAndRecallTests(unittest.TestCase):
 
             action = turn.plan.unit_actions.get(RANGER_ID)
             self.assertIsInstance(action, MoveAction)
+
+    def test_aggress_main_force_explores_when_own_core_carries_beacon(self) -> None:
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            self._write_control(control_path, mode="aggress")
+            own = core((5, 5))
+            turn, _ = make_turn(
+                tick=8,
+                own_core=own,
+                units=(
+                    vanguard((6, 5)),
+                    vanguard((7, 5), VANGUARD_TWO_ID),
+                    ranger((6, 6)),
+                    ranger((7, 6), RANGER_TWO_ID),
+                ),
+                beacon=ChampionBeacon(
+                    position=own.position,
+                    status=BeaconStatus.CARRIED,
+                    carrier_id=CORE_ID,
+                ),
+            )
+
+            SmartTactic(TacticMemory(), control_path=control_path).choose_actions(turn)
+
+            vanguard_action = turn.plan.unit_actions.get(VANGUARD_TWO_ID)
+            ranger_action = turn.plan.unit_actions.get(RANGER_TWO_ID)
+            self.assertIsInstance(vanguard_action, MoveAction)
+            self.assertIsInstance(ranger_action, MoveAction)
+            self.assertNotEqual(vanguard_action.direction, Direction.LEFT)
+            self.assertNotEqual(ranger_action.direction, Direction.LEFT)
+
+    def test_enemy_sighting_is_removed_when_its_cell_is_seen_empty(self) -> None:
+        memory = TacticMemory()
+        visible_turn, _ = make_turn(
+            tick=8,
+            own_core=core((5, 5)),
+            enemies=(enemy_ranger((8, 5)),),
+        )
+        memory.observe(visible_turn)
+        self.assertIn(str(ENEMY_RANGER_ID), memory.enemy_sightings)
+
+        empty_turn, _ = make_turn(tick=9, own_core=core((5, 5)))
+        memory.observe(empty_turn)
+
+        self.assertNotIn(str(ENEMY_RANGER_ID), memory.enemy_sightings)
 
     def test_recall_vanguards_return_to_core(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1812,6 +1909,83 @@ class ModeAndRecallTests(unittest.TestCase):
 
         self.assertEqual(payload["total_resources_harvested"], 2)
         self.assertEqual(payload["total_resources_deposited"], 2)
+
+    def test_write_stats_includes_real_and_detailed_counters(self) -> None:
+        memory = TacticMemory()
+        memory.event_totals.update(
+            {
+                "CORE_SPAWN_SUCCEEDED": 3,
+                "UNIT_MOVE_FAILED": 4,
+            }
+        )
+        memory.decision_totals.update(
+            {
+                "manual_override:move": 2,
+                "worker:harvest": 5,
+            }
+        )
+        turn, _ = make_turn(
+            tick=12,
+            own_core=core((5, 5)),
+            units=(worker(WORKER_LOW, (6, 5), cargo=1),),
+            resource_cells=((8, 5),),
+        )
+        memory.observe(turn)
+        with TemporaryDirectory() as directory:
+            stats_path = Path(directory) / "stats.json"
+            memory.write_stats(stats_path, turn)
+            payload = json.loads(stats_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["units_built"], 3)
+        self.assertEqual(payload["move_failures"], 4)
+        self.assertEqual(payload["manual_overrides"], 2)
+        self.assertEqual(payload["worker_cargo"], 1)
+        self.assertEqual(payload["visible_resource_cells"], 1)
+        self.assertEqual(payload["event_totals"]["CORE_SPAWN_SUCCEEDED"], 3)
+        self.assertEqual(payload["decision_totals"]["worker:harvest"], 5)
+
+
+    def test_full_capacity_skips_frontier_expansion(self) -> None:
+        # 满仓（资源=容量）时不再派 frontier/refilled 探索目标，工人就地驻守
+        turn, _ = make_turn(
+            own_core=core((0, 0)),
+            units=(worker(WORKER_LOW, (1, 0)),),
+            resources=10,  # capacity = max(10, 1*5) = 10 → 满仓
+        )
+        memory = TacticMemory()
+        SmartTactic(memory).choose_actions(turn)
+
+        for goal in memory.worker_goals.values():
+            self.assertNotIn(
+                goal.kind,
+                {"frontier", "develop_frontier", "refilled_chunk"},
+            )
+
+    def test_wide_search_radius_capped_at_24(self) -> None:
+        # 发育模式无已知资源时触发 wide_search，但半径封顶 24 格
+        memory = TacticMemory(mode=MODE_DEVELOP)
+        tactic = SmartTactic(memory)
+        for tick in range(100, 112):
+            turn, _ = make_turn(
+                tick=tick,
+                own_core=core((0, 0)),
+                units=(worker(WORKER_LOW, (1, 0)),),
+                resources=0,
+            )
+            tactic.choose_actions(turn)
+
+        core_position = (0, 0)
+        frontier_goals = [
+            goal
+            for goal in memory.worker_goals.values()
+            if goal.kind == "develop_frontier"
+        ]
+        self.assertTrue(frontier_goals)
+        for goal in frontier_goals:
+            self.assertLessEqual(
+                _distance(core_position, goal.position),
+                DEVELOP_WIDE_SEARCH_MAX_RADIUS,
+            )
 
 
 if __name__ == "__main__":

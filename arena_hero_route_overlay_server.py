@@ -29,9 +29,25 @@ EMPTY_STATS = {
     "rangers": 0,
     "core_hp": 0,
     "core_shield": 0,
+    "core_state": "RESPAWNING",
+    "core_position": None,
+    "beacon_position": [0, 0],
+    "beacon_status": "UNCLAIMED",
     "visible_enemies": 0,
     "owns_beacon": False,
-    "ticks_since_last_tick": 0,
+    "visible_resource_cells": 0,
+    "known_resource_cells": 0,
+    "known_obstacle_cells": 0,
+    "visited_cells": 0,
+    "worker_cargo": 0,
+    "active_routes": 0,
+    "complete_routes": 0,
+    "remembered_enemies": 0,
+    "exploring_workers": 0,
+    "max_worker_search_radius": 0,
+    "tick_interval": 0,
+    "observed_turns": 0,
+    "elapsed_ticks": 0,
     "total_resources_harvested": 0,
     "total_resources_deposited": 0,
     "total_resources_captured": 0,
@@ -43,8 +59,15 @@ EMPTY_STATS = {
     "harvest_count": 0,
     "deposit_count": 0,
     "shoot_count": 0,
+    "move_failures": 0,
+    "manual_overrides": 0,
+    "event_totals": {},
+    "decision_totals": {},
 }
 VALID_MODES = {"develop", "aggress"}
+POSITION_STATS = {"core_position", "beacon_position"}
+COUNTER_STATS = {"event_totals", "decision_totals"}
+SENSITIVE_KEY_PARTS = ("api", "authorization", "credential", "secret", "token")
 
 
 def _position(value: Any) -> list[int] | None:
@@ -160,11 +183,53 @@ def load_routes(path: Path) -> dict[str, Any]:
 def load_stats(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            return dict(EMPTY_STATS)
-        return data
+        return _normalize_stats(data)
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return dict(EMPTY_STATS)
+
+
+def _normalize_counter(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, int] = {}
+    for key, count in value.items():
+        if (
+            not isinstance(key, str)
+            or len(key) > 128
+            or any(part in key.lower() for part in SENSITIVE_KEY_PARTS)
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+        ):
+            continue
+        result[key] = max(0, int(count))
+    return dict(sorted(result.items()))
+
+
+def _normalize_stats(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return dict(EMPTY_STATS)
+    result: dict[str, Any] = {}
+    for key, default in EMPTY_STATS.items():
+        value = payload.get(key, default)
+        if key in COUNTER_STATS:
+            result[key] = _normalize_counter(value)
+        elif key in POSITION_STATS:
+            result[key] = _position(value) if value is not None else None
+        elif isinstance(default, bool):
+            result[key] = value if isinstance(value, bool) else default
+        elif isinstance(default, int):
+            result[key] = (
+                max(0, int(value))
+                if isinstance(value, int) and not isinstance(value, bool)
+                else default
+            )
+        elif isinstance(default, str):
+            result[key] = str(value)[:64] if isinstance(value, str) else default
+        else:
+            result[key] = default
+    if result["mode"] not in VALID_MODES:
+        result["mode"] = "develop"
+    return result
 
 
 def load_control(path: Path) -> dict[str, Any]:
@@ -253,6 +318,10 @@ class RouteOverlayHandler(BaseHTTPRequestHandler):
         endpoint = self.path.partition("?")[0]
         if endpoint != "/control":
             self._send_json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
+            return
+        origin = self.headers.get("Origin", "")
+        if origin and not origin.startswith(("chrome-extension://", "extension://")):
+            self._send_json({"error": "forbidden_origin"}, HTTPStatus.FORBIDDEN)
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
