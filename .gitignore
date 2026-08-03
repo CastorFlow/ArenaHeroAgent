@@ -1,0 +1,8 @@
+.arena_hero_api_key.dpapi
+.venv/
+__pycache__/
+*.pyc
+arena_hero_telemetry.jsonl
+.arena_hero_memory.json
+.arena_hero_routes.json
+.arena_hero_recovery_targets.json

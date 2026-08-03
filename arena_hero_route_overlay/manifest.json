@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "Arena Hero Agent Route Overlay",
+  "version": "1.1.0",
+  "description": "Adjustable read-only Agent routes, unit labels, resources, and grid coordinates.",
+  "minimum_chrome_version": "111",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8765/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Arena Hero Agent Route Overlay"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://app.arenahero.io/*"
+      ],
+      "js": [
+        "overlay-core.js",
+        "overlay-main.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://app.arenahero.io/*"
+      ],
+      "js": [
+        "bridge.js"
+      ],
+      "run_at": "document_start"
+    }
+  ]
+}
