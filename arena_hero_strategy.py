@@ -1127,7 +1127,8 @@ def _find_path(
     blocked: set[Position],
     threat: Counter[Position],
     visited: Counter[Position],
-    max_expansions: int = 900,
+    max_expansions: int = 2000,
+    ignore_occupancy_goals: bool = True,
 ) -> tuple[Direction, ...]:
     if start == goal:
         return ()
@@ -1194,7 +1195,7 @@ class MovementPlanner:
             position not in self.obstacles
             and position not in self.enemy_cells
             and self.memory.temporary_blocks.get(position, 0) <= self.turn.tick
-            and self.final_occupancy(position) < 2
+            and self.final_occupancy(position) < 3
         )
 
     def _blocked(
@@ -1213,7 +1214,7 @@ class MovementPlanner:
         blocked.update(
             position
             for position in self.occupancy
-            if position != unit.position and position != goal and self.final_occupancy(position) >= 2
+            if position != unit.position and position != goal and self.final_occupancy(position) >= 3
         )
         return blocked
 
