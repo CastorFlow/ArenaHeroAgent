@@ -35,7 +35,8 @@ ROUTE_OVERLAY_VERSION = 2
 
 MODE_DEVELOP = "develop"
 MODE_AGGRESS = "aggress"
-MODE_VALUES = {MODE_DEVELOP, MODE_AGGRESS}
+MODE_BEACON = "beacon"
+MODE_VALUES = {MODE_DEVELOP, MODE_AGGRESS, MODE_BEACON}
 DEVELOP_TARGET_WORKERS = 12
 DEVELOP_TARGET_VANGUARDS = 2
 DEVELOP_TARGET_RANGERS = 2
@@ -1800,6 +1801,25 @@ class SmartTactic:
                 reserved_targets,
             )
 
+        if self.memory.mode == MODE_BEACON and not owns_beacon:
+            # 抢信标模式：未分配的工人也向信标推进（作为拾取/侦察/支援）
+            for worker_id, worker in list(unassigned.items()):
+                if _distance(worker.position, turn.beacon.position) <= 1:
+                    continue
+                self.memory.set_worker_goal(
+                    worker,
+                    "beacon",
+                    turn.beacon.position,
+                    turn.tick,
+                )
+                if planner.toward(worker, turn.beacon.position, "beacon"):
+                    unassigned.pop(worker_id, None)
+                    decisions.append(
+                        f"worker:{_short_id(worker.id)} beacon_advance "
+                        f"target={turn.beacon.position}"
+                    )
+                    self.memory.decision_totals["worker:beacon"] += 1
+
         for worker_id, worker in list(unassigned.items()):
             if full_capacity:
                 # 满仓：不派新探索目标，工人就地驻守等待 core 腾空间
@@ -2347,6 +2367,8 @@ class SmartTactic:
             self._choose_vanguards_recall(turn, planner, acted_units, decisions)
         elif self.memory.mode == MODE_AGGRESS:
             self._choose_vanguards_aggress(turn, planner, acted_units, decisions)
+        elif self.memory.mode == MODE_BEACON:
+            self._choose_vanguards_beacon(turn, planner, acted_units, decisions)
         else:
             self._choose_vanguards_defend(turn, planner, acted_units, decisions)
 
@@ -2499,6 +2521,51 @@ class SmartTactic:
             ):
                 candidates.append((enemy, enemy.position))
         return candidates
+
+    def _choose_vanguards_beacon(
+        self,
+        turn: Turn,
+        planner: MovementPlanner,
+        acted_units: set[UUID],
+        decisions: list[str],
+    ) -> None:
+        beacon_position = turn.beacon.position
+        for vanguard in sorted(turn.vanguards, key=_uuid_key):
+            if vanguard.id in acted_units:
+                continue
+            direction = self._sweep_targets(vanguard, turn)
+            if direction is not None:
+                vanguard.sweep(direction)
+                decisions.append(
+                    f"vanguard:{_short_id(vanguard.id)} sweep {direction.value} reason=beacon"
+                )
+                self.memory.decision_totals["vanguard:sweep"] += 1
+                continue
+            if turn.core is not None:
+                # 家被摸：先救家再抢信标
+                threatening = [
+                    enemy
+                    for enemy in turn.visible_enemies
+                    if _distance(enemy.position, turn.core.position) <= 5
+                ]
+                if threatening:
+                    target = min(
+                        threatening,
+                        key=lambda enemy: (
+                            _enemy_role_priority(enemy),
+                            _distance(vanguard.position, enemy.position),
+                            enemy.id.bytes,
+                        ),
+                    )
+                    planner.toward(vanguard, target.position, "beacon_defend_core")
+                    continue
+            if _distance(vanguard.position, beacon_position) > 1:
+                planner.toward(vanguard, beacon_position, "beacon_assault")
+                decisions.append(
+                    f"vanguard:{_short_id(vanguard.id)} beacon_advance "
+                    f"target={beacon_position}"
+                )
+                self.memory.decision_totals["vanguard:beacon"] += 1
 
     def _choose_vanguards_aggress(
         self,
@@ -2668,6 +2735,8 @@ class SmartTactic:
             self._choose_rangers_recall(turn, planner, acted_units, decisions)
         elif self.memory.mode == MODE_AGGRESS:
             self._choose_rangers_aggress(turn, planner, acted_units, decisions)
+        elif self.memory.mode == MODE_BEACON:
+            self._choose_rangers_beacon(turn, planner, acted_units, decisions)
         else:
             self._choose_rangers_defend(turn, planner, acted_units, decisions)
 
@@ -2754,6 +2823,62 @@ class SmartTactic:
             if frontier_target is not None:
                 planner.toward(ranger, frontier_target, "aggress_frontier")
                 self.memory.decision_totals["ranger:frontier"] += 1
+
+    def _choose_rangers_beacon(
+        self,
+        turn: Turn,
+        planner: MovementPlanner,
+        acted_units: set[UUID],
+        decisions: list[str],
+    ) -> None:
+        assigned_damage: Counter[UUID] = Counter()
+        beacon_position = turn.beacon.position
+        for ranger in sorted(turn.rangers, key=_uuid_key):
+            if ranger.id in acted_units:
+                continue
+            # 优先射信标附近的敌人
+            shot_candidates = [
+                (enemy, cell)
+                for enemy, cell in self._ranger_shot_candidates(turn, ranger, planner)
+                if _distance(enemy.position, beacon_position) <= 5
+            ]
+            if not shot_candidates:
+                shot_candidates = self._ranger_shot_candidates(turn, ranger, planner)
+            if shot_candidates:
+                target, cell = min(
+                    shot_candidates,
+                    key=lambda pair: (
+                        1 if assigned_damage[pair[0].id] >= _effective_hp(pair[0]) else 0,
+                        0 if isinstance(pair[0], CoreView) else 1,
+                        _enemy_role_priority(pair[0]),
+                        _effective_hp(pair[0]),
+                        _distance(ranger.position, pair[0].position),
+                        pair[0].id.bytes,
+                    ),
+                )
+                ranger.shoot(target, expected_cell=cell)
+                assigned_damage[target.id] += 1
+                decisions.append(
+                    f"ranger:{_short_id(ranger.id)} shoot target={_short_id(target.id)} "
+                    f"expected={cell} role=beacon"
+                )
+                self.memory.decision_totals["ranger:shoot"] += 1
+                continue
+            # 向信标方向推进
+            firing_cells = self._firing_cells(beacon_position, planner.obstacles)
+            if firing_cells:
+                firing_cell = min(
+                    firing_cells,
+                    key=lambda position: (
+                        planner.threat.get(position, 0),
+                        _distance(ranger.position, position),
+                        position,
+                    ),
+                )
+                planner.toward(ranger, firing_cell, "beacon_seek_firing")
+            else:
+                planner.toward(ranger, beacon_position, "beacon_advance")
+            self.memory.decision_totals["ranger:beacon_advance"] += 1
 
     def _choose_rangers_recall(
         self,
@@ -3141,6 +3266,29 @@ class SmartTactic:
                 elif rangers < 8 and budget >= 12:
                     spawn = UnitType.RANGER
                 elif vanguards < 5 and budget >= 10:
+                    spawn = UnitType.VANGUARD
+                elif (
+                    workers < 6
+                    and not near_threat
+                    and budget >= 5
+                    and projected_resources - 5 >= DEFENSE_REPLACEMENT_RESERVE
+                ):
+                    spawn = UnitType.WORKER
+            elif mode == MODE_BEACON:
+                # 抢信标模式：全力战斗单位，工人只保最低经济
+                if workers < 3 and budget >= 5:
+                    spawn = UnitType.WORKER
+                elif near_threat and rangers < 2 and budget >= 12:
+                    spawn = UnitType.RANGER
+                elif near_threat and vanguards < 2 and budget >= 10:
+                    spawn = UnitType.VANGUARD
+                elif rangers < 8 and budget >= 12:
+                    spawn = UnitType.RANGER
+                elif vanguards < 5 and budget >= 10:
+                    spawn = UnitType.VANGUARD
+                elif rangers < 12 and budget >= 12:
+                    spawn = UnitType.RANGER
+                elif vanguards < 8 and budget >= 10:
                     spawn = UnitType.VANGUARD
                 elif (
                     workers < 6

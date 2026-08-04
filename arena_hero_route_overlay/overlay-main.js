@@ -3,6 +3,11 @@
 
   const CHANNEL = "arena-hero-route-overlay/v1";
   const OVERLAY_ATTRIBUTE = "data-arena-hero-agent-route-overlay";
+  const MODE_LABELS = {
+    develop: "发育",
+    aggress: "侵略",
+    beacon: "抢信标",
+  };
   const core = globalThis.ArenaHeroOverlayCore;
   if (!core) {
     return;
@@ -321,9 +326,11 @@
     const modeButton = document.createElement("button");
     modeButton.type = "button";
     applyButtonStyle(modeButton);
-    modeButton.title = "切换发展模式：发育（Alt+Shift+1）/ 侵略（Alt+Shift+2）";
+    modeButton.title = "切换模式：发育 / 侵略 / 抢信标（Alt+Shift+1/2/3）";
     modeButton.addEventListener("click", () => {
-      const next = state.control.mode === "aggress" ? "develop" : "aggress";
+      const order = ["develop", "aggress", "beacon"];
+      const next =
+        order[(order.indexOf(state.control.mode) + 1) % order.length];
       updateControl({ mode: next });
     });
 
@@ -537,7 +544,7 @@
       setText("bar:beacon", "信标 -");
       return;
     }
-    const mode = stats.mode === "aggress" ? "侵略" : "发育";
+    const mode = MODE_LABELS[stats.mode] || "发育";
     setText("bar:tick", `Tick ${stats.tick}`);
     setText("bar:resources", `资源 ${stats.resources}/${stats.capacity}`);
     setText(
@@ -667,8 +674,14 @@
     }
     if (state.modeButton) {
       const mode = state.control.mode;
-      state.modeButton.textContent = mode === "aggress" ? "侵略模式" : "发育模式";
-      state.modeButton.style.color = mode === "aggress" ? "#d98a7a" : "#9bcbbd";
+      state.modeButton.textContent =
+        mode === "beacon"
+          ? "🚩 抢信标"
+          : mode === "aggress"
+            ? "⚔ 侵略"
+            : "🌱 发育";
+      state.modeButton.style.color =
+        mode === "beacon" ? "#c8a3e8" : mode === "aggress" ? "#d98a7a" : "#9bcbbd";
     }
     if (state.recallButton) {
       const recall = state.control.recall;
@@ -1177,7 +1190,7 @@
         renderStatusBar();
       } else if (message.kind === "control" && message.payload && typeof message.payload === "object") {
         state.control = {
-          mode: message.payload.mode === "aggress" ? "aggress" : "develop",
+          mode: message.payload.mode === "beacon" ? "beacon" : message.payload.mode === "aggress" ? "aggress" : "develop",
           recall: Boolean(message.payload.recall),
         };
         syncControls();
@@ -1214,6 +1227,9 @@
     } else if (!editing && event.altKey && event.shiftKey && event.code === "Digit2") {
       event.preventDefault();
       updateControl({ mode: "aggress" });
+    } else if (!editing && event.altKey && event.shiftKey && event.code === "Digit3") {
+      event.preventDefault();
+      updateControl({ mode: "beacon" });
     } else if (!editing && event.altKey && event.shiftKey && event.code === "KeyC") {
       event.preventDefault();
       updateControl({ recall: !state.control.recall });

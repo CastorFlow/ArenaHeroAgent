@@ -1989,7 +1989,21 @@ class ModeAndRecallTests(unittest.TestCase):
 
 
 class StuckHealPredictionTests(unittest.TestCase):
-    """迷路检测 + core 让路 + 回血 + 预判射击。"""
+    """迷路检测 + core 让路 + 回血 + 预判射击 + 抢信标。"""
+
+    def _write_control(
+        self,
+        path: Path,
+        *,
+        mode: str | None = None,
+        recall: bool | None = None,
+    ) -> None:
+        data: dict = {}
+        if mode is not None:
+            data["mode"] = mode
+        if recall is not None:
+            data["recall"] = recall
+        path.write_text(json.dumps(data), encoding="utf-8")
 
     def test_stuck_worker_clears_goal(self) -> None:
         memory = TacticMemory()
@@ -2148,6 +2162,68 @@ class StuckHealPredictionTests(unittest.TestCase):
         action = turn.plan.unit_actions.get(RANGER_ID)
         self.assertIsInstance(action, ShootAction)
         self.assertEqual(action.expected_cell, (7, 5))
+
+
+    def test_beacon_mode_vanguard_advances_to_beacon(self) -> None:
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            self._write_control(control_path, mode="beacon")
+            turn, _ = make_turn(
+                own_core=core((5, 5)),
+                units=(vanguard((10, 10)),),
+            )
+            SmartTactic(TacticMemory(), control_path=control_path).choose_actions(turn)
+
+            action = turn.plan.unit_actions.get(VANGUARD_ID)
+            self.assertIsInstance(action, MoveAction)
+            self.assertNotEqual(action.direction, Direction.LEFT)  # 朝信标方向而非离开
+
+    def test_beacon_mode_ranger_advances_to_beacon(self) -> None:
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            self._write_control(control_path, mode="beacon")
+            turn, _ = make_turn(
+                own_core=core((5, 5)),
+                units=(ranger((10, 10)),),
+            )
+            SmartTactic(TacticMemory(), control_path=control_path).choose_actions(turn)
+
+            action = turn.plan.unit_actions.get(RANGER_ID)
+            self.assertIsInstance(action, MoveAction)
+
+    def test_beacon_mode_worker_advances_to_beacon(self) -> None:
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            self._write_control(control_path, mode="beacon")
+            turn, _ = make_turn(
+                own_core=core((5, 5)),
+                units=(worker(WORKER_LOW, (6, 5)),),
+            )
+            summary = SmartTactic(TacticMemory(), control_path=control_path).choose_actions(turn)
+
+            self.assertTrue(
+                any("beacon_advance" in item for item in summary.decisions)
+            )
+
+    def test_beacon_mode_spawns_rangers(self) -> None:
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            self._write_control(control_path, mode="beacon")
+            turn, _ = make_turn(
+                own_core=core((0, 0)),
+                units=(
+                    worker(WORKER_LOW, (6, 0)),
+                    worker(WORKER_HIGH, (7, 0)),
+                    worker(WORKER_THIRD, (8, 0)),
+                    vanguard((3, 3)),
+                    ranger((3, 4)),
+                ),
+                resources=30,
+            )
+            SmartTactic(TacticMemory(), control_path=control_path).choose_actions(turn)
+
+            self.assertIsInstance(turn.plan.core_action, SpawnAction)
+            self.assertEqual(turn.plan.core_action.unit_type, UnitType.RANGER)
 
 
 if __name__ == "__main__":

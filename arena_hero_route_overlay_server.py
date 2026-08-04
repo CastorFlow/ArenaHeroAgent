@@ -64,7 +64,7 @@ EMPTY_STATS = {
     "event_totals": {},
     "decision_totals": {},
 }
-VALID_MODES = {"develop", "aggress"}
+VALID_MODES = {"develop", "aggress", "beacon"}
 POSITION_STATS = {"core_position", "beacon_position"}
 COUNTER_STATS = {"event_totals", "decision_totals"}
 SENSITIVE_KEY_PARTS = ("api", "authorization", "credential", "secret", "token")

@@ -213,6 +213,30 @@ class RouteOverlayServerTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=2)
 
+    def test_control_accepts_beacon_mode(self) -> None:
+        with TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            routes_path = directory_path / ".arena_hero_routes.json"
+            routes_path.write_text("{}", encoding="utf-8")
+            server = create_server(routes_path, port=0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address
+            try:
+                request = Request(
+                    f"http://{host}:{port}/control",
+                    data=json.dumps({"mode": "beacon"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(request, timeout=2) as response:
+                    posted = json.load(response)
+                self.assertEqual(posted, {"mode": "beacon", "recall": False})
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
     def test_manifest_is_read_only_and_scoped(self) -> None:
         extension = Path(__file__).with_name("arena_hero_route_overlay")
         manifest = json.loads((extension / "manifest.json").read_text(encoding="utf-8"))
