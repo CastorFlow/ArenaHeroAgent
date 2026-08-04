@@ -1127,13 +1127,13 @@ def _find_path(
     blocked: set[Position],
     threat: Counter[Position],
     visited: Counter[Position],
-    max_expansions: int = 2000,
+    max_expansions: int = 4000,
     ignore_occupancy_goals: bool = True,
 ) -> tuple[Direction, ...]:
     if start == goal:
         return ()
 
-    search_radius = max(16, min(160, _distance(start, goal) + 20))
+    search_radius = max(32, min(400, _distance(start, goal) + 60))
     frontier: list[tuple[float, float, int, Position]] = []
     sequence = 0
     heapq.heappush(frontier, (float(_distance(start, goal)), 0.0, sequence, start))
