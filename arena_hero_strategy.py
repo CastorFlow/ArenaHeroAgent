@@ -2461,13 +2461,16 @@ class SmartTactic:
         self,
         turn: Turn,
         planner: MovementPlanner,
+        origin: Position | None = None,
     ) -> Position | None:
-        if turn.core is not None:
-            origin = turn.core.position
-        elif turn.units:
-            origin = min(turn.units, key=_uuid_key).position
-        else:
-            return None
+        if origin is None:
+            if turn.core is not None:
+                origin = turn.core.position
+            elif turn.units:
+                origin = min(turn.units, key=_uuid_key).position
+            else:
+                return None
+        assert origin is not None
 
         sector = (turn.tick // 64) % 4
         preferred_signs = ((1, 1), (-1, 1), (-1, -1), (1, -1))[sector]
@@ -2677,8 +2680,12 @@ class SmartTactic:
                 )
                 self.memory.decision_totals["vanguard:escort"] += 1
             else:
-                # 所有游侠已被护卫 → 沿作战方向推进
-                frontier = self._assault_frontier_target(turn, planner)
+                # 所有游侠已被护卫 → 向信标方向推进（地图焦点，敌人必争之地）
+                frontier = self._assault_frontier_target(
+                    turn,
+                    planner,
+                    origin=turn.beacon.position,
+                )
                 if frontier is not None:
                     planner.toward(vanguard, frontier, "aggress_frontier")
                     self.memory.decision_totals["vanguard:frontier"] += 1
@@ -2810,7 +2817,11 @@ class SmartTactic:
         defender_ids = {unit.id for unit in defenders}
         patrol_slots = self._core_patrol_slots(turn, planner, defenders)
         combat_target = self._pick_assault_target(turn)
-        frontier_target = self._assault_frontier_target(turn, planner)
+        frontier_target = self._assault_frontier_target(
+            turn,
+            planner,
+            origin=turn.beacon.position,
+        )
         frontier_probe_count = 0
         for ranger in ordered:
             if ranger.id in acted_units:
@@ -2875,7 +2886,7 @@ class SmartTactic:
                 self.memory.decision_totals["ranger:assault"] += 1
                 continue
             if frontier_target is not None:
-                # 编队散布：不同游侠分散到前沿不同方位，避免全队挤一个点
+                # 编队散布：不同游侠分散到信标方向前沿不同方位，避免全队挤一个点
                 spread = SPREAD_OFFSETS[frontier_probe_count % len(SPREAD_OFFSETS)]
                 spread_cell = (
                     frontier_target[0] + spread[0],
