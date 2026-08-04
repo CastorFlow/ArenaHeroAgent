@@ -208,6 +208,9 @@ class TacticMemory:
     unit_label_counters: Counter[str] = field(default_factory=Counter)
     core_heading: Direction | None = None
     last_core_move_tick: int = 0
+    unit_label_mapping: dict[str, str] = field(default_factory=dict)
+    last_events: list[dict] = field(default_factory=list)
+    unit_positions_for_overlay: dict[str, Position] = field(default_factory=dict)
     last_tick: int = 0
     mode: str = MODE_DEVELOP
     recall: bool = False
@@ -564,6 +567,30 @@ class TacticMemory:
         }
 
         for event in turn.events:
+            # 记录战斗事件（供 overlay 快速定位）
+            if event.event_type in {
+                "SHOT_HIT",
+                "SHOT_MISSED",
+                "UNIT_DESTROYED",
+                "UNIT_DAMAGED",
+                "CORE_RESOURCES_CAPTURED",
+                "SWEEP_RESOLVED",
+                "UNIT_SELF_DESTRUCTED",
+                "CORE_DESTROYED",
+            }:
+                self.last_events.append(
+                    {
+                        "tick": turn.tick,
+                        "type": event.event_type,
+                        "position": (
+                            [event.position[0], event.position[1]]
+                            if event.position is not None
+                            else None
+                        ),
+                    }
+                )
+                if len(self.last_events) > 15:
+                    self.last_events.pop(0)
             actor_key = str(event.actor_id) if event.actor_id is not None else None
             if event.event_type == "UNIT_MOVE_FAILED" and actor_key is not None:
                 planned = self.planned_moves.pop(actor_key, None)
@@ -885,6 +912,28 @@ class TacticMemory:
                 ),
                 "event_totals": dict(sorted(self.event_totals.items())),
                 "decision_totals": dict(sorted(self.decision_totals.items())),
+                "recent_events": self.last_events[-15:],
+                "units": [
+                    {
+                        "id": str(unit.id)[:8],
+                        "type": unit.unit_type.value,
+                        "number": self.unit_labels.get(
+                            str(unit.id), UnitLabel(unit.unit_type.value, 0)
+                        ).number,
+                        "position": [unit.position[0], unit.position[1]],
+                        "hp": unit.hp,
+                    }
+                    for unit in sorted(
+                        turn.units,
+                        key=lambda candidate: (
+                            candidate.unit_type.value,
+                            self.unit_labels.get(
+                                str(candidate.id), UnitLabel(candidate.unit_type.value, 0)
+                            ).number,
+                            candidate.id.bytes,
+                        ),
+                    )
+                ],
             }
             temporary = path.with_suffix(path.suffix + ".tmp")
             temporary.write_text(

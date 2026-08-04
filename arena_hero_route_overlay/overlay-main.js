@@ -38,6 +38,11 @@
     statsButton: null,
     statsPanel: null,
     statsOpen: false,
+    locatorButton: null,
+    locatorPanel: null,
+    locatorOpen: false,
+    locatorTimer: null,
+    followUnit: null,
     statusElements: new Map(),
     statsCounterContainers: new Map(),
   };
@@ -236,6 +241,189 @@
     state.settingInputs.set(key, { input, kind: "number" });
   }
 
+  function createLocatorPanel() {
+    if (state.locatorPanel || !document.documentElement) {
+      return;
+    }
+    const panel = controlContainer("div");
+    Object.assign(panel.style, {
+      position: "fixed",
+      display: "none",
+      width: "min(330px, calc(100vw - 16px))",
+      maxHeight: "72vh",
+      overflowY: "auto",
+      padding: "10px 12px 12px",
+      border: "1px solid rgba(255,255,255,0.2)",
+      borderRadius: "9px",
+      background: "rgba(8,11,18,0.96)",
+      color: "#d9e1eb",
+      font: "12px system-ui, -apple-system, Segoe UI, sans-serif",
+      boxShadow: "0 8px 28px rgba(0,0,0,0.42)",
+      zIndex: "90",
+      pointerEvents: "auto",
+      userSelect: "none",
+    });
+    const header = document.createElement("div");
+    Object.assign(header.style, {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      marginBottom: "8px",
+      fontSize: "13px",
+      fontWeight: 600,
+    });
+    header.textContent = "🎯 定位 · 点击条目聚焦地图";
+    const close = document.createElement("button");
+    close.type = "button";
+    close.textContent = "✕";
+    Object.assign(close.style, {
+      background: "transparent",
+      border: "none",
+      color: "#9fb0c0",
+      cursor: "pointer",
+      fontSize: "14px",
+      padding: "2px 6px",
+    });
+    close.addEventListener("click", () => {
+      state.locatorOpen = false;
+      syncControls();
+    });
+    header.append(close);
+    panel.appendChild(header);
+
+    const unitSection = document.createElement("div");
+    const unitTitle = document.createElement("div");
+    Object.assign(unitTitle.style, {
+      color: "#8fbbae",
+      fontWeight: 600,
+      margin: "6px 0 4px",
+      fontSize: "11px",
+    });
+    unitTitle.textContent = "单位";
+    const unitList = document.createElement("div");
+    unitSection.append(unitTitle, unitList);
+
+    const eventSection = document.createElement("div");
+    const eventTitle = document.createElement("div");
+    Object.assign(eventTitle.style, {
+      color: "#d9a05b",
+      fontWeight: 600,
+      margin: "10px 0 4px",
+      fontSize: "11px",
+    });
+    eventTitle.textContent = "最近事件";
+    const eventList = document.createElement("div");
+    eventSection.append(eventTitle, eventList);
+
+    panel.append(unitSection, eventSection);
+    document.documentElement.appendChild(panel);
+    state.locatorPanel = panel;
+    state.locatorUnitList = unitList;
+    state.locatorEventList = eventList;
+  }
+
+  function focusTarget(position, label) {
+    state.followUnit = null;
+    state.focusMarker = { position, label, until: performance.now() + 8000 };
+  }
+
+  function followUnit(unitId) {
+    state.focusMarker = null;
+    state.followUnit = state.followUnit === unitId ? null : unitId;
+    renderLocator();
+  }
+
+  function renderLocator() {
+    if (!state.locatorPanel) {
+      return;
+    }
+    const stats = state.stats || {};
+    const units = Array.isArray(stats.units) ? stats.units : [];
+    const events = Array.isArray(stats.recent_events) ? stats.recent_events : [];
+
+    const unitList = state.locatorUnitList;
+    unitList.innerHTML = "";
+    if (!units.length) {
+      unitList.textContent = "暂无数据";
+    } else {
+      for (const unit of units) {
+        const row = document.createElement("div");
+        Object.assign(row.style, {
+          padding: "2px 4px",
+          borderRadius: "4px",
+          cursor: "pointer",
+          display: "flex",
+          gap: "8px",
+          alignItems: "center",
+        });
+        const active = state.followUnit === unit.id;
+        row.style.background = active ? "rgba(240,185,60,0.18)" : "transparent";
+        const typeIcon =
+          unit.type === "WORKER" ? "⚒️" : unit.type === "VANGUARD" ? "🛡️" : "🏹";
+        const pos = Array.isArray(unit.position) ? `(${unit.position[0]}, ${unit.position[1]})` : "?";
+        row.textContent = `${typeIcon} ${unit.type[0]}${unit.number ?? ""}  ${pos}  HP ${unit.hp}/2`;
+        row.addEventListener("mouseenter", () => {
+          row.style.background = "rgba(255,255,255,0.08)";
+        });
+        row.addEventListener("mouseleave", () => {
+          row.style.background = active ? "rgba(240,185,60,0.18)" : "transparent";
+        });
+        row.addEventListener("click", () => followUnit(unit.id));
+        unitList.appendChild(row);
+      }
+    }
+
+    const eventList = state.locatorEventList;
+    eventList.innerHTML = "";
+    if (!events.length) {
+      eventList.textContent = "暂无战斗事件";
+    } else {
+      const labels = {
+        SHOT_HIT: "🔫 命中",
+        SHOT_MISSED: "💨 未中",
+        UNIT_DESTROYED: "💀 击杀",
+        UNIT_DAMAGED: "🩸 受伤",
+        CORE_RESOURCES_CAPTURED: "🏴 掠夺",
+        SWEEP_RESOLVED: "⚔️ 横扫",
+        UNIT_SELF_DESTRUCTED: "💥 自毁",
+        CORE_DESTROYED: "🔥 敌核心毁灭",
+      };
+      for (let i = events.length - 1; i >= 0; i--) {
+        const event = events[i];
+        const row = document.createElement("div");
+        Object.assign(row.style, {
+          padding: "2px 4px",
+          borderRadius: "4px",
+          cursor: "pointer",
+          fontSize: "11px",
+          display: "flex",
+          gap: "6px",
+        });
+        const label = labels[event.type] || event.type;
+        const pos = Array.isArray(event.position)
+          ? `(${event.position[0]}, ${event.position[1]})`
+          : "(位置未知)";
+        row.textContent = `t${event.tick ?? "?"} ${label} ${pos}`;
+        if (i === events.length - 1) {
+          row.style.color = "#ffd479";
+          row.style.fontWeight = 600;
+        }
+        row.addEventListener("mouseenter", () => {
+          row.style.background = "rgba(255,255,255,0.08)";
+        });
+        row.addEventListener("mouseleave", () => {
+          row.style.background = "transparent";
+        });
+        row.addEventListener("click", () => {
+          if (Array.isArray(event.position)) {
+            focusTarget(event.position, label);
+          }
+        });
+        eventList.appendChild(row);
+      }
+    }
+  }
+
   function createControls() {
     if (state.toolbar || !document.documentElement) {
       return;
@@ -409,14 +597,30 @@
       syncControls();
     });
 
+    const locatorButton = document.createElement("button");
+    locatorButton.type = "button";
+    locatorButton.textContent = "🎯 定位";
+    locatorButton.title = "打开定位面板：单位/事件一键追踪（点击条目聚焦地图）";
+    applyButtonStyle(locatorButton);
+    locatorButton.addEventListener("click", () => {
+      state.locatorOpen = !state.locatorOpen;
+      if (state.locatorOpen) {
+        state.statsOpen = false;
+      }
+      syncControls();
+      renderLocator();
+    });
+
     bar.append(modeButton, recallButton);
     bar.appendChild(statsButton);
+    bar.appendChild(locatorButton);
 
     document.documentElement.appendChild(bar);
     state.statusBar = bar;
     state.modeButton = modeButton;
     state.recallButton = recallButton;
     state.statsButton = statsButton;
+    state.locatorButton = locatorButton;
     syncControls();
   }
 
@@ -762,6 +966,9 @@
     if (state.statsPanel) {
       state.statsPanel.style.display = visible && state.statsOpen ? "block" : "none";
     }
+    if (state.locatorPanel) {
+      state.locatorPanel.style.display = visible && state.locatorOpen ? "block" : "none";
+    }
   }
 
   function positionControls(rect) {
@@ -784,6 +991,10 @@
     if (state.statsPanel) {
       state.statsPanel.style.left = `${panelLeft}px`;
       state.statsPanel.style.top = `${Math.max(8, rect.top + 46)}px`;
+    }
+    if (state.locatorPanel) {
+      state.locatorPanel.style.left = `${Math.max(8, rect.right - Math.min(330, rect.width - 20) - 10)}px`;
+      state.locatorPanel.style.top = `${Math.max(8, rect.top + 46)}px`;
     }
   }
 
@@ -1206,9 +1417,89 @@
     context.restore();
   }
 
+  function drawLocator(context, rect) {
+    // 追踪目标：正在追踪的单位 或 临时标记
+    let position = null;
+    let label = "";
+    if (state.followUnit) {
+      const stats = state.stats || {};
+      const units = Array.isArray(stats.units) ? stats.units : [];
+      const unit = units.find((entry) => entry.id === state.followUnit);
+      if (unit && Array.isArray(unit.position)) {
+        position = unit.position;
+        label = `${unit.type[0]}${unit.number ?? ""}`;
+      }
+    } else if (state.focusMarker && state.focusMarker.until > performance.now()) {
+      position = state.focusMarker.position;
+      label = state.focusMarker.label;
+    }
+    if (!position) {
+      return;
+    }
+    const center = screenPoint(position, rect.width, rect.height);
+    if (!center) {
+      return;
+    }
+    const size = state.camera.cell;
+    context.save();
+    // 屏幕内：金色圈 + 标签
+    if (
+      center.x >= -20 &&
+      center.y >= -20 &&
+      center.x <= rect.width + 20 &&
+      center.y <= rect.height + 20
+    ) {
+      const pulse = 1 + Math.sin(performance.now() / 200) * 0.12;
+      context.strokeStyle = "rgba(240, 185, 60, 0.95)";
+      context.fillStyle = "rgba(240, 185, 60, 0.15)";
+      context.lineWidth = 2.5;
+      context.beginPath();
+      context.arc(center.x, center.y, Math.max(10, size * 0.7) * pulse, 0, Math.PI * 2);
+      context.fill();
+      context.stroke();
+      context.fillStyle = "#f0b93c";
+      context.font = "600 12px ui-monospace, Consolas, monospace";
+      const labelWidth = context.measureText(label).width + 10;
+      context.fillStyle = "rgba(7,10,16,0.9)";
+      context.fillRect(center.x - labelWidth / 2, center.y - size - 22, labelWidth, 18);
+      context.fillStyle = "#f0b93c";
+      context.fillText(label, center.x - labelWidth / 2 + 5, center.y - size - 8);
+    } else {
+      // 屏幕外：边缘方向箭头 + 距离
+      const cx = rect.width / 2;
+      const cy = rect.height / 2;
+      const dx = center.x - cx;
+      const dy = center.y - cy;
+      const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+      const margin = 46;
+      const bx = cx + (dx / dist) * (Math.min(rect.width, rect.height) / 2 - margin);
+      const by = cy + (dy / dist) * (Math.min(rect.width, rect.height) / 2 - margin);
+      // 限制在屏幕内
+      const clampedX = Math.max(8, Math.min(rect.width - 8, bx));
+      const clampedY = Math.max(8, Math.min(rect.height - 8, by));
+      const angle = Math.atan2(center.y - cy, center.x - cx);
+      context.translate(clampedX, clampedY);
+      context.rotate(angle);
+      context.fillStyle = "rgba(240, 185, 60, 0.95)";
+      context.beginPath();
+      context.moveTo(14, 0);
+      context.lineTo(-6, -9);
+      context.lineTo(-2, 0);
+      context.lineTo(-6, 9);
+      context.closePath();
+      context.fill();
+      context.setTransform(1, 0, 0, 1, 0, 0);
+      context.fillStyle = "#f0b93c";
+      context.font = "600 11px ui-monospace, Consolas, monospace";
+      context.fillText(`${label} 屏外→`, clampedX + 16, clampedY + 16);
+    }
+    context.restore();
+  }
+
   function render(now) {
     createOverlay();
     createControls();
+    createLocatorPanel();
     if (
       !state.overlay ||
       !state.context ||
@@ -1255,8 +1546,13 @@
     const hover = hoverCell(rect);
     drawHover(state.context, rect, hover);
     drawRally(state.context, rect);
+    drawLocator(state.context, rect);
     drawHud(state.context, rect, hover);
     renderStatusBar();
+    if (state.locatorOpen && (state.locatorTimer === null || now - state.locatorTimer > 1000)) {
+      state.locatorTimer = now;
+      renderLocator();
+    }
     requestAnimationFrame(render);
   }
 
@@ -1272,6 +1568,9 @@
       } else if (message.kind === "stats" && message.payload && typeof message.payload === "object") {
         state.stats = message.payload;
         renderStatusBar();
+        if (state.locatorOpen) {
+          renderLocator();
+        }
       } else if (message.kind === "control" && message.payload && typeof message.payload === "object") {
         state.control = {
           mode: message.payload.mode === "beacon" ? "beacon" : message.payload.mode === "aggress" ? "aggress" : "develop",
