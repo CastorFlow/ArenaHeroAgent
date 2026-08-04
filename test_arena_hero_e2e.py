@@ -146,7 +146,12 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(stats_payload["resources"], 25)
             self.assertEqual(
             control_payload,
-            {"mode": "aggress", "recall": False, "beacon_target_distance": 0},
+            {
+                "mode": "aggress",
+                "recall": False,
+                "beacon_target_distance": 0,
+                "rally_point": None,
+            },
         )
 
 

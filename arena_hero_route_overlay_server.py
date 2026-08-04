@@ -248,9 +248,27 @@ def load_control(path: Path) -> dict[str, Any]:
             and not isinstance(raw_distance, bool)
             else 0
         )
-        return {"mode": mode, "recall": bool(recall), "beacon_target_distance": distance}
+        raw_rally = data.get("rally_point")
+        rally = None
+        if (
+            isinstance(raw_rally, list)
+            and len(raw_rally) == 2
+            and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in raw_rally)
+        ):
+            rally = [int(raw_rally[0]), int(raw_rally[1])]
+        return {
+            "mode": mode,
+            "recall": bool(recall),
+            "beacon_target_distance": distance,
+            "rally_point": rally,
+        }
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        return {"mode": "develop", "recall": False, "beacon_target_distance": 0}
+        return {
+            "mode": "develop",
+            "recall": False,
+            "beacon_target_distance": 0,
+            "rally_point": None,
+        }
 
 
 def save_control(path: Path, mode: str, recall: bool, data: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -265,6 +283,15 @@ def save_control(path: Path, mode: str, recall: bool, data: dict[str, Any] | Non
             payload["beacon_target_distance"] = max(0, int(raw_distance))
         else:
             payload["beacon_target_distance"] = 0
+        raw_rally = data.get("rally_point")
+        if (
+            isinstance(raw_rally, list)
+            and len(raw_rally) == 2
+            and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in raw_rally)
+        ):
+            payload["rally_point"] = [int(raw_rally[0]), int(raw_rally[1])]
+        else:
+            payload["rally_point"] = None
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(

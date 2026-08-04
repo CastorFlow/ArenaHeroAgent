@@ -2332,5 +2332,47 @@ class StuckHealPredictionTests(unittest.TestCase):
         self.assertIsNone(turn.plan.core_action)
 
 
+    def test_rally_point_sends_units_to_marker(self) -> None:
+        # 标记（rally_point）设置后，先锋/游侠前往标记坐标
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            self._write_control(control_path, mode="develop")
+            control_path.write_text(
+                json.dumps({"rally_point": [20, 20]}),
+                encoding="utf-8",
+            )
+            turn, _ = make_turn(
+                own_core=core((0, 0)),
+                units=(
+                    vanguard((3, 3)),
+                    ranger((3, 5)),
+                ),
+            )
+            summary = SmartTactic(TacticMemory(), control_path=control_path).choose_actions(turn)
+
+            self.assertTrue(
+                any("rally_advance" in item for item in summary.decisions)
+            )
+            vanguard_action = turn.plan.unit_actions.get(VANGUARD_ID)
+            ranger_action = turn.plan.unit_actions.get(RANGER_ID)
+            self.assertIsInstance(vanguard_action, MoveAction)
+            self.assertIsInstance(ranger_action, MoveAction)
+
+    def test_rally_point_cleared_returns_to_mode(self) -> None:
+        # 清除标记后恢复模式逻辑（无 rally_advance）
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            self._write_control(control_path, mode="develop")
+            turn, _ = make_turn(
+                own_core=core((0, 0)),
+                units=(vanguard((3, 3)),),
+            )
+            summary = SmartTactic(TacticMemory(), control_path=control_path).choose_actions(turn)
+
+            self.assertFalse(
+                any("rally_advance" in item for item in summary.decisions)
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

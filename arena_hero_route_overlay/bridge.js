@@ -62,6 +62,8 @@
         update: {
           mode: message.payload.mode,
           recall: message.payload.recall,
+          beacon_target_distance: message.payload.beacon_target_distance,
+          rally_point: message.payload.rally_point,
         },
       },
       (failed, payload) => {

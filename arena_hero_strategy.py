@@ -202,6 +202,7 @@ class TacticMemory:
     mode: str = MODE_DEVELOP
     recall: bool = False
     beacon_target_distance: int = 0
+    rally_point: tuple[int, int] | None = None
     control_mtime: int = 0
     total_resources_harvested: int = 0
     total_resources_deposited: int = 0
@@ -782,6 +783,15 @@ class TacticMemory:
                 raw_distance, bool
             ):
                 self.beacon_target_distance = max(0, int(raw_distance))
+            raw_rally = data.get("rally_point")
+            if (
+                isinstance(raw_rally, list)
+                and len(raw_rally) == 2
+                and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in raw_rally)
+            ):
+                self.rally_point = (int(raw_rally[0]), int(raw_rally[1]))
+            else:
+                self.rally_point = None
             self.control_mtime = mtime
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             pass
@@ -2399,6 +2409,8 @@ class SmartTactic:
     ) -> None:
         if self.memory.recall:
             self._choose_vanguards_recall(turn, planner, acted_units, decisions)
+        elif self.memory.rally_point is not None:
+            self._choose_vanguards_rally(turn, planner, acted_units, decisions)
         elif self.memory.mode == MODE_AGGRESS:
             self._choose_vanguards_aggress(turn, planner, acted_units, decisions)
         elif self.memory.mode == MODE_BEACON:
@@ -2699,6 +2711,101 @@ class SmartTactic:
                     planner.toward(vanguard, frontier, "aggress_frontier")
                     self.memory.decision_totals["vanguard:frontier"] += 1
 
+    def _choose_vanguards_rally(
+        self,
+        turn: Turn,
+        planner: MovementPlanner,
+        acted_units: set[UUID],
+        decisions: list[str],
+    ) -> None:
+        rally = self.memory.rally_point
+        if rally is None:
+            return
+        for vanguard in sorted(turn.vanguards, key=_uuid_key):
+            if vanguard.id in acted_units:
+                continue
+            direction = self._sweep_targets(vanguard, turn)
+            if direction is not None:
+                vanguard.sweep(direction)
+                decisions.append(
+                    f"vanguard:{_short_id(vanguard.id)} sweep {direction.value} reason=rally"
+                )
+                self.memory.decision_totals["vanguard:sweep"] += 1
+                continue
+            if turn.core is not None:
+                threatening = [
+                    enemy
+                    for enemy in turn.visible_enemies
+                    if _distance(enemy.position, turn.core.position) <= 5
+                ]
+                if threatening:
+                    target = min(
+                        threatening,
+                        key=lambda enemy: (
+                            _enemy_role_priority(enemy),
+                            _distance(vanguard.position, enemy.position),
+                            enemy.id.bytes,
+                        ),
+                    )
+                    planner.toward(vanguard, target.position, "rally_defend_core")
+                    continue
+            if _distance(vanguard.position, rally) > 1:
+                planner.toward(vanguard, rally, "rally_advance")
+                decisions.append(
+                    f"vanguard:{_short_id(vanguard.id)} rally_advance "
+                    f"target={rally}"
+                )
+                self.memory.decision_totals["vanguard:rally"] += 1
+
+    def _choose_rangers_rally(
+        self,
+        turn: Turn,
+        planner: MovementPlanner,
+        acted_units: set[UUID],
+        decisions: list[str],
+    ) -> None:
+        assigned_damage: Counter[UUID] = Counter()
+        rally = self.memory.rally_point
+        if rally is None:
+            return
+        for ranger in sorted(turn.rangers, key=_uuid_key):
+            if ranger.id in acted_units:
+                continue
+            shot_candidates = self._ranger_shot_candidates(turn, ranger, planner)
+            if shot_candidates:
+                target, cell = min(
+                    shot_candidates,
+                    key=lambda pair: (
+                        1 if assigned_damage[pair[0].id] >= _effective_hp(pair[0]) else 0,
+                        0 if isinstance(pair[0], CoreView) else 1,
+                        _enemy_role_priority(pair[0]),
+                        _effective_hp(pair[0]),
+                        _distance(ranger.position, pair[0].position),
+                        pair[0].id.bytes,
+                    ),
+                )
+                ranger.shoot(target, expected_cell=cell)
+                decisions.append(
+                    f"ranger:{_short_id(ranger.id)} shoot target={_short_id(target.id)} "
+                    f"expected={cell} role=rally"
+                )
+                self.memory.decision_totals["ranger:shoot"] += 1
+                continue
+            firing_cells = self._firing_cells(rally, planner.obstacles)
+            if firing_cells:
+                firing_cell = min(
+                    firing_cells,
+                    key=lambda position: (
+                        planner.threat.get(position, 0),
+                        _distance(ranger.position, position),
+                        position,
+                    ),
+                )
+                planner.toward(ranger, firing_cell, "rally_seek_firing")
+            else:
+                planner.toward(ranger, rally, "rally_advance")
+            self.memory.decision_totals["ranger:rally"] += 1
+
     def _choose_vanguards_recall(
         self,
         turn: Turn,
@@ -2802,6 +2909,8 @@ class SmartTactic:
     ) -> None:
         if self.memory.recall:
             self._choose_rangers_recall(turn, planner, acted_units, decisions)
+        elif self.memory.rally_point is not None:
+            self._choose_rangers_rally(turn, planner, acted_units, decisions)
         elif self.memory.mode == MODE_AGGRESS:
             self._choose_rangers_aggress(turn, planner, acted_units, decisions)
         elif self.memory.mode == MODE_BEACON:

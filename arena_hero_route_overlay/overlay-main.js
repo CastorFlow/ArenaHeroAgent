@@ -1168,6 +1168,44 @@
     context.restore();
   }
 
+  function drawRally(context, rect) {
+    const rally = state.control.rally_point;
+    if (!Array.isArray(rally) || rally.length !== 2) {
+      return;
+    }
+    const center = screenPoint(rally, rect.width, rect.height);
+    if (!center) {
+      return;
+    }
+    const size = state.camera.cell;
+    context.save();
+    // 标记点
+    context.fillStyle = "rgba(240, 185, 60, 0.85)";
+    context.strokeStyle = "rgba(20, 16, 4, 0.9)";
+    context.lineWidth = 2;
+    context.beginPath();
+    context.arc(center.x, center.y, Math.max(5, size * 0.32), 0, Math.PI * 2);
+    context.fill();
+    context.stroke();
+    // 旗帜杆 + 旗帜
+    const flagX = center.x + Math.max(4, size * 0.28);
+    const flagY = center.y - Math.max(8, size * 0.5);
+    context.strokeStyle = "rgba(240, 185, 60, 0.9)";
+    context.lineWidth = 2;
+    context.beginPath();
+    context.moveTo(center.x, center.y);
+    context.lineTo(center.x, flagY);
+    context.stroke();
+    context.fillStyle = "rgba(240, 185, 60, 0.9)";
+    context.beginPath();
+    context.moveTo(center.x, flagY);
+    context.lineTo(flagX, flagY + Math.max(4, size * 0.22));
+    context.lineTo(center.x, flagY + Math.max(8, size * 0.44));
+    context.closePath();
+    context.fill();
+    context.restore();
+  }
+
   function render(now) {
     createOverlay();
     createControls();
@@ -1216,6 +1254,7 @@
     drawUnitLabels(state.context, rect.width, rect.height);
     const hover = hoverCell(rect);
     drawHover(state.context, rect, hover);
+    drawRally(state.context, rect);
     drawHud(state.context, rect, hover);
     renderStatusBar();
     requestAnimationFrame(render);
@@ -1241,6 +1280,11 @@
             typeof message.payload.beacon_target_distance === "number"
               ? message.payload.beacon_target_distance
               : state.control.beacon_target_distance ?? 0,
+          rally_point:
+            Array.isArray(message.payload.rally_point) &&
+            message.payload.rally_point.length === 2
+              ? [Number(message.payload.rally_point[0]), Number(message.payload.rally_point[1])]
+              : null,
         };
         syncControls();
         renderStatusBar();
@@ -1282,6 +1326,36 @@
     } else if (!editing && event.altKey && event.shiftKey && event.code === "KeyC") {
       event.preventDefault();
       updateControl({ recall: !state.control.recall });
+    } else if (!editing && event.altKey && event.shiftKey && event.code === "KeyM") {
+      event.preventDefault();
+      // Alt+Shift+M：在鼠标悬停处设置兵力集结标记
+      const mapCanvas = findMapCanvas(performance.now());
+      if (mapCanvas && state.pointer && state.camera) {
+        const rect = mapCanvas.getBoundingClientRect();
+        const localX = state.pointer.x - rect.left;
+        const localY = state.pointer.y - rect.top;
+        if (
+          localX >= 0 &&
+          localY >= 0 &&
+          localX < rect.width &&
+          localY < rect.height
+        ) {
+          const cell = core.screenToGrid(
+            localX,
+            localY,
+            state.camera,
+            rect.width,
+            rect.height,
+          );
+          if (cell) {
+            updateControl({ rally_point: [cell[0], cell[1]] });
+          }
+        }
+      }
+    } else if (!editing && event.altKey && event.shiftKey && event.code === "KeyU") {
+      event.preventDefault();
+      // Alt+Shift+U：清除集结标记
+      updateControl({ rally_point: null });
     }
   });
   window.addEventListener("blur", () => {

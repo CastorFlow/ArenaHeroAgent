@@ -139,7 +139,12 @@ class RouteOverlayServerTests(unittest.TestCase):
                     default = json.load(response)
                 self.assertEqual(
                     default,
-                    {"mode": "develop", "recall": False, "beacon_target_distance": 0},
+                    {
+                        "mode": "develop",
+                        "recall": False,
+                        "beacon_target_distance": 0,
+                        "rally_point": None,
+                    },
                 )
 
                 request = Request(
@@ -152,18 +157,33 @@ class RouteOverlayServerTests(unittest.TestCase):
                     posted = json.load(response)
                 self.assertEqual(
                     posted,
-                    {"mode": "aggress", "recall": True, "beacon_target_distance": 0},
+                    {
+                        "mode": "aggress",
+                        "recall": True,
+                        "beacon_target_distance": 0,
+                        "rally_point": None,
+                    },
                 )
 
                 with urlopen(f"{base}/control", timeout=2) as response:
                     after = json.load(response)
                 self.assertEqual(
                     after,
-                    {"mode": "aggress", "recall": True, "beacon_target_distance": 0},
+                    {
+                        "mode": "aggress",
+                        "recall": True,
+                        "beacon_target_distance": 0,
+                        "rally_point": None,
+                    },
                 )
                 self.assertEqual(
                     json.loads(control_path.read_text(encoding="utf-8")),
-                    {"mode": "aggress", "recall": True, "beacon_target_distance": 0},
+                    {
+                        "mode": "aggress",
+                        "recall": True,
+                        "beacon_target_distance": 0,
+                        "rally_point": None,
+                    },
                 )
             finally:
                 server.shutdown()
@@ -242,7 +262,12 @@ class RouteOverlayServerTests(unittest.TestCase):
                     posted = json.load(response)
                 self.assertEqual(
                     posted,
-                    {"mode": "beacon", "recall": False, "beacon_target_distance": 0},
+                    {
+                        "mode": "beacon",
+                        "recall": False,
+                        "beacon_target_distance": 0,
+                        "rally_point": None,
+                    },
                 )
             finally:
                 server.shutdown()
