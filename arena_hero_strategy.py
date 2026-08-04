@@ -571,11 +571,11 @@ class TacticMemory:
                     if event.reason_code == "MOVE_BLOCKED_TERRAIN":
                         self.known_obstacles.add(planned.destination)
                     else:
-                        penalty = 4 if event.reason_code in {
+                        penalty = 12 if event.reason_code in {
                             "MOVE_CONTESTED",
                             "MOVE_DESTINATION_OCCUPIED",
                             "MOVE_SWAP_BLOCKED",
-                        } else 2
+                        } else 4
                         self.temporary_blocks[planned.destination] = max(
                             self.temporary_blocks.get(planned.destination, 0),
                             turn.tick + penalty,
@@ -1297,6 +1297,9 @@ class MovementPlanner:
                 self.threat.get(_destination(unit.position, direction), 0),
                 _distance(_destination(unit.position, direction), goal),
                 self.memory.visited.get(_destination(unit.position, direction), 0),
+                self.memory.temporary_blocks.get(
+                    _destination(unit.position, direction), 0
+                ) > self.turn.tick,
                 DIRECTION_RANK[direction],
             ),
         )
