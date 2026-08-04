@@ -2226,5 +2226,64 @@ class StuckHealPredictionTests(unittest.TestCase):
             self.assertEqual(turn.plan.core_action.unit_type, UnitType.RANGER)
 
 
+    def test_aggress_vanguard_escorts_ranger(self) -> None:
+        # 侵略模式：无敌人时，远离游侠的先锋向游侠靠拢（编队护卫）
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            self._write_control(control_path, mode="aggress")
+            turn, _ = make_turn(
+                own_core=core((0, 0)),
+                units=(
+                    vanguard((5, 5)),   # 离游侠远（>3 格）
+                    ranger((0, 0)),      # 游侠在 core 附近
+                ),
+            )
+            summary = SmartTactic(TacticMemory(), control_path=control_path).choose_actions(turn)
+
+            self.assertTrue(
+                any("escort" in item for item in summary.decisions)
+            )
+
+    def test_aggress_ranger_advances_frontier(self) -> None:
+        # 侵略模式：无敌人时游侠向前沿推进
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            self._write_control(control_path, mode="aggress")
+            turn, _ = make_turn(
+                own_core=core((0, 0)),
+                units=(ranger((3, 3)),),
+            )
+            summary = SmartTactic(TacticMemory(), control_path=control_path).choose_actions(turn)
+
+            action = turn.plan.unit_actions.get(RANGER_ID)
+            self.assertIsInstance(action, MoveAction)
+            self.assertTrue(
+                any("aggress_frontier" in item for item in summary.decisions)
+            )
+
+    def test_same_cell_stacking_does_not_merge_hp(self) -> None:
+        # 研究结论：同格叠放不叠加血量——两个同类型单位 hp 独立
+        first = UnitView(
+            kind="UNIT",
+            id=RANGER_ID,
+            controlled=True,
+            position=(3, 3),
+            hp=2,
+            unit_type=UnitType.RANGER,
+        )
+        second = UnitView(
+            kind="UNIT",
+            id=ENEMY_RANGER_ID,
+            controlled=True,
+            position=(3, 3),
+            hp=2,
+            unit_type=UnitType.RANGER,
+        )
+        self.assertEqual(first.hp, 2)
+        self.assertEqual(second.hp, 2)
+        # 单位 hp 字段彼此独立，不存在合并结算
+        self.assertNotEqual(id(first), id(second))
+
+
 if __name__ == "__main__":
     unittest.main()

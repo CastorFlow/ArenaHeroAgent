@@ -46,6 +46,15 @@ DEVELOP_SEARCH_STEP = 12
 AGGRESS_BASE_WORKERS = 4
 AGGRESS_TARGET_VANGUARDS = 3
 AGGRESS_TARGET_RANGERS = 6
+# 编队距离：同类型组合 ≤ 此距离视为一队
+FORMATION_SAME_TYPE_MAX_DISTANCE = 2
+# 编队距离：先锋与游侠间 ≤ 此距离视为组合编队
+FORMATION_VANGUARD_RANGER_MAX_DISTANCE = 3
+# 侵略前沿散布偏移（9 方位，避免全队挤一个巡逻点）
+SPREAD_OFFSETS = (
+    (0, 0), (4, 0), (-4, 0), (0, 4), (0, -4),
+    (4, 4), (-4, -4), (4, -4), (-4, 4),
+)
 # 人口上限（游戏规则 19）
 MAX_POPULATION = 19
 # core 是否允许自动迁移（false = 固定不动）
@@ -2581,7 +2590,8 @@ class SmartTactic:
         )
         defender_ids = {unit.id for unit in ordered[:defender_count]}
         combat_target = self._pick_assault_target(turn)
-        frontier_target = self._assault_frontier_target(turn, planner)
+        # 先锋编队：找最近的"游离游侠"（未被其他先锋护卫的）→ 贴上去
+        ranger_ids_with_guard: set[UUID] = set()
         for vanguard in ordered:
             if vanguard.id in acted_units:
                 continue
@@ -2594,22 +2604,21 @@ class SmartTactic:
                 self.memory.decision_totals["vanguard:sweep"] += 1
                 continue
             if turn.core is not None:
-                # 家被摸：先救家再出击
                 threatening = [
                     enemy
                     for enemy in turn.visible_enemies
                     if _distance(enemy.position, turn.core.position) <= 5
                 ]
                 if threatening:
-                    target = min(
+                    target_ = min(
                         threatening,
-                        key=lambda enemy: (
-                            _enemy_role_priority(enemy),
-                            _distance(vanguard.position, enemy.position),
-                            enemy.id.bytes,
+                        key=lambda enemy_: (
+                            _enemy_role_priority(enemy_),
+                            _distance(vanguard.position, enemy_.position),
+                            enemy_.id.bytes,
                         ),
                     )
-                    planner.toward(vanguard, target.position, "aggress_defend_core")
+                    planner.toward(vanguard, target_.position, "aggress_defend_core")
                     continue
             if vanguard.id in defender_ids:
                 if (
@@ -2626,9 +2635,37 @@ class SmartTactic:
                 )
                 self.memory.decision_totals["vanguard:assault"] += 1
                 continue
-            if frontier_target is not None:
-                planner.toward(vanguard, frontier_target, "aggress_frontier")
-                self.memory.decision_totals["vanguard:frontier"] += 1
+            # 编队：找一个未被护卫的游侠，贴到距离 <= FORMATION_VANGUARD_RANGER_MAX_DISTANCE
+            unguarded = [
+                r
+                for r in turn.rangers
+                if r.id not in acted_units
+                and r.id not in ranger_ids_with_guard
+                and _distance(vanguard.position, r.position)
+                > FORMATION_VANGUARD_RANGER_MAX_DISTANCE
+            ]
+            if unguarded:
+                buddy = min(
+                    unguarded,
+                    key=lambda r: _distance(vanguard.position, r.position),
+                )
+                planner.toward(
+                    vanguard,
+                    buddy.position,
+                    "vanguard_escort_ranger",
+                )
+                ranger_ids_with_guard.add(buddy.id)
+                decisions.append(
+                    f"vanguard:{_short_id(vanguard.id)} escort "
+                    f"ranger:{_short_id(buddy.id)}"
+                )
+                self.memory.decision_totals["vanguard:escort"] += 1
+            else:
+                # 所有游侠已被护卫 → 沿作战方向推进
+                frontier = self._assault_frontier_target(turn, planner)
+                if frontier is not None:
+                    planner.toward(vanguard, frontier, "aggress_frontier")
+                    self.memory.decision_totals["vanguard:frontier"] += 1
 
     def _choose_vanguards_recall(
         self,
@@ -2758,6 +2795,7 @@ class SmartTactic:
         patrol_slots = self._core_patrol_slots(turn, planner, defenders)
         combat_target = self._pick_assault_target(turn)
         frontier_target = self._assault_frontier_target(turn, planner)
+        frontier_probe_count = 0
         for ranger in ordered:
             if ranger.id in acted_units:
                 continue
@@ -2821,7 +2859,14 @@ class SmartTactic:
                 self.memory.decision_totals["ranger:assault"] += 1
                 continue
             if frontier_target is not None:
-                planner.toward(ranger, frontier_target, "aggress_frontier")
+                # 编队散布：不同游侠分散到前沿不同方位，避免全队挤一个点
+                spread = SPREAD_OFFSETS[frontier_probe_count % len(SPREAD_OFFSETS)]
+                spread_cell = (
+                    frontier_target[0] + spread[0],
+                    frontier_target[1] + spread[1],
+                )
+                planner.toward(ranger, spread_cell, "aggress_frontier")
+                frontier_probe_count += 1
                 self.memory.decision_totals["ranger:frontier"] += 1
 
     def _choose_rangers_beacon(
