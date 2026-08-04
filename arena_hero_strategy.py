@@ -1127,7 +1127,7 @@ def _find_path(
     blocked: set[Position],
     threat: Counter[Position],
     visited: Counter[Position],
-    max_expansions: int = 4000,
+    max_expansions: int = 30000,
     ignore_occupancy_goals: bool = True,
 ) -> tuple[Direction, ...]:
     if start == goal:
