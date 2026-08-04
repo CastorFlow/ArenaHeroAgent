@@ -151,6 +151,8 @@ class EndToEndTests(unittest.TestCase):
                 "recall": False,
                 "beacon_target_distance": 0,
                 "rally_point": None,
+                "aggress_vanguards": 0,
+                "aggress_rangers": 0,
             },
         )
 

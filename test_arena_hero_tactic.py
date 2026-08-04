@@ -2241,7 +2241,7 @@ class StuckHealPredictionTests(unittest.TestCase):
             summary = SmartTactic(TacticMemory(), control_path=control_path).choose_actions(turn)
 
             self.assertTrue(
-                any("escort" in item for item in summary.decisions)
+                any("squad_front" in item for item in summary.decisions)
             )
 
     def test_aggress_ranger_advances_frontier(self) -> None:

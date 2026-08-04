@@ -256,18 +256,29 @@ def load_control(path: Path) -> dict[str, Any]:
             and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in raw_rally)
         ):
             rally = [int(raw_rally[0]), int(raw_rally[1])]
-        return {
+        result: dict[str, Any] = {
             "mode": mode,
             "recall": bool(recall),
             "beacon_target_distance": distance,
             "rally_point": rally,
         }
+        for key in ("aggress_vanguards", "aggress_rangers"):
+            raw_value = data.get(key, 0)
+            result[key] = (
+                max(0, int(raw_value))
+                if isinstance(raw_value, (int, float))
+                and not isinstance(raw_value, bool)
+                else 0
+            )
+        return result
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return {
             "mode": "develop",
             "recall": False,
             "beacon_target_distance": 0,
             "rally_point": None,
+            "aggress_vanguards": 0,
+            "aggress_rangers": 0,
         }
 
 
@@ -292,6 +303,14 @@ def save_control(path: Path, mode: str, recall: bool, data: dict[str, Any] | Non
             payload["rally_point"] = [int(raw_rally[0]), int(raw_rally[1])]
         else:
             payload["rally_point"] = None
+        for key in ("aggress_vanguards", "aggress_rangers"):
+            raw_value = data.get(key, 0)
+            payload[key] = (
+                max(0, int(raw_value))
+                if isinstance(raw_value, (int, float))
+                and not isinstance(raw_value, bool)
+                else 0
+            )
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(

@@ -216,6 +216,9 @@ class TacticMemory:
     recall: bool = False
     beacon_target_distance: int = 0
     rally_point: tuple[int, int] | None = None
+    aggress_vanguards: int = 0
+    aggress_rangers: int = 0
+    attacked_units: dict[str, int] = field(default_factory=dict)
     control_mtime: int = 0
     total_resources_harvested: int = 0
     total_resources_deposited: int = 0
@@ -567,6 +570,11 @@ class TacticMemory:
         }
 
         for event in turn.events:
+            # 广播系统：单位被攻击 → 记录并通知其他单位支援
+            if event.event_type == "UNIT_DAMAGED" and event.actor_id is not None:
+                actor_key = str(event.actor_id)
+                if actor_key in self.unit_labels:
+                    self.attacked_units[actor_key] = turn.tick
             # 记录战斗事件（供 overlay 快速定位）
             if event.event_type in {
                 "SHOT_HIT",
@@ -829,6 +837,12 @@ class TacticMemory:
                 self.rally_point = (int(raw_rally[0]), int(raw_rally[1]))
             else:
                 self.rally_point = None
+            for key in ("aggress_vanguards", "aggress_rangers"):
+                raw_value = data.get(key)
+                if isinstance(raw_value, (int, float)) and not isinstance(
+                    raw_value, bool
+                ):
+                    setattr(self, key, max(0, int(raw_value)))
             self.control_mtime = mtime
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             pass
@@ -947,6 +961,11 @@ class TacticMemory:
 
 def _distance(left: Position, right: Position) -> int:
     return abs(left[0] - right[0]) + abs(left[1] - right[1])
+
+
+def _sign(value: int) -> int:
+    """返回 -1 / 0 / +1（用于编队方向偏移）"""
+    return (value > 0) - (value < 0)
 
 
 def _load_recovery_target_hints(path: Path) -> tuple[Position, ...]:
@@ -2687,17 +2706,60 @@ class SmartTactic:
         decisions: list[str],
     ) -> None:
         ordered = sorted(turn.vanguards, key=_uuid_key)
-        defender_count = min(
-            AGGRESS_DEFENDER_VANGUARDS,
-            max(0, len(ordered) - 1),
-        )
+        # 守家/侵略配比：aggress_vanguards > 0 时，指定去侵略的数量，其余守家
+        if self.memory.aggress_vanguards > 0:
+            defender_count = max(0, len(ordered) - self.memory.aggress_vanguards)
+        else:
+            defender_count = min(
+                AGGRESS_DEFENDER_VANGUARDS,
+                max(0, len(ordered) - 1),
+            )
         defender_ids = {unit.id for unit in ordered[:defender_count]}
         combat_target = self._pick_assault_target(turn)
-        # 先锋编队：找最近的"游离游侠"（未被其他先锋护卫的）→ 贴上去
-        ranger_ids_with_guard: set[UUID] = set()
+        frontier_target = self._assault_frontier_target(
+            turn,
+            planner,
+            origin=turn.beacon.position,
+        )
+        now = turn.tick
+        # 广播系统：最近 40 tick 内被攻击的队友（含先锋/游侠）
+        attacked_victims: list[tuple[Position, UUID]] = []
+        for unit in list(turn.vanguards) + list(turn.rangers):
+            attacked_tick = self.memory.attacked_units.get(str(unit.id))
+            if attacked_tick is not None and now - attacked_tick <= 40:
+                attacked_victims.append((unit.position, unit.id))
+        victim_positions = [position for position, _ in attacked_victims]
+
+        # 编队方向：游侠 leader 的推进目标（combat 优先，其次 frontier/信标）
+        squad_direction: Position | None = combat_target or frontier_target
+
         for vanguard in ordered:
             if vanguard.id in acted_units:
                 continue
+            vanguard_key = str(vanguard.id)
+            # 1. 自己被攻击且敌人贴身 → 撤退回走位（不原地挨打）
+            if (
+                vanguard_key in self.memory.attacked_units
+                and now - self.memory.attacked_units[vanguard_key] <= 30
+                and turn.visible_enemies
+            ):
+                nearest_enemy = min(
+                    turn.visible_enemies,
+                    key=lambda enemy: _distance(enemy.position, vanguard.position),
+                )
+                if _distance(nearest_enemy.position, vanguard.position) <= 6:
+                    retreat = (
+                        vanguard.position[0] * 2 - nearest_enemy.position[0],
+                        vanguard.position[1] * 2 - nearest_enemy.position[1],
+                    )
+                    planner.toward(vanguard, retreat, "aggress_retreat")
+                    decisions.append(
+                        f"vanguard:{_short_id(vanguard.id)} retreat "
+                        f"from={_short_id(nearest_enemy.id)}"
+                    )
+                    self.memory.decision_totals["vanguard:retreat"] += 1
+                    continue
+            # 2. 贴脸敌人 → sweep（近身战斗）
             direction = self._sweep_targets(vanguard, turn)
             if direction is not None:
                 vanguard.sweep(direction)
@@ -2706,6 +2768,7 @@ class SmartTactic:
                 )
                 self.memory.decision_totals["vanguard:sweep"] += 1
                 continue
+            # 3. 家被摸 → 先救家
             if turn.core is not None:
                 threatening = [
                     enemy
@@ -2713,16 +2776,32 @@ class SmartTactic:
                     if _distance(enemy.position, turn.core.position) <= 5
                 ]
                 if threatening:
-                    target_ = min(
+                    target = min(
                         threatening,
-                        key=lambda enemy_: (
-                            _enemy_role_priority(enemy_),
-                            _distance(vanguard.position, enemy_.position),
-                            enemy_.id.bytes,
+                        key=lambda enemy: (
+                            _enemy_role_priority(enemy),
+                            _distance(vanguard.position, enemy.position),
+                            enemy.id.bytes,
                         ),
                     )
-                    planner.toward(vanguard, target_.position, "aggress_defend_core")
+                    planner.toward(vanguard, target.position, "aggress_defend_core")
                     continue
+            # 4. 支援被攻击的队友（靠近的优先，站在受害者附近拦截）
+            if victim_positions:
+                nearest_victim = min(
+                    victim_positions,
+                    key=lambda position: _distance(vanguard.position, position),
+                )
+                victim_distance = _distance(vanguard.position, nearest_victim)
+                if 2 < victim_distance <= 18:
+                    planner.toward(vanguard, nearest_victim, "aggress_support")
+                    decisions.append(
+                        f"vanguard:{_short_id(vanguard.id)} support "
+                        f"victim={nearest_victim}"
+                    )
+                    self.memory.decision_totals["vanguard:support"] += 1
+                    continue
+            # 5. 守家单位 → 驻守 core
             if vanguard.id in defender_ids:
                 if (
                     turn.core is not None
@@ -2731,48 +2810,41 @@ class SmartTactic:
                     planner.toward(vanguard, turn.core.position, "aggress_core_guard")
                 self.memory.decision_totals["vanguard:aggress_guard"] += 1
                 continue
-            if combat_target is not None:
-                planner.toward(vanguard, combat_target, "assault_enemy")
-                decisions.append(
-                    f"vanguard:{_short_id(vanguard.id)} assault target={combat_target}"
-                )
-                self.memory.decision_totals["vanguard:assault"] += 1
-                continue
-            # 编队：找一个未被护卫的游侠，贴到距离 <= FORMATION_VANGUARD_RANGER_MAX_DISTANCE
-            unguarded = [
+            # 6. 编队（核心）：先锋站到游侠前方 2 格（游侠与目标方向之间）
+            rangers = [
                 r
                 for r in turn.rangers
                 if r.id not in acted_units
-                and r.id not in ranger_ids_with_guard
-                and _distance(vanguard.position, r.position)
-                > FORMATION_VANGUARD_RANGER_MAX_DISTANCE
+                and r.id not in defender_ids
             ]
-            if unguarded:
+            if rangers:
                 buddy = min(
-                    unguarded,
+                    rangers,
                     key=lambda r: _distance(vanguard.position, r.position),
                 )
-                planner.toward(
-                    vanguard,
-                    buddy.position,
-                    "vanguard_escort_ranger",
-                )
-                ranger_ids_with_guard.add(buddy.id)
-                decisions.append(
-                    f"vanguard:{_short_id(vanguard.id)} escort "
-                    f"ranger:{_short_id(buddy.id)}"
-                )
-                self.memory.decision_totals["vanguard:escort"] += 1
-            else:
-                # 所有游侠已被护卫 → 向信标方向推进（地图焦点，敌人必争之地）
-                frontier = self._assault_frontier_target(
-                    turn,
-                    planner,
-                    origin=turn.beacon.position,
-                )
-                if frontier is not None:
-                    planner.toward(vanguard, frontier, "aggress_frontier")
-                    self.memory.decision_totals["vanguard:frontier"] += 1
+                buddy_position = buddy.position
+                if squad_direction is not None:
+                    # 先锋站位 = 游侠朝向目标方向前推 2 格（挡在游侠与敌人之间）
+                    dx = _sign(squad_direction[0] - buddy_position[0])
+                    dy = _sign(squad_direction[1] - buddy_position[1])
+                    formation = (
+                        buddy_position[0] + dx * 2,
+                        buddy_position[1] + dy * 2,
+                    )
+                else:
+                    formation = buddy_position
+                if _distance(vanguard.position, formation) > 1:
+                    planner.toward(vanguard, formation, "vanguard_squad_front")
+                    decisions.append(
+                        f"vanguard:{_short_id(vanguard.id)} squad_front "
+                        f"ranger:{_short_id(buddy.id)} pos={formation}"
+                    )
+                    self.memory.decision_totals["vanguard:squad_front"] += 1
+                continue
+            # 7. 无游侠可护卫 → 向目标推进
+            if squad_direction is not None:
+                planner.toward(vanguard, squad_direction, "aggress_advance")
+                self.memory.decision_totals["vanguard:frontier"] += 1
 
     def _choose_vanguards_rally(
         self,
@@ -3002,10 +3074,14 @@ class SmartTactic:
     ) -> None:
         assigned_damage: Counter[UUID] = Counter()
         ordered = sorted(turn.rangers, key=_uuid_key)
-        defender_count = min(
-            AGGRESS_DEFENDER_RANGERS,
-            max(0, len(ordered) - 1),
-        )
+        # 守家/侵略配比：aggress_rangers > 0 时，指定去侵略的数量，其余守家
+        if self.memory.aggress_rangers > 0:
+            defender_count = max(0, len(ordered) - self.memory.aggress_rangers)
+        else:
+            defender_count = min(
+                AGGRESS_DEFENDER_RANGERS,
+                max(0, len(ordered) - 1),
+            )
         defenders = ordered[:defender_count]
         defender_ids = {unit.id for unit in defenders}
         patrol_slots = self._core_patrol_slots(turn, planner, defenders)
@@ -3016,9 +3092,39 @@ class SmartTactic:
             origin=turn.beacon.position,
         )
         frontier_probe_count = 0
+        now = turn.tick
+        # 广播系统：最近 40 tick 内被攻击的队友（含先锋/游侠）
+        attacked_victims: list[Position] = []
+        for unit in list(turn.vanguards) + list(turn.rangers):
+            attacked_tick = self.memory.attacked_units.get(str(unit.id))
+            if attacked_tick is not None and now - attacked_tick <= 40:
+                attacked_victims.append(unit.position)
         for ranger in ordered:
             if ranger.id in acted_units:
                 continue
+            ranger_key = str(ranger.id)
+            # 0. 被攻击且被近身 → 先撤退回走位（不原地挨打）
+            if (
+                ranger_key in self.memory.attacked_units
+                and now - self.memory.attacked_units[ranger_key] <= 30
+                and turn.visible_enemies
+            ):
+                nearest_enemy = min(
+                    turn.visible_enemies,
+                    key=lambda enemy: _distance(enemy.position, ranger.position),
+                )
+                if _distance(nearest_enemy.position, ranger.position) <= 3:
+                    retreat = (
+                        ranger.position[0] * 2 - nearest_enemy.position[0],
+                        ranger.position[1] * 2 - nearest_enemy.position[1],
+                    )
+                    planner.toward(ranger, retreat, "aggress_retreat")
+                    decisions.append(
+                        f"ranger:{_short_id(ranger.id)} retreat "
+                        f"from={_short_id(nearest_enemy.id)}"
+                    )
+                    self.memory.decision_totals["ranger:retreat"] += 1
+                    continue
             shot_candidates = self._ranger_shot_candidates(turn, ranger, planner)
             if ranger.id in defender_ids:
                 shot_candidates = [
@@ -3050,6 +3156,31 @@ class SmartTactic:
                 )
                 self.memory.decision_totals["ranger:shoot"] += 1
                 continue
+            # 1. 支援被攻击的队友：向受害者推进到射程
+            if attacked_victims:
+                nearest_victim = min(
+                    attacked_victims,
+                    key=lambda position: _distance(ranger.position, position),
+                )
+                victim_distance = _distance(ranger.position, nearest_victim)
+                if victim_distance > 3:
+                    firing_cells = self._firing_cells(
+                        nearest_victim, planner.obstacles
+                    )
+                    if firing_cells:
+                        firing_cell = min(
+                            firing_cells,
+                            key=lambda position: (
+                                planner.threat.get(position, 0),
+                                _distance(ranger.position, position),
+                                position,
+                            ),
+                        )
+                        planner.toward(ranger, firing_cell, "aggress_support_firing")
+                    else:
+                        planner.toward(ranger, nearest_victim, "aggress_support")
+                    self.memory.decision_totals["ranger:support"] += 1
+                    continue
             # 移动：向敌人（Core 优先）推进到射程内
             if ranger.id in defender_ids:
                 patrol_slot = patrol_slots.get(ranger.id)
