@@ -2012,6 +2012,30 @@ class StuckHealPredictionTests(unittest.TestCase):
         if goal is not None:
             self.assertGreaterEqual(goal.created_tick, 20)
 
+    def test_spinning_worker_clears_goal(self) -> None:
+        # 来回震荡（在 2-3 格间打转 16 tick）→ 判定打转并清除目标
+        memory = TacticMemory()
+        memory.worker_goals[str(WORKER_LOW)] = WorkerGoal("frontier", (10, 0), 0)
+        memory.recent_positions[str(WORKER_LOW)] = [
+            (3, 0), (3, 1), (3, 0), (3, 1), (3, 0), (3, 1),
+            (3, 0), (3, 1), (3, 0), (3, 1), (3, 0), (3, 1),
+            (3, 0), (3, 1), (3, 0), (3, 1),
+        ]
+        memory.unit_positions[str(WORKER_LOW)] = (3, 1)
+        memory.last_position_tick[str(WORKER_LOW)] = 5  # 位置在变，stationary 不触发
+        turn, _ = make_turn(
+            tick=20,
+            own_core=core((0, 0)),
+            units=(worker(WORKER_LOW, (3, 1)),),
+            resources=0,
+        )
+
+        summary = SmartTactic(memory).choose_actions(turn)
+
+        self.assertTrue(
+            any("stuck_clear reason=spinning" in item for item in summary.decisions)
+        )
+
     def test_moving_worker_keeps_goal(self) -> None:
         # 位置在变化（非卡住）→ 目标保留
         memory = TacticMemory()

@@ -53,6 +53,8 @@ CORE_MIGRATION_ENABLED = False
 DEVELOP_WIDE_SEARCH_MAX_RADIUS = 24
 # 卡住判定：单位连续这么多 tick 位置未变化且仍有移动目标 → 视为迷路
 STUCK_TICKS = 16
+# 打转判定：最近 STUCK_TICKS 个 tick 内，单位经过的不同位置 ≤ 此阈值 → 震荡打转
+SPIN_POSITION_BUDGET = 6
 # 单位满血值
 MAX_HP = {UnitType.WORKER: 2, UnitType.VANGUARD: 4, UnitType.RANGER: 2}
 AGGRESS_DEFENDER_VANGUARDS = 1
@@ -202,6 +204,7 @@ class TacticMemory:
     observations: list[str] = field(default_factory=list, repr=False)
     unit_positions: dict[str, Position] = field(default_factory=dict, repr=False)
     last_position_tick: dict[str, int] = field(default_factory=dict, repr=False)
+    recent_positions: dict[str, list[Position]] = field(default_factory=dict, repr=False)
     enemy_positions: dict[str, Position] = field(default_factory=dict, repr=False)
     enemy_prev: dict[str, Position] = field(default_factory=dict, repr=False)
 
@@ -697,6 +700,10 @@ class TacticMemory:
             self.unit_positions[uid] = unit.position
             if previous != unit.position:
                 self.last_position_tick[uid] = turn.tick
+            recent = self.recent_positions.setdefault(uid, [])
+            recent.append(unit.position)
+            if len(recent) > STUCK_TICKS:
+                del recent[: len(recent) - STUCK_TICKS]
         # 追踪敌人位置（用于预判射击）
         for enemy in turn.visible_enemies:
             eid = str(enemy.id)
@@ -715,6 +722,7 @@ class TacticMemory:
             if uid not in live_ids:
                 self.last_position_tick.pop(uid, None)
                 self.unit_positions.pop(uid, None)
+                self.recent_positions.pop(uid, None)
         self.last_tick = turn.tick
 
     def remember_move(self, unit: Unit, destination: Position, tick: int) -> None:
@@ -1584,18 +1592,27 @@ class SmartTactic:
             empty_workers.append(worker)
 
         unassigned = {worker.id: worker for worker in empty_workers}
-        # 迷路检测：有移动目标但超过 STUCK_TICKS 无法挪动 → 清除目标重新分配
+        # 迷路检测：有移动目标但无法到达 → 清除目标重新分配
+        # 两种模式：①位置完全不动 ②来回震荡（打转，位置在 2-3 格间反复）
         stuck_cleared = 0
         for worker_id, worker in list(unassigned.items()):
             goal = self.memory.worker_goals.get(str(worker.id))
             if goal is None or goal.position == worker.position:
                 continue
-            last_moved = self.memory.last_position_tick.get(str(worker.id), turn.tick)
-            if turn.tick - last_moved > STUCK_TICKS:
+            uid = str(worker.id)
+            last_moved = self.memory.last_position_tick.get(uid, turn.tick)
+            stationary = turn.tick - last_moved > STUCK_TICKS
+            recent = self.memory.recent_positions.get(uid, [])
+            spinning = (
+                len(recent) >= STUCK_TICKS
+                and len(set(recent)) <= SPIN_POSITION_BUDGET
+            )
+            if stationary or spinning:
+                reason = "stationary" if stationary else "spinning"
                 self.memory.clear_worker_goal(worker)
                 decisions.append(
-                    f"worker:{_short_id(worker.id)} stuck_clear "
-                    f"goal={goal.position} stuck_ticks={turn.tick - last_moved}"
+                    f"worker:{_short_id(worker.id)} stuck_clear reason={reason} "
+                    f"goal={goal.position} unique_cells={len(set(recent))}"
                 )
                 self.memory.decision_totals["worker:stuck_clear"] += 1
                 stuck_cleared += 1
