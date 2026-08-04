@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import heapq
 import json
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -449,7 +450,25 @@ class TacticMemory:
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             encoding="utf-8",
         )
-        temporary.replace(path)
+        # 双 agent 竞争写同一文件时会 PermissionError（WinError 5）；重试 + 降级，绝不崩溃
+        for attempt in range(4):
+            try:
+                temporary.replace(path)
+                break
+            except OSError:
+                if attempt < 3:
+                    time.sleep(0.2)
+                else:
+                    try:
+                        path.write_text(
+                            json.dumps(
+                                payload, ensure_ascii=False, separators=(",", ":")
+                            ),
+                            encoding="utf-8",
+                        )
+                    except OSError:
+                        # 保存失败不致命：下一 tick 会再试
+                        pass
         try:
             self.save_routes(path.with_name(ROUTES_FILENAME))
         except OSError:
