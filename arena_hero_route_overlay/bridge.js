@@ -10,10 +10,15 @@
   }
 
   function send(message, callback) {
-    chrome.runtime.sendMessage(message, (response) => {
-      const failed = Boolean(chrome.runtime.lastError) || !response || !response.ok;
-      callback(failed, response && response.payload);
-    });
+    try {
+      chrome.runtime.sendMessage(message, (response) => {
+        const failed =
+          Boolean(chrome.runtime.lastError) || !response || !response.ok;
+        callback(failed, response && response.payload);
+      });
+    } catch (error) {
+      callback(true, undefined);
+    }
   }
 
   function poll() {

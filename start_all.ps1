@@ -3,6 +3,14 @@
 $ErrorActionPreference = 'Continue'
 $root = $PSScriptRoot
 
+# 0. 清理旧的 arena_hero 进程（避免端口 8765 被多个 server 抢占导致扩展报错）
+$old = Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+    Where-Object { $_.CommandLine -like '*arena_hero*' }
+foreach ($process in $old) {
+    Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+}
+Start-Sleep -Milliseconds 800
+
 # 1. overlay server（8765 端口，供 Chrome 扩展读取路线/状态/控制）
 Start-Process -FilePath "$root\.venv\Scripts\python.exe" `
     -ArgumentList "$root\arena_hero_route_overlay_server.py", `
@@ -26,4 +34,5 @@ Start-Process -FilePath "$root\.venv\Scripts\python.exe" `
 Write-Host "Arena Hero 已启动（后台）:"
 Write-Host "  - overlay server  → http://127.0.0.1:8765"
 Write-Host "  - agent           → 日志见 agent.log"
+Write-Host "  （已清理 $($old.Count) 个旧进程）"
 Write-Host "关闭本窗口不影响以上进程运行。"

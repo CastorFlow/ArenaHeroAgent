@@ -55,6 +55,16 @@ SPREAD_OFFSETS = (
     (0, 0), (4, 0), (-4, 0), (0, 4), (0, -4),
     (4, 4), (-4, -4), (4, -4), (-4, 4),
 )
+# 召回时先锋贴身 core 的分散位（core 4 邻 + 对角，避免全挤 core 位置）
+VANGUARD_RECALL_OFFSETS = (
+    (1, 0), (-1, 0), (0, 1), (0, -1),
+    (1, 1), (-1, -1), (1, -1), (-1, 1),
+)
+# 召回时游侠回 core 周围的分散位（2 格环，避免路径冲突）
+RANGER_RECALL_OFFSETS = (
+    (0, -2), (2, 0), (0, 2), (-2, 0),
+    (2, -2), (-2, -2), (2, 2), (-2, 2),
+)
 # 人口上限（游戏规则 19）
 MAX_POPULATION = 19
 # core 是否允许自动迁移（false = 固定不动）
@@ -2813,7 +2823,11 @@ class SmartTactic:
         acted_units: set[UUID],
         decisions: list[str],
     ) -> None:
-        for vanguard in sorted(turn.vanguards, key=_uuid_key):
+        ordered_vanguards = sorted(turn.vanguards, key=_uuid_key)
+        vanguard_indexes = {
+            unit.id: index for index, unit in enumerate(ordered_vanguards)
+        }
+        for vanguard in ordered_vanguards:
             if vanguard.id in acted_units:
                 continue
             direction = self._sweep_targets(vanguard, turn)
@@ -2842,7 +2856,15 @@ class SmartTactic:
                     planner.toward(vanguard, target.position, "recall_intercept")
                     continue
                 if _distance(vanguard.position, turn.core.position) > 1:
-                    planner.toward(vanguard, turn.core.position, "recall_guard_core")
+                    offset = VANGUARD_RECALL_OFFSETS[
+                        (index := vanguard_indexes[vanguard.id])
+                        % len(VANGUARD_RECALL_OFFSETS)
+                    ]
+                    target = (
+                        turn.core.position[0] + offset[0],
+                        turn.core.position[1] + offset[1],
+                    )
+                    planner.toward(vanguard, target, "recall_guard_core")
                     self.memory.decision_totals["vanguard:recall"] += 1
 
     def _choose_vanguards_defend(
@@ -3126,7 +3148,14 @@ class SmartTactic:
                     self.memory.decision_totals["ranger:recall"] += 1
                     continue
             if turn.core is not None and _distance(ranger.position, turn.core.position) > 2:
-                planner.toward(ranger, turn.core.position, "ranger_recall_core")
+                offset = RANGER_RECALL_OFFSETS[
+                    ordered_rangers.index(ranger) % len(RANGER_RECALL_OFFSETS)
+                ]
+                target = (
+                    turn.core.position[0] + offset[0],
+                    turn.core.position[1] + offset[1],
+                )
+                planner.toward(ranger, target, "ranger_recall_core")
                 self.memory.decision_totals["ranger:recall"] += 1
 
     def _choose_rangers_defend(
