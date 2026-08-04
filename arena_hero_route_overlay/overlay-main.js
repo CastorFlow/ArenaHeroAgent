@@ -20,7 +20,7 @@
     camera: null,
     payload: { version: 2, tick: 0, routes: [], units: [], resources: [] },
     stats: null,
-    control: { mode: "develop", recall: false },
+    control: { mode: "develop", recall: false, beacon_target_distance: 0 },
     settings: core.normalizeSettings({}),
     serviceOnline: false,
     pointer: null,
@@ -201,6 +201,41 @@
     state.settingInputs.set(key, { input, kind: "color" });
   }
 
+  function addControlNumber(panel, key, labelText, hintText) {
+    const row = document.createElement("div");
+    Object.assign(row.style, {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      minHeight: "28px",
+    });
+    const label = document.createElement("span");
+    label.textContent = labelText;
+    label.title = hintText;
+    const input = document.createElement("input");
+    input.type = "number";
+    input.min = "0";
+    input.max = "300";
+    input.step = "5";
+    Object.assign(input.style, {
+      width: "64px",
+      padding: "2px 6px",
+      border: "1px solid rgba(255,255,255,0.25)",
+      borderRadius: "5px",
+      background: "rgba(255,255,255,0.08)",
+      color: "#d9e1eb",
+      font: "12px system-ui, -apple-system, Segoe UI, sans-serif",
+    });
+    input.addEventListener("change", () => {
+      const value = Math.max(0, Number.parseInt(input.value, 10) || 0);
+      updateControl({ [key]: value });
+      input.value = String(value);
+    });
+    row.append(label, input);
+    panel.appendChild(row);
+    state.settingInputs.set(key, { input, kind: "number" });
+  }
+
   function createControls() {
     if (state.toolbar || !document.documentElement) {
       return;
@@ -272,6 +307,12 @@
     addColor(panel, "vanguardColor", "先锋路线颜色");
     addColor(panel, "rangerColor", "游侠路线颜色");
     addColor(panel, "resourceColor", "资源高亮颜色");
+    addControlNumber(
+      panel,
+      "beacon_target_distance",
+      "core↔信标目标距离",
+      "core 与信标的目标距离（格）：0=关闭；距离大于设定时 core 向信标推进，小于则远离",
+    );
 
     const reset = document.createElement("button");
     reset.type = "button";
@@ -685,8 +726,12 @@
     }
     if (state.recallButton) {
       const recall = state.control.recall;
-      state.recallButton.textContent = recall ? "召回中" : "一键召回";
-      state.recallButton.style.color = recall ? "#e0b25c" : "#8f9cad";
+      state.recallButton.textContent = recall ? "解除召回" : "一键召回";
+      state.recallButton.style.color = recall ? "#d98a7a" : "#9bcbbd";
+    }
+    if (state.settingInputs.has("beacon_target_distance")) {
+      const entry = state.settingInputs.get("beacon_target_distance");
+      entry.input.value = String(state.control.beacon_target_distance ?? 0);
     }
     if (state.statsPanel) {
       state.statsPanel.style.display = state.statsOpen ? "block" : "none";
@@ -1192,6 +1237,10 @@
         state.control = {
           mode: message.payload.mode === "beacon" ? "beacon" : message.payload.mode === "aggress" ? "aggress" : "develop",
           recall: Boolean(message.payload.recall),
+          beacon_target_distance:
+            typeof message.payload.beacon_target_distance === "number"
+              ? message.payload.beacon_target_distance
+              : state.control.beacon_target_distance ?? 0,
         };
         syncControls();
         renderStatusBar();

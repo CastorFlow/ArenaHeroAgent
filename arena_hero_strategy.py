@@ -59,6 +59,8 @@ SPREAD_OFFSETS = (
 MAX_POPULATION = 19
 # core 是否允许自动迁移（false = 固定不动）
 CORE_MIGRATION_ENABLED = False
+# 信标目标距离控制的容差带（格）：距离偏差超过此值才迁移，避免来回抖动
+CORE_BEACON_HYSTERESIS = 8
 # 发育探索半径封顶：资源 4 tick 刷新，守点循环采集优于长途探索
 DEVELOP_WIDE_SEARCH_MAX_RADIUS = 24
 # 卡住判定：单位连续这么多 tick 位置未变化且仍有移动目标 → 视为迷路
@@ -199,6 +201,7 @@ class TacticMemory:
     last_tick: int = 0
     mode: str = MODE_DEVELOP
     recall: bool = False
+    beacon_target_distance: int = 0
     control_mtime: int = 0
     total_resources_harvested: int = 0
     total_resources_deposited: int = 0
@@ -774,6 +777,11 @@ class TacticMemory:
             if mode in MODE_VALUES:
                 self.mode = mode
             self.recall = bool(data.get("recall", self.recall))
+            raw_distance = data.get("beacon_target_distance")
+            if isinstance(raw_distance, (int, float)) and not isinstance(
+                raw_distance, bool
+            ):
+                self.beacon_target_distance = max(0, int(raw_distance))
             self.control_mtime = mtime
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             pass
@@ -794,6 +802,7 @@ class TacticMemory:
                 "tick": turn.tick,
                 "mode": self.mode,
                 "recall": self.recall,
+                "beacon_target_distance": self.beacon_target_distance,
                 "resources": turn.resources,
                 "capacity": turn.resource_capacity,
                 "population": len(turn.units),
@@ -3381,6 +3390,42 @@ class SmartTactic:
             decisions.append(f"core repair_shield reason=spare_resources shield={core.shield}")
             self.memory.decision_totals["core:repair"] += 1
         else:
+            # 信标目标距离控制：设置了 beacon_target_distance 时按距离推进/远离
+            beacon_ctrl = self.memory.beacon_target_distance
+            beacon_dist = _distance(core.position, turn.beacon.position)
+            if beacon_ctrl > 0:
+                if beacon_dist > beacon_ctrl + CORE_BEACON_HYSTERESIS:
+                    decisions.append(
+                        f"core migrate reason=beacon_distance_ctrl "
+                        f"dist={beacon_dist} target={beacon_ctrl} toward=beacon"
+                    )
+                    self.memory.decision_totals["core:migrate_beacon_ctrl"] += 1
+                    self._choose_core_migration(
+                        turn,
+                        planner,
+                        incoming_deposit,
+                        decisions,
+                        beacon_target=turn.beacon.position,
+                    )
+                elif beacon_dist < beacon_ctrl - CORE_BEACON_HYSTERESIS:
+                    # 太近 → 远离信标（向反方向延伸点）
+                    retreat = (
+                        core.position[0] * 2 - turn.beacon.position[0],
+                        core.position[1] * 2 - turn.beacon.position[1],
+                    )
+                    decisions.append(
+                        f"core migrate reason=beacon_distance_ctrl "
+                        f"dist={beacon_dist} target={beacon_ctrl} away=beacon"
+                    )
+                    self.memory.decision_totals["core:migrate_beacon_ctrl"] += 1
+                    self._choose_core_migration(
+                        turn,
+                        planner,
+                        incoming_deposit,
+                        decisions,
+                        beacon_target=retreat,
+                    )
+                return
             # cargo 工人被障碍挡回不来（长时间打转且离 core 远）→ 允许 core 自愈迁移靠拢
             cargo_blocked = False
             for worker in turn.workers:
@@ -3411,6 +3456,7 @@ class SmartTactic:
         planner: MovementPlanner,
         incoming_deposit: int,
         decisions: list[str],
+        beacon_target: Position | None = None,
     ) -> None:
         core = turn.core
         if core is None or core.view.state is not CoreState.NORMAL:
@@ -3432,7 +3478,10 @@ class SmartTactic:
             return
         owns_beacon = _owns_beacon(turn)
 
-        if cargo_workers:
+        if beacon_target is not None:
+            targets = [beacon_target]
+            reason = "beacon_distance_ctrl"
+        elif cargo_workers:
             # 只向被挡在远处的 cargo 工人靠拢（近的能自己交付）
             targets = [
                 worker.position
@@ -3468,8 +3517,6 @@ class SmartTactic:
             if (
                 destination in planner.obstacles
                 or destination in planner.enemy_cells
-                or destination in turn.resource_cells
-                or self.memory.temporary_blocks.get(destination, 0) > turn.tick
                 or planner.final_occupancy(destination) >= 2
             ):
                 continue
@@ -3497,7 +3544,7 @@ class SmartTactic:
                     current_beacon_distance
                     - _distance(destination, turn.beacon.position)
                 )
-                if beacon_progress < 0:
+                if beacon_progress < 0 and beacon_target is None:
                     continue
             score = (
                 target_distance

@@ -144,7 +144,10 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(routes_payload["tick"], 12)
             self.assertEqual(stats_payload["mode"], "aggress")
             self.assertEqual(stats_payload["resources"], 25)
-            self.assertEqual(control_payload, {"mode": "aggress", "recall": False})
+            self.assertEqual(
+            control_payload,
+            {"mode": "aggress", "recall": False, "beacon_target_distance": 0},
+        )
 
 
 if __name__ == "__main__":

@@ -137,7 +137,10 @@ class RouteOverlayServerTests(unittest.TestCase):
             try:
                 with urlopen(f"{base}/control", timeout=2) as response:
                     default = json.load(response)
-                self.assertEqual(default, {"mode": "develop", "recall": False})
+                self.assertEqual(
+                    default,
+                    {"mode": "develop", "recall": False, "beacon_target_distance": 0},
+                )
 
                 request = Request(
                     f"{base}/control",
@@ -147,14 +150,20 @@ class RouteOverlayServerTests(unittest.TestCase):
                 )
                 with urlopen(request, timeout=2) as response:
                     posted = json.load(response)
-                self.assertEqual(posted, {"mode": "aggress", "recall": True})
+                self.assertEqual(
+                    posted,
+                    {"mode": "aggress", "recall": True, "beacon_target_distance": 0},
+                )
 
                 with urlopen(f"{base}/control", timeout=2) as response:
                     after = json.load(response)
-                self.assertEqual(after, {"mode": "aggress", "recall": True})
+                self.assertEqual(
+                    after,
+                    {"mode": "aggress", "recall": True, "beacon_target_distance": 0},
+                )
                 self.assertEqual(
                     json.loads(control_path.read_text(encoding="utf-8")),
-                    {"mode": "aggress", "recall": True},
+                    {"mode": "aggress", "recall": True, "beacon_target_distance": 0},
                 )
             finally:
                 server.shutdown()
@@ -231,7 +240,10 @@ class RouteOverlayServerTests(unittest.TestCase):
                 )
                 with urlopen(request, timeout=2) as response:
                     posted = json.load(response)
-                self.assertEqual(posted, {"mode": "beacon", "recall": False})
+                self.assertEqual(
+                    posted,
+                    {"mode": "beacon", "recall": False, "beacon_target_distance": 0},
+                )
             finally:
                 server.shutdown()
                 server.server_close()

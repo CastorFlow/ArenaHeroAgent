@@ -236,20 +236,35 @@ def load_control(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
-            return {"mode": "develop", "recall": False}
+            return {"mode": "develop", "recall": False, "beacon_target_distance": 0}
         mode = data.get("mode", "develop")
         if mode not in VALID_MODES:
             mode = "develop"
         recall = data.get("recall", False)
-        return {"mode": mode, "recall": bool(recall)}
+        raw_distance = data.get("beacon_target_distance", 0)
+        distance = (
+            max(0, int(raw_distance))
+            if isinstance(raw_distance, (int, float))
+            and not isinstance(raw_distance, bool)
+            else 0
+        )
+        return {"mode": mode, "recall": bool(recall), "beacon_target_distance": distance}
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        return {"mode": "develop", "recall": False}
+        return {"mode": "develop", "recall": False, "beacon_target_distance": 0}
 
 
-def save_control(path: Path, mode: str, recall: bool) -> dict[str, Any]:
+def save_control(path: Path, mode: str, recall: bool, data: dict[str, Any] | None = None) -> dict[str, Any]:
     if mode not in VALID_MODES:
         raise ValueError(f"mode must be one of {sorted(VALID_MODES)}")
-    payload = {"mode": mode, "recall": bool(recall)}
+    payload: dict[str, Any] = {"mode": mode, "recall": bool(recall)}
+    if data is not None:
+        raw_distance = data.get("beacon_target_distance")
+        if isinstance(raw_distance, (int, float)) and not isinstance(
+            raw_distance, bool
+        ):
+            payload["beacon_target_distance"] = max(0, int(raw_distance))
+        else:
+            payload["beacon_target_distance"] = 0
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
@@ -343,7 +358,7 @@ class RouteOverlayHandler(BaseHTTPRequestHandler):
         mode = data.get("mode", current["mode"])
         recall = data.get("recall", current["recall"])
         try:
-            payload = save_control(self.server.control_path, mode, recall)
+            payload = save_control(self.server.control_path, mode, recall, data)
         except ValueError as exc:
             self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
