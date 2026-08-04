@@ -1628,6 +1628,22 @@ class SmartTactic:
                 stuck_cleared += 1
         if stuck_cleared:
             decisions.append(f"worker_stuck_cleared count={stuck_cleared}")
+        # cargo 工人回程打转检测：return_cargo 不走 worker_goals，stuck 检测覆盖不到
+        for worker in turn.workers:
+            if worker.id in acted_units or not worker.cargo:
+                continue
+            if _distance(worker.position, return_position) <= 4:
+                continue
+            recent = self.memory.recent_positions.get(str(worker.id), [])
+            if (
+                len(recent) >= STUCK_TICKS
+                and len(set(recent)) <= SPIN_POSITION_BUDGET
+            ):
+                decisions.append(
+                    f"worker:{_short_id(worker.id)} cargo_stuck "
+                    f"pos={worker.position} core={return_position}"
+                )
+                self.memory.decision_totals["worker:cargo_stuck"] += 1
         harvested_cells: set[Position] = set()
         for position in sorted(turn.resource_cells):
             contenders = sorted(
@@ -3354,7 +3370,23 @@ class SmartTactic:
             decisions.append(f"core repair_shield reason=spare_resources shield={core.shield}")
             self.memory.decision_totals["core:repair"] += 1
         else:
-            if CORE_MIGRATION_ENABLED:
+            # cargo 工人被障碍挡回不来（长时间打转且离 core 远）→ 允许 core 自愈迁移靠拢
+            cargo_blocked = False
+            for worker in turn.workers:
+                if not worker.cargo:
+                    continue
+                recent = self.memory.recent_positions.get(str(worker.id), [])
+                if (
+                    len(recent) >= STUCK_TICKS
+                    and len(set(recent)) <= SPIN_POSITION_BUDGET
+                    and _distance(core.position, worker.position) > 6
+                ):
+                    cargo_blocked = True
+                    break
+            if CORE_MIGRATION_ENABLED or cargo_blocked:
+                if cargo_blocked:
+                    decisions.append("core migrate reason=cargo_blocked_self_heal")
+                    self.memory.decision_totals["core:migrate_cargo_blocked"] += 1
                 self._choose_core_migration(
                     turn,
                     planner,
@@ -3373,7 +3405,9 @@ class SmartTactic:
         if core is None or core.view.state is not CoreState.NORMAL:
             return
         cargo_workers = [worker for worker in turn.workers if worker.cargo]
-        if incoming_deposit > 0 or any(
+        if incoming_deposit > 0:
+            return
+        if cargo_workers and all(
             _distance(core.position, worker.position) <= 5
             for worker in cargo_workers
         ):
@@ -3388,7 +3422,14 @@ class SmartTactic:
         owns_beacon = _owns_beacon(turn)
 
         if cargo_workers:
-            targets = [worker.position for worker in cargo_workers]
+            # 只向被挡在远处的 cargo 工人靠拢（近的能自己交付）
+            targets = [
+                worker.position
+                for worker in cargo_workers
+                if _distance(core.position, worker.position) > 5
+            ]
+            if not targets:
+                targets = [worker.position for worker in cargo_workers]
             reason = "rendezvous_cargo"
         else:
             targets = [

@@ -2285,5 +2285,52 @@ class StuckHealPredictionTests(unittest.TestCase):
         self.assertNotEqual(id(first), id(second))
 
 
+    def test_cargo_worker_stuck_triggers_core_migration(self) -> None:
+        # cargo 工人被墙挡回不来（打转 16 tick 且离 core 远 >6 格）→ core 自愈迁移靠拢
+        memory = TacticMemory()
+        memory.recent_positions[str(WORKER_LOW)] = [
+            (10, 0), (10, 1), (10, 0), (10, 1), (10, 0), (10, 1),
+            (10, 0), (10, 1), (10, 0), (10, 1), (10, 0), (10, 1),
+            (10, 0), (10, 1), (10, 0), (10, 1),
+        ]
+        turn, _ = make_turn(
+            own_core=core((0, 0)),
+            units=(worker(WORKER_LOW, (10, 0), cargo=2),),
+            resources=0,
+            obstacle_cells=((1, 0), (2, 0), (3, 0), (4, 0), (5, 0)),  # 挡住回 core 的路
+        )
+
+        summary = SmartTactic(memory).choose_actions(turn)
+
+        self.assertTrue(
+            any("cargo_stuck" in item for item in summary.decisions)
+        )
+        self.assertTrue(
+            any("cargo_blocked_self_heal" in item for item in summary.decisions)
+        )
+        self.assertIsInstance(turn.plan.core_action, StartMoveAction)
+
+    def test_cargo_worker_near_core_no_migration(self) -> None:
+        # cargo 工人在 core 附近（≤5 格）→ 不触发迁移
+        memory = TacticMemory()
+        memory.recent_positions[str(WORKER_LOW)] = [
+            (3, 0), (3, 1), (3, 0), (3, 1), (3, 0), (3, 1),
+            (3, 0), (3, 1), (3, 0), (3, 1), (3, 0), (3, 1),
+            (3, 0), (3, 1), (3, 0), (3, 1),
+        ]
+        turn, _ = make_turn(
+            own_core=core((0, 0)),
+            units=(worker(WORKER_LOW, (3, 0), cargo=2),),
+            resources=0,
+        )
+
+        summary = SmartTactic(memory).choose_actions(turn)
+
+        self.assertFalse(
+            any("cargo_blocked_self_heal" in item for item in summary.decisions)
+        )
+        self.assertIsNone(turn.plan.core_action)
+
+
 if __name__ == "__main__":
     unittest.main()
