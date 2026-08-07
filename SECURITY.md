@@ -1,26 +1,26 @@
-# Security Policy
+# 安全策略
 
-## Credentials
+## 凭据保护
 
-Never commit or publish any of the following:
+禁止提交或发布以下内容：
 
 - `.env`
 - `.arena_hero_api_key.dpapi`
-- API keys in shell history, screenshots, issue bodies, or CI logs
-- Runtime telemetry or state snapshots that you do not intend to disclose
+- Shell 历史、截图、Issue 正文或 CI 日志中的 API Key
+- 不准备公开的运行遥测或状态快照
 
-On Windows, `set_key.ps1` stores the Arena Hero API Key with DPAPI for the current user. The encrypted file is machine/user-bound and is ignored by Git. On other platforms, inject `ARENA_HERO_API_KEY` through the platform's secret store or a local ignored `.env` file.
+在 Windows 上，`set_key.ps1` 使用当前用户的 DPAPI 保存 Arena Hero API Key。加密文件与当前计算机和用户绑定，并已被 Git 忽略。在其他平台上，应通过平台密钥存储或本地且已忽略的 `.env` 文件注入 `ARENA_HERO_API_KEY`。
 
-The Agent, event logger, and overlay server intentionally omit values whose keys contain `api`, `authorization`, `credential`, `secret`, or `token`.
+Agent、事件记录器和叠加层服务会主动省略键名中包含 `api`、`authorization`、`credential`、`secret` 或 `token` 的值。
 
-## Local overlay boundary
+## 本地叠加层边界
 
-The overlay server binds only to `127.0.0.1`. Write endpoints accept extension origins and reject normal web origins. Do not modify it to listen on a public interface without adding authentication and a threat model.
+叠加层服务仅绑定 `127.0.0.1`。写入接口接受扩展程序来源，并拒绝普通网页来源。未增加身份验证和威胁模型前，不要将其修改为监听公共网络接口。
 
-## Reporting a vulnerability
+## 报告安全漏洞
 
-Use GitHub private vulnerability reporting for the repository when available. Do not open a public issue containing a credential, exploit payload, or private Arena Hero state. Revoke an exposed API Key before sending any report.
+仓库支持时，请使用 GitHub 私密漏洞报告功能。不要创建包含凭据、漏洞利用载荷或 Arena Hero 私有状态的公开 Issue。发送报告前，应先撤销已经暴露的 API Key。
 
-## Before publishing a fork
+## 发布派生仓库前
 
-Run the release checks in [docs/RELEASING.md](docs/RELEASING.md), inspect `git status --ignored`, and search the complete Git history if the fork ever tracked local credential files.
+运行 [发布清单](docs/RELEASING.md)中的检查并查看 `git status --ignored`。如果派生仓库曾经跟踪过本地凭据文件，还必须检查完整 Git 历史。

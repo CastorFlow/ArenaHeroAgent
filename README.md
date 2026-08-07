@@ -1,4 +1,4 @@
-# Arena Hero Adaptive Tactic
+# Arena Hero 自适应战术 Agent
 
 一个面向 Arena Hero 的长期运行战术 Agent。项目使用官方 Python SDK，包含自适应经济、动态产兵、编队推进、Core 斩首、信标控制、运行状态持久化，以及可选的 Chrome 路线与统计叠加层。
 

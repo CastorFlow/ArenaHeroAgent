@@ -1,18 +1,18 @@
-# Contributing
+# 贡献指南
 
-## Compatibility
+## 兼容性
 
-Tactical changes must remain compatible with Arena Hero gameplay rules v0.14 and the official Python SDK `>=0.2.9,<0.3`. Do not duplicate SDK transport, retry, state-model, or dynamic pricing logic.
+战术改动必须兼容 Arena Hero gameplay rules v0.14 和官方 Python SDK `>=0.2.9,<0.3`。不要重复实现 SDK 已提供的传输、重试、状态模型或动态定价逻辑。
 
-Every Turn is an authoritative replacement. Remembered resources and enemies must retain explicit expiry and current-visibility invalidation rules.
+每个 Turn 都是对上一状态的权威完整替换。记忆中的资源和敌人必须具有明确的过期机制，并在当前视野确认信息失效时立即清除。
 
-## Development setup
+## 开发环境
 
 ```powershell
 .\setup.ps1
 ```
 
-Run the checks before opening a pull request:
+提交 Pull Request 前请运行以下检查：
 
 ```powershell
 .\.venv\Scripts\python.exe -m compileall -q arena_hero_tactic.py arena_hero_strategy.py arena_hero_event_log.py arena_hero_route_overlay_server.py
@@ -21,11 +21,11 @@ node arena_hero_route_overlay\test_overlay_core.js
 .\.venv\Scripts\python.exe -m pip check
 ```
 
-## Change expectations
+## 改动要求
 
-- Add focused tests for new economy, combat, movement, production, control, or persistence behavior.
-- Keep API keys and runtime files out of fixtures and logs.
-- Preserve the foreground and background launch paths.
-- Update `docs/STRATEGY.md` when a constant or decision priority changes materially.
-- Update `docs/USAGE.md` when a CLI argument, environment variable, control field, or overlay workflow changes.
-- Treat a failed or missed Tick honestly; do not hide submission errors in logging.
+- 新增或修改经济、战斗、移动、产兵、控制或持久化行为时，添加有针对性的测试。
+- 测试夹具和日志中不得包含 API Key 或本地运行文件。
+- 保持前台和后台两种启动方式可用。
+- 战术常量或决策优先级发生实质变化时，同步更新 `docs/STRATEGY.md`。
+- CLI 参数、环境变量、控制字段或叠加层操作流程变化时，同步更新 `docs/USAGE.md`。
+- 如实记录提交失败或错过的 Tick，不得在日志中隐藏提交错误。
