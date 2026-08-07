@@ -6560,6 +6560,27 @@ class StuckHealPredictionTests(unittest.TestCase):
                 "beacon_expedition_regroup",
             )
 
+    def test_beacon_expedition_advance_anchor_routes_around_obstacle(self) -> None:
+        turn, _ = make_turn(
+            own_core=core((0, 0)),
+            obstacle_cells=((1, 0),),
+        )
+        memory = TacticMemory()
+        decisions: list[str] = []
+        planner = MovementPlanner(turn, memory, decisions)
+        tactic = SmartTactic(memory)
+
+        anchor = tactic._expedition_advance_anchor(
+            (0, 0),
+            (5, 0),
+            planner,
+        )
+
+        self.assertNotEqual(anchor, (0, 0))
+        self.assertNotIn(anchor, planner.obstacles)
+        self.assertGreater(anchor[0], 0)
+        self.assertLess(_distance(anchor, (5, 0)), 5)
+
     def test_compact_beacon_formation_makes_real_forward_progress(self) -> None:
         expedition_vanguards = (
             (VANGUARD_FOURTH_ID, (40, 1)),

@@ -6165,14 +6165,21 @@ class SmartTactic:
     ) -> Position:
         # A one-cell anchor shift is swallowed by the Ranger formation's
         # two-cell radius: every unit can remain in its old slot forever.
-        # Push beyond that radius; individual Units still path one legal cell
-        # at a time toward the resulting formation slots.
+        # Follow a real route for the shared stride. A greedy one-cell step
+        # bounces backward/forward when the direct cell is blocked because a
+        # valid detour initially increases Manhattan distance.
+        path = _find_path(
+            origin,
+            target,
+            blocked=set(planner.obstacles) | set(planner.enemy_cells),
+            threat=planner.threat,
+            visited=Counter(),
+        )
+        if not path:
+            return self._expedition_anchor_step(origin, target, planner)
         anchor = origin
-        for _ in range(BEACON_EXPEDITION_ADVANCE_STRIDE):
-            next_anchor = self._expedition_anchor_step(anchor, target, planner)
-            if next_anchor == anchor:
-                break
-            anchor = next_anchor
+        for direction in path[:BEACON_EXPEDITION_ADVANCE_STRIDE]:
+            anchor = _destination(anchor, direction)
         return anchor
 
     def _beacon_core_focus_anchor(
