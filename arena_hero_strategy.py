@@ -184,9 +184,10 @@ AGGRESS_RANGER_ALERT_OFFSETS = (
 BEACON_GUARD_VANGUARDS = 2
 BEACON_GUARD_RANGERS = 3
 # After the 5V+8R combat baseline is ready, grow a local economy before buying
-# the expensive 9th-12th Rangers and 6th-8th Vanguards. Two spare resources
+# the expensive 9th-12th Rangers and 6th-8th Vanguards. Ten Workers improve
+# refill discovery after nearby chunks are depleted, while two spare resources
 # preserve immediate healing or shield-repair capacity in a quiet state.
-BEACON_ECONOMY_TARGET_WORKERS = 9
+BEACON_ECONOMY_TARGET_WORKERS = 10
 BEACON_ECONOMY_RESERVE = 2
 # Once the Beacon home screen has five Vanguards, preserve the next affordable
 # resource window for the cheaper pre-population-20 Ranger instead of filling
@@ -200,6 +201,10 @@ BEACON_CARRIER_SUPPORT_RADIUS = 5
 BEACON_CARRIER_CORE_AVOID_RADIUS = 8
 BEACON_GUARD_PATROL_TICKS = 4
 BEACON_EXPEDITION_COHESION_RADIUS = 6
+# Main-force advance resumes only after the formation is comfortably inside
+# the outer cohesion radius. This hysteresis prevents obstacle detours from
+# toggling spread 5 -> 6 -> 5 without any strategic progress.
+BEACON_EXPEDITION_ADVANCE_RELEASE_RADIUS = 4
 BEACON_EXPEDITION_CORE_GUARD_RADIUS = 8
 BEACON_EXPEDITION_WEAK_GUARD_MAX = 1
 BEACON_EXPEDITION_OPPORTUNISTIC_RADIUS = 10
@@ -6341,10 +6346,20 @@ class SmartTactic:
                 enemy_combat_units=enemy_strength,
             )
 
-        if spread > BEACON_EXPEDITION_COHESION_RADIUS:
+        if spread > BEACON_EXPEDITION_ADVANCE_RELEASE_RADIUS:
+            regroup_anchor = center
+            if not enemy_strength:
+                # In a quiet chokepoint, regroup around a forward anchor. A
+                # center-only anchor lets one detouring rear unit pull the
+                # whole formation backward after every advance step.
+                regroup_anchor = self._expedition_advance_anchor(
+                    center,
+                    strategic_target,
+                    planner,
+                )
             return BeaconExpeditionOrder(
                 strategic_target,
-                center,
+                regroup_anchor,
                 "regroup",
                 enemy_combat_units=enemy_strength,
             )

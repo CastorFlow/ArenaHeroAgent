@@ -6517,6 +6517,49 @@ class StuckHealPredictionTests(unittest.TestCase):
             any("beacon_expedition_order phase=regroup" in item for item in summary.decisions)
         )
 
+    def test_beacon_expedition_keeps_regrouping_inside_cohesion_boundary(self) -> None:
+        extra_vanguard = VANGUARD_FOURTH_ID
+        extra_ranger_one = RANGER_FOURTH_ID
+        extra_ranger_two = UUID(int=0x17)
+        units = (
+            vanguard((1, 0), VANGUARD_ID),
+            vanguard((-1, 0), VANGUARD_TWO_ID),
+            vanguard((0, 1), VANGUARD_THREE_ID),
+            vanguard((17, 0), extra_vanguard),
+            ranger((0, -2), RANGER_ID),
+            ranger((2, 0), RANGER_TWO_ID),
+            ranger((-2, 0), RANGER_THREE_ID),
+            ranger((7, 0), extra_ranger_one),
+            ranger((12, 0), extra_ranger_two),
+        )
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            self._write_control(control_path, mode="beacon")
+            turn, _ = make_turn(
+                own_core=core((0, 0)),
+                units=units,
+                enemies=(enemy_core((100, 0)),),
+                beacon=ChampionBeacon(position=(120, 0)),
+            )
+            memory = TacticMemory()
+            summary = SmartTactic(
+                memory,
+                control_path=control_path,
+            ).choose_actions(turn)
+
+        self.assertTrue(
+            any(
+                "beacon_expedition_order phase=regroup" in item
+                and "anchor=(15, 0)" in item
+                for item in summary.decisions
+            )
+        )
+        for unit_id in (extra_vanguard, extra_ranger_one, extra_ranger_two):
+            self.assertEqual(
+                memory.current_routes[str(unit_id)].reason,
+                "beacon_expedition_regroup",
+            )
+
     def test_compact_beacon_formation_makes_real_forward_progress(self) -> None:
         expedition_vanguards = (
             (VANGUARD_FOURTH_ID, (40, 1)),
@@ -6890,6 +6933,7 @@ class StuckHealPredictionTests(unittest.TestCase):
             self.assertEqual(turn.plan.core_action.unit_type, UnitType.RANGER)
 
     def test_beacon_mode_expands_economy_after_combat_baseline(self) -> None:
+        self.assertEqual(BEACON_ECONOMY_TARGET_WORKERS, 10)
         units = tuple(
             [
                 worker(UUID(int=0x7000 + index), (20 + index, 0))

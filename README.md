@@ -11,6 +11,8 @@
 
 本项目是社区战术实现，不是 Arena Hero 官方客户端。Agent 会真实控制账号中的单位；首次运行前请先阅读[完整用法](docs/USAGE.md)和[策略说明](docs/STRATEGY.md)。
 
+社区交流：[LINUX DO 项目讨论帖](https://linux.do/t/topic/2703804)
+
 ## 主要能力
 
 - 四种运行模式：发育、侵略、抢信标、迁移。
