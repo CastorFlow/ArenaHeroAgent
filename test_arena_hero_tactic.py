@@ -6474,6 +6474,64 @@ class StuckHealPredictionTests(unittest.TestCase):
             )
         )
 
+    def test_beacon_home_threat_does_not_recall_ready_expedition(self) -> None:
+        extra_vanguard = VANGUARD_FOURTH_ID
+        extra_ranger_one = RANGER_FOURTH_ID
+        extra_ranger_two = UUID(int=0x17)
+        units = (
+            vanguard((1, 0), VANGUARD_ID),
+            vanguard((-1, 0), VANGUARD_TWO_ID),
+            vanguard((0, 1), VANGUARD_THREE_ID),
+            vanguard((20, 0), extra_vanguard),
+            ranger((0, -2), RANGER_ID),
+            ranger((2, 0), RANGER_TWO_ID),
+            ranger((-2, 0), RANGER_THREE_ID),
+            ranger((20, 1), extra_ranger_one),
+            ranger((20, -1), extra_ranger_two),
+        )
+        memory = TacticMemory(
+            mode=MODE_BEACON,
+            enemy_sightings={
+                str(ENEMY_CORE_ID): EnemySighting((30, 0), 100, True)
+            },
+        )
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            self._write_control(control_path, mode="beacon")
+            turn, _ = make_turn(
+                tick=108,
+                own_core=core((0, 0)),
+                units=units,
+                enemies=(enemy_ranger((0, 3)),),
+                beacon=ChampionBeacon(position=(100, 0)),
+            )
+            summary = SmartTactic(
+                memory,
+                control_path=control_path,
+            ).choose_actions(turn)
+
+        expedition_ids = {
+            extra_vanguard,
+            extra_ranger_one,
+            extra_ranger_two,
+        }
+        self.assertTrue(
+            all(
+                memory.current_routes[str(unit_id)].reason
+                == "beacon_expedition_advance"
+                for unit_id in expedition_ids
+            )
+        )
+        self.assertTrue(
+            any(
+                "beacon_expedition_order phase=advance target=(30, 0)" in item
+                for item in summary.decisions
+            )
+        )
+        self.assertTrue(
+            any("core_patrol_alert count=1" in item for item in summary.decisions)
+        )
+
     def test_beacon_expedition_regroups_before_advancing(self) -> None:
         extra_vanguard = VANGUARD_FOURTH_ID
         extra_ranger_one = RANGER_FOURTH_ID

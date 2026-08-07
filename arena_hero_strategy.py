@@ -5766,9 +5766,14 @@ class SmartTactic:
         opening; once the complete home reserve exists it is never borrowed by
         the expedition.
         """
-        if self._home_recovery_active(turn):
+        home_vanguards, home_rangers = self._minimum_home_reserve_ids(turn)
+        reserve_complete = (
+            len(home_vanguards) >= RAID_HOME_RESERVE_VANGUARDS
+            and len(home_rangers) >= RAID_HOME_RESERVE_RANGERS
+        )
+        if self._home_recovery_active(turn) and not reserve_complete:
             return set(), set()
-        return self._minimum_home_reserve_ids(turn)
+        return home_vanguards, home_rangers
 
     def _beacon_core_assault_target(
         self,
@@ -5777,12 +5782,24 @@ class SmartTactic:
         home_rangers: set[UUID],
     ) -> Position | None:
         """Use only Beacon-expedition surplus to pursue a known enemy Core."""
+        emergency_threats = self._core_emergency_threats(turn)
+        home_defender_count = len(home_vanguards) + len(home_rangers)
+        home_screen_ready = (
+            len(home_vanguards) >= RAID_HOME_RESERVE_VANGUARDS
+            and len(home_rangers) >= RAID_HOME_RESERVE_RANGERS
+        )
+        home_screen_can_contain_threat = (
+            home_screen_ready
+            and len(emergency_threats) < home_defender_count
+        )
         if (
             self.memory.mode != MODE_BEACON
             or turn.core is None
-            or self._home_recovery_active(turn)
-            or self._core_emergency_threats(turn)
             or self._core_recently_damaged(turn)
+            or (
+                self._home_recovery_active(turn)
+                and not home_screen_can_contain_threat
+            )
         ):
             return None
         assault_vanguards = sum(
@@ -7303,8 +7320,13 @@ class SmartTactic:
                 )
                 self.memory.decision_totals["vanguard:sweep"] += 1
                 continue
-            if turn.core is not None:
-                # 家被摸：先救家再抢信标
+            if (
+                turn.core is not None
+                and len(home_vanguards) < RAID_HOME_RESERVE_VANGUARDS
+            ):
+                # Before the fixed home screen is complete, every available
+                # Vanguard helps. Once it is complete, surplus expedition
+                # Vanguards keep their strategic target.
                 threatening = [
                     enemy
                     for enemy in turn.visible_enemies
