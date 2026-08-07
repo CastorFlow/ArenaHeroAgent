@@ -1,19 +1,43 @@
+# Credentials and local configuration
 .arena_hero_api_key.dpapi
+.env
+
+# Python environments and caches
 .venv/
 .venv-linux/
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Arena Hero runtime state and logs
 arena_hero_telemetry.jsonl
+arena_hero_events_zh.jsonl
+arena_hero_*.log
 .arena_hero_memory.json
 .arena_hero_routes.json
 .arena_hero_recovery_targets.json
 .arena_hero_stats.json
 .arena_hero_control.json
-
-*.tmp
-
-*.test-backup
-
-.env
+.arena_hero_browser_intel.json
 agent.log
 agent_err.log
+
+# Local test and scratch data
+credential_test_scratch/
+*.tmp
+*.test-backup
+*.bak
+
+# Build, editor, and operating-system files
+build/
+dist/
+*.egg-info/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

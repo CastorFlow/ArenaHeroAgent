@@ -7,6 +7,7 @@
     develop: "发育",
     aggress: "侵略",
     beacon: "抢信标",
+    migrate: "迁移",
   };
   const core = globalThis.ArenaHeroOverlayCore;
   if (!core) {
@@ -19,13 +20,37 @@
     context: null,
     camera: null,
     payload: { version: 2, tick: 0, routes: [], units: [], resources: [] },
+    browserIntel: { version: 1, source: "browser", captured_at: null, resources: [] },
     stats: null,
-    control: { mode: "develop", recall: false, beacon_target_distance: 0 },
+    logs: core.normalizeLogs({}),
+    control: {
+      mode: "develop",
+      recall: false,
+      raid_enabled: false,
+      raid_recall: false,
+      raid_vanguards: 1,
+      raid_rangers: 2,
+      beacon_target_distance: 0,
+    },
     settings: core.normalizeSettings({}),
     serviceOnline: false,
     pointer: null,
     pointerOverControls: false,
+    selectedCell: null,
+    distanceCard: null,
+    distanceCardPosition: null,
+    distanceCardDetail: null,
+    clickMapCanvas: null,
+    mapClickHandler: null,
+    pageClickHandler: null,
+    tickTiming: {
+      lastTick: null,
+      lastAt: 0,
+      secondsPerTick: 5,
+    },
     lastCanvasSearch: 0,
+    lastBrowserIntelCapture: 0,
+    browserEmptyCaptures: 0,
     toolbar: null,
     routeToggle: null,
     settingsButton: null,
@@ -33,8 +58,12 @@
     settingsOpen: false,
     settingInputs: new Map(),
     statusBar: null,
+    statusMetrics: null,
+    statusActions: null,
     modeButton: null,
     recallButton: null,
+    raidButton: null,
+    raidRecallButton: null,
     statsButton: null,
     statsPanel: null,
     statsOpen: false,
@@ -42,7 +71,17 @@
     locatorPanel: null,
     locatorOpen: false,
     locatorTimer: null,
+    logsButton: null,
+    logsPanel: null,
+    logsOpen: false,
+    logsList: null,
+    logsCategory: null,
+    logsLevel: null,
+    logsSearch: null,
+    lastLogEventId: null,
+    unreadLogs: 0,
     followUnit: null,
+    followPositionKey: null,
     statusElements: new Map(),
     statsCounterContainers: new Map(),
   };
@@ -110,12 +149,13 @@
       width: "0",
       height: "0",
       pointerEvents: "none",
-      zIndex: "80",
+      zIndex: "4",
       display: "none",
     });
     document.documentElement.appendChild(canvas);
     state.overlay = canvas;
     state.context = canvas.getContext("2d");
+    bindPageClick();
   }
 
   function controlContainer(tagName) {
@@ -206,7 +246,13 @@
     state.settingInputs.set(key, { input, kind: "color" });
   }
 
-  function addControlNumber(panel, key, labelText, hintText) {
+  function addControlNumber(
+    panel,
+    key,
+    labelText,
+    hintText,
+    { maximum = 300, step = 5 } = {},
+  ) {
     const row = document.createElement("div");
     Object.assign(row.style, {
       display: "flex",
@@ -220,8 +266,8 @@
     const input = document.createElement("input");
     input.type = "number";
     input.min = "0";
-    input.max = "300";
-    input.step = "5";
+    input.max = String(maximum);
+    input.step = String(step);
     Object.assign(input.style, {
       width: "64px",
       padding: "2px 6px",
@@ -232,7 +278,10 @@
       font: "12px system-ui, -apple-system, Segoe UI, sans-serif",
     });
     input.addEventListener("change", () => {
-      const value = Math.max(0, Number.parseInt(input.value, 10) || 0);
+      const value = Math.min(
+        maximum,
+        Math.max(0, Number.parseInt(input.value, 10) || 0),
+      );
       updateControl({ [key]: value });
       input.value = String(value);
     });
@@ -254,14 +303,15 @@
       overflowY: "auto",
       padding: "10px 12px 12px",
       border: "1px solid rgba(255,255,255,0.2)",
-      borderRadius: "9px",
+      borderRadius: "8px",
       background: "rgba(8,11,18,0.96)",
       color: "#d9e1eb",
       font: "12px system-ui, -apple-system, Segoe UI, sans-serif",
       boxShadow: "0 8px 28px rgba(0,0,0,0.42)",
-      zIndex: "90",
+      zIndex: "2147483001",
       pointerEvents: "auto",
       userSelect: "none",
+      boxSizing: "border-box",
     });
     const header = document.createElement("div");
     Object.assign(header.style, {
@@ -322,15 +372,58 @@
     state.locatorEventList = eventList;
   }
 
+  function centerMapOn(position) {
+    const mapCanvas = findMapCanvas(performance.now());
+    if (!mapCanvas || !core.centerCameraOn(mapCanvas, position)) {
+      return false;
+    }
+    if (state.camera) {
+      state.camera = {
+        ...state.camera,
+        x: Number(position[0]),
+        y: Number(position[1]),
+      };
+    }
+    return true;
+  }
+
   function focusTarget(position, label) {
     state.followUnit = null;
+    state.followPositionKey = null;
     state.focusMarker = { position, label, until: performance.now() + 8000 };
+    centerMapOn(position);
   }
 
   function followUnit(unitId) {
     state.focusMarker = null;
     state.followUnit = state.followUnit === unitId ? null : unitId;
+    state.followPositionKey = null;
+    if (state.followUnit) {
+      const units = Array.isArray(state.stats?.units) ? state.stats.units : [];
+      const unit = units.find((entry) => entry.id === state.followUnit);
+      if (unit && Array.isArray(unit.position)) {
+        centerMapOn(unit.position);
+        state.followPositionKey = `${unit.position[0]},${unit.position[1]}`;
+      }
+    }
     renderLocator();
+  }
+
+  function centerFollowedUnit() {
+    if (!state.followUnit) {
+      return;
+    }
+    const units = Array.isArray(state.stats?.units) ? state.stats.units : [];
+    const unit = units.find((entry) => entry.id === state.followUnit);
+    if (!unit || !Array.isArray(unit.position)) {
+      state.followUnit = null;
+      state.followPositionKey = null;
+      return;
+    }
+    const positionKey = `${unit.position[0]},${unit.position[1]}`;
+    if (positionKey !== state.followPositionKey && centerMapOn(unit.position)) {
+      state.followPositionKey = positionKey;
+    }
   }
 
   function renderLocator() {
@@ -430,12 +523,12 @@
     }
     const toolbar = controlContainer("div");
     Object.assign(toolbar.style, {
-      position: "fixed",
+      position: "static",
       display: "none",
       alignItems: "center",
-      gap: "6px",
-      zIndex: "90",
+      gap: "4px",
       pointerEvents: "auto",
+      flexWrap: "wrap",
     });
 
     const routeToggle = document.createElement("button");
@@ -450,7 +543,13 @@
     settingsButton.title = "调整路线和高亮样式";
     applyButtonStyle(settingsButton);
     settingsButton.addEventListener("click", () => {
-      state.settingsOpen = !state.settingsOpen;
+      const opening = !state.settingsOpen;
+      state.settingsOpen = opening;
+      if (opening) {
+        state.statsOpen = false;
+        state.locatorOpen = false;
+        state.logsOpen = false;
+      }
       syncControls();
     });
     toolbar.append(routeToggle, settingsButton);
@@ -459,17 +558,20 @@
     Object.assign(panel.style, {
       position: "fixed",
       display: "none",
-      width: "252px",
+      width: "min(300px, calc(100vw - 16px))",
+      maxHeight: "72vh",
+      overflowY: "auto",
       padding: "11px 12px 12px",
       border: "1px solid rgba(255,255,255,0.2)",
-      borderRadius: "9px",
+      borderRadius: "8px",
       background: "rgba(8,11,18,0.94)",
       color: "#d9e1eb",
       font: "12px system-ui, -apple-system, Segoe UI, sans-serif",
       boxShadow: "0 8px 28px rgba(0,0,0,0.42)",
-      zIndex: "90",
+      zIndex: "2147483001",
       pointerEvents: "auto",
       userSelect: "none",
+      boxSizing: "border-box",
     });
     const title = document.createElement("div");
     title.textContent = "Arena Hero 叠加层";
@@ -479,7 +581,7 @@
       marginBottom: "4px",
     });
     const shortcut = document.createElement("div");
-    shortcut.textContent = "快捷键：Alt+Shift+R 路线 · Alt+Shift+1 发育 · Alt+Shift+2 侵略 · Alt+Shift+C 召回";
+    shortcut.textContent = "快捷键：Alt+Shift+R 路线 · Alt+Shift+L 日志 · Alt+Shift+1 发育 · Alt+Shift+2 侵略 · Alt+Shift+C 召回";
     Object.assign(shortcut.style, {
       color: "#8f9cad",
       fontSize: "11px",
@@ -500,6 +602,20 @@
       "beacon_target_distance",
       "core↔信标目标距离",
       "core 与信标的目标距离（格）：0=关闭；距离大于设定时 core 向信标推进，小于则远离",
+    );
+    addControlNumber(
+      panel,
+      "raid_vanguards",
+      "偷袭先锋人数",
+      "独立偷袭编组的先锋数量；0 表示不抽调先锋",
+      { maximum: 19, step: 1 },
+    );
+    addControlNumber(
+      panel,
+      "raid_rangers",
+      "偷袭游侠人数",
+      "独立偷袭编组的游侠数量；0 表示不抽调游侠",
+      { maximum: 19, step: 1 },
     );
 
     const reset = document.createElement("button");
@@ -524,7 +640,9 @@
     state.settingsButton = settingsButton;
     state.settingsPanel = panel;
     createStatusBar();
+    createDistanceCard();
     createStatsPanel();
+    createLogsPanel();
     syncControls();
   }
 
@@ -536,20 +654,56 @@
     Object.assign(bar.style, {
       position: "fixed",
       display: "none",
-      alignItems: "center",
-      gap: "8px",
-      padding: "4px 10px",
+      flexDirection: "column",
+      alignItems: "stretch",
+      gap: "5px",
+      padding: "6px 8px",
       border: "1px solid rgba(255,255,255,0.2)",
       borderRadius: "7px",
       background: "rgba(8,11,18,0.92)",
       color: "#d9e1eb",
       font: "600 12px system-ui, -apple-system, Segoe UI, sans-serif",
       boxShadow: "0 2px 10px rgba(0,0,0,0.28)",
-      zIndex: "90",
+      zIndex: "2147483000",
       pointerEvents: "auto",
       userSelect: "none",
+      boxSizing: "border-box",
+      minWidth: "0",
+    });
+
+    const metrics = document.createElement("div");
+    Object.assign(metrics.style, {
+      display: "flex",
+      alignItems: "center",
       flexWrap: "wrap",
-      maxWidth: "calc(100vw - 16px)",
+      minHeight: "20px",
+      rowGap: "2px",
+      overflow: "hidden",
+    });
+
+    const actions = document.createElement("div");
+    Object.assign(actions.style, {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      flexWrap: "wrap",
+      gap: "4px 10px",
+    });
+
+    const primaryActions = document.createElement("div");
+    Object.assign(primaryActions.style, {
+      display: "flex",
+      alignItems: "center",
+      flexWrap: "wrap",
+      gap: "4px",
+    });
+
+    const utilityActions = document.createElement("div");
+    Object.assign(utilityActions.style, {
+      display: "flex",
+      alignItems: "center",
+      flexWrap: "wrap",
+      gap: "4px",
     });
 
     const modeButton = document.createElement("button");
@@ -571,11 +725,33 @@
       updateControl({ recall: !state.control.recall });
     });
 
+    const raidButton = document.createElement("button");
+    raidButton.type = "button";
+    applyButtonStyle(raidButton);
+    raidButton.title = "独立偷袭编组：无限扩圈寻找无人值守的敌方 Core";
+    raidButton.addEventListener("click", () => {
+      updateControl({ raid_enabled: !state.control.raid_enabled });
+    });
+
+    const raidRecallButton = document.createElement("button");
+    raidRecallButton.type = "button";
+    applyButtonStyle(raidRecallButton);
+    raidRecallButton.title = "只召回偷袭编组；侵略模式和其他单位不受影响";
+    raidRecallButton.addEventListener("click", () => {
+      updateControl({ raid_recall: !state.control.raid_recall });
+    });
+
     const makeStatus = (key, title) => {
       const span = document.createElement("span");
       span.title = title;
-      span.style.color = "#aeb9c6";
-      bar.appendChild(span);
+      Object.assign(span.style, {
+        color: "#aeb9c6",
+        padding: "0 8px",
+        lineHeight: "18px",
+        whiteSpace: "nowrap",
+        borderRight: "1px solid rgba(255,255,255,0.12)",
+      });
+      metrics.appendChild(span);
       state.statusElements.set(`bar:${key}`, span);
       return span;
     };
@@ -594,6 +770,11 @@
     applyButtonStyle(statsButton);
     statsButton.addEventListener("click", () => {
       state.statsOpen = !state.statsOpen;
+      if (state.statsOpen) {
+        state.settingsOpen = false;
+        state.locatorOpen = false;
+        state.logsOpen = false;
+      }
       syncControls();
     });
 
@@ -605,23 +786,99 @@
     locatorButton.addEventListener("click", () => {
       state.locatorOpen = !state.locatorOpen;
       if (state.locatorOpen) {
+        state.settingsOpen = false;
         state.statsOpen = false;
+        state.logsOpen = false;
       }
       syncControls();
       renderLocator();
     });
 
-    bar.append(modeButton, recallButton);
-    bar.appendChild(statsButton);
-    bar.appendChild(locatorButton);
+    const logsButton = document.createElement("button");
+    logsButton.type = "button";
+    logsButton.textContent = "日志";
+    logsButton.title = "显示/隐藏中文事件日志（Alt+Shift+L）";
+    applyButtonStyle(logsButton);
+    logsButton.addEventListener("click", () => {
+      state.logsOpen = !state.logsOpen;
+      if (state.logsOpen) {
+        state.settingsOpen = false;
+        state.statsOpen = false;
+        state.locatorOpen = false;
+        state.unreadLogs = 0;
+        renderLogs();
+      }
+      syncControls();
+    });
+
+    primaryActions.append(modeButton, recallButton, raidButton, raidRecallButton);
+    if (state.toolbar) {
+      utilityActions.appendChild(state.toolbar);
+    }
+    utilityActions.append(statsButton, locatorButton, logsButton);
+    actions.append(primaryActions, utilityActions);
+    bar.append(metrics, actions);
+
+    for (const button of bar.querySelectorAll("button")) {
+      Object.assign(button.style, {
+        height: "28px",
+        lineHeight: "26px",
+        padding: "0 8px",
+        whiteSpace: "nowrap",
+        boxShadow: "none",
+      });
+    }
 
     document.documentElement.appendChild(bar);
     state.statusBar = bar;
+    state.statusMetrics = metrics;
+    state.statusActions = actions;
     state.modeButton = modeButton;
     state.recallButton = recallButton;
+    state.raidButton = raidButton;
+    state.raidRecallButton = raidRecallButton;
     state.statsButton = statsButton;
     state.locatorButton = locatorButton;
+    state.logsButton = logsButton;
     syncControls();
+  }
+
+  function createDistanceCard() {
+    if (state.distanceCard || !document.documentElement) {
+      return;
+    }
+    const card = document.createElement("div");
+    card.setAttribute(OVERLAY_ATTRIBUTE, "distance");
+    Object.assign(card.style, {
+      position: "fixed",
+      display: "none",
+      padding: "7px 10px",
+      border: "1px solid rgba(240,185,60,0.78)",
+      borderRadius: "7px",
+      background: "rgba(7,10,16,0.94)",
+      color: "#eef2f7",
+      font: "600 12px system-ui, -apple-system, Segoe UI, sans-serif",
+      lineHeight: "19px",
+      boxShadow: "0 3px 14px rgba(0,0,0,0.38)",
+      zIndex: "2147483002",
+      pointerEvents: "none",
+      userSelect: "none",
+      boxSizing: "border-box",
+      visibility: "visible",
+      opacity: "1",
+      transform: "translateZ(0)",
+      contain: "layout paint",
+    });
+    card.style.setProperty("z-index", "2147483647", "important");
+    const position = document.createElement("div");
+    position.style.color = "#f0b93c";
+    const detail = document.createElement("div");
+    detail.style.color = "#eef2f7";
+    card.append(position, detail);
+    document.documentElement.appendChild(card);
+    state.distanceCard = card;
+    state.distanceCardPosition = position;
+    state.distanceCardDetail = detail;
   }
 
   function createStatsPanel() {
@@ -637,14 +894,15 @@
       overflowY: "auto",
       padding: "10px 12px 12px",
       border: "1px solid rgba(255,255,255,0.2)",
-      borderRadius: "9px",
+      borderRadius: "8px",
       background: "rgba(8,11,18,0.96)",
       color: "#d9e1eb",
       font: "12px system-ui, -apple-system, Segoe UI, sans-serif",
       boxShadow: "0 8px 28px rgba(0,0,0,0.42)",
-      zIndex: "90",
+      zIndex: "2147483001",
       pointerEvents: "auto",
       userSelect: "none",
+      boxSizing: "border-box",
     });
 
     const header = document.createElement("div");
@@ -681,15 +939,29 @@
           ["tick", "Tick"],
           ["mode", "模式"],
           ["recall", "召回状态"],
+          ["raid_enabled", "偷袭模式"],
+          ["raid_recall", "偷袭召回"],
+          ["raid_selected", "偷袭编组 (先/游)"],
+          ["raid_target", "偷袭目标 Core"],
+          ["raid_sweep_radius", "偷袭扫荡半径"],
+          ["migration_candidate", "迁移候选点"],
+          ["migration_target", "迁移目标"],
+          ["migration_site_checked", "候选点已检查"],
+          ["migration_site_score", "障碍半侧评分"],
           ["resources", "资源 / 容量"],
           ["population", "人口 (工/先/游)"],
           ["core", "核心 HP / 盾"],
           ["core_position", "核心坐标"],
           ["beacon_position", "信标坐标"],
           ["visible_enemies", "可见敌人"],
+          ["core_threat_count", "Core 周边敌军"],
+          ["core_reinforcement_active", "主力回援"],
           ["owns_beacon", "持有信标"],
           ["visible_resource_cells", "当前可见矿点"],
           ["known_resource_cells", "记忆矿点"],
+          ["browser_resource_hints", "浏览器矿点参考"],
+          ["browser_intel_online", "浏览器数据状态"],
+          ["browser_intel_age_seconds", "浏览器数据延迟"],
           ["worker_cargo", "工人携带资源"],
           ["exploring_workers", "向外探索工人"],
           ["max_worker_search_radius", "最远探索半径"],
@@ -772,6 +1044,287 @@
     syncControls();
   }
 
+  function createLogsPanel() {
+    if (state.logsPanel || !document.documentElement) {
+      return;
+    }
+    const panel = controlContainer("div");
+    Object.assign(panel.style, {
+      position: "fixed",
+      display: "none",
+      flexDirection: "column",
+      width: "min(520px, calc(100vw - 16px))",
+      maxHeight: "72vh",
+      padding: "10px 12px 12px",
+      border: "1px solid rgba(255,255,255,0.2)",
+      borderRadius: "8px",
+      background: "rgba(8,11,18,0.96)",
+      color: "#d9e1eb",
+      font: "12px system-ui, -apple-system, Segoe UI, sans-serif",
+      boxShadow: "0 8px 28px rgba(0,0,0,0.42)",
+      zIndex: "2147483001",
+      pointerEvents: "auto",
+      userSelect: "text",
+      overflow: "hidden",
+      boxSizing: "border-box",
+    });
+
+    const header = document.createElement("div");
+    Object.assign(header.style, {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      marginBottom: "8px",
+      flex: "0 0 auto",
+    });
+    const title = document.createElement("span");
+    title.textContent = "中文事件日志";
+    Object.assign(title.style, { fontWeight: "700", fontSize: "13px" });
+    const close = document.createElement("button");
+    close.type = "button";
+    close.textContent = "✕";
+    close.title = "关闭日志面板";
+    applyButtonStyle(close);
+    Object.assign(close.style, {
+      height: "24px",
+      lineHeight: "22px",
+      padding: "0 8px",
+    });
+    close.addEventListener("click", () => {
+      state.logsOpen = false;
+      syncControls();
+    });
+    header.append(title, close);
+
+    const filters = document.createElement("div");
+    Object.assign(filters.style, {
+      display: "grid",
+      gridTemplateColumns: "105px 118px minmax(120px, 1fr)",
+      gap: "6px",
+      marginBottom: "8px",
+      flex: "0 0 auto",
+    });
+    const styleFilter = (element) => {
+      Object.assign(element.style, {
+        minWidth: "0",
+        height: "28px",
+        padding: "2px 7px",
+        border: "1px solid rgba(255,255,255,0.2)",
+        borderRadius: "5px",
+        background: "#121824",
+        color: "#d9e1eb",
+        font: "12px system-ui, -apple-system, Segoe UI, sans-serif",
+      });
+    };
+    const category = document.createElement("select");
+    for (const [value, label] of [
+      ["", "全部分类"],
+      ["战斗", "战斗"],
+      ["资源", "资源"],
+      ["生产", "生产"],
+      ["信标", "信标"],
+      ["Core", "Core"],
+      ["移动", "移动"],
+      ["单位", "单位"],
+      ["系统", "系统"],
+    ]) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      category.appendChild(option);
+    }
+    styleFilter(category);
+    const level = document.createElement("select");
+    for (const [value, label] of [
+      ["important", "重要事件"],
+      ["all", "全部级别"],
+      ["warning", "警告及以上"],
+      ["danger", "仅严重"],
+    ]) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      level.appendChild(option);
+    }
+    styleFilter(level);
+    const search = document.createElement("input");
+    search.type = "search";
+    search.placeholder = "搜索事件";
+    search.setAttribute("aria-label", "搜索事件日志");
+    styleFilter(search);
+    for (const input of [category, level, search]) {
+      input.addEventListener("input", renderLogs);
+      input.addEventListener("change", renderLogs);
+    }
+    filters.append(category, level, search);
+
+    const list = document.createElement("div");
+    Object.assign(list.style, {
+      overflowY: "auto",
+      minHeight: "120px",
+      maxHeight: "calc(72vh - 92px)",
+      overscrollBehavior: "contain",
+    });
+    panel.append(header, filters, list);
+    document.documentElement.appendChild(panel);
+    state.logsPanel = panel;
+    state.logsList = list;
+    state.logsCategory = category;
+    state.logsLevel = level;
+    state.logsSearch = search;
+    renderLogs();
+    syncControls();
+  }
+
+  function logTime(value) {
+    if (typeof value !== "string") {
+      return "";
+    }
+    const date = new Date(value);
+    return Number.isNaN(date.getTime())
+      ? ""
+      : date.toLocaleTimeString("zh-CN", { hour12: false });
+  }
+
+  function renderLogs() {
+    if (!state.logsList) {
+      return;
+    }
+    const category = state.logsCategory?.value || "";
+    const level = state.logsLevel?.value || "important";
+    const query = (state.logsSearch?.value || "").trim().toLocaleLowerCase();
+    const importantLevels = new Set(["info", "success", "warning", "danger"]);
+    const warningLevels = new Set(["warning", "danger"]);
+    const entries = Array.isArray(state.logs.entries)
+      ? [...state.logs.entries].reverse().filter((entry) => {
+          if (category && entry.category !== category) {
+            return false;
+          }
+          if (level === "important" && !importantLevels.has(entry.level)) {
+            return false;
+          }
+          if (level === "warning" && !warningLevels.has(entry.level)) {
+            return false;
+          }
+          if (level === "danger" && entry.level !== "danger") {
+            return false;
+          }
+          if (!query) {
+            return true;
+          }
+          return [
+            entry.title,
+            entry.message,
+            entry.category,
+            entry.event_type,
+            entry.reason_code,
+            entry.actor,
+            entry.target,
+          ]
+            .filter(Boolean)
+            .join(" ")
+            .toLocaleLowerCase()
+            .includes(query);
+        })
+      : [];
+    state.logsList.replaceChildren();
+    if (!entries.length) {
+      const empty = document.createElement("div");
+      empty.textContent = "暂无符合条件的事件";
+      Object.assign(empty.style, { color: "#7f8996", padding: "12px 2px" });
+      state.logsList.appendChild(empty);
+      return;
+    }
+    const levelColors = {
+      debug: "#7f8996",
+      info: "#b9c4d2",
+      success: "#8fc8a8",
+      warning: "#e0b36b",
+      danger: "#ee8c80",
+    };
+    for (const entry of entries) {
+      const row = document.createElement("div");
+      Object.assign(row.style, {
+        padding: "7px 4px 8px",
+        borderBottom: "1px solid rgba(255,255,255,0.07)",
+        cursor: entry.position ? "pointer" : "default",
+        overflowWrap: "anywhere",
+      });
+      row.title = [entry.event_type, entry.reason_code].filter(Boolean).join(" · ");
+      const meta = document.createElement("div");
+      Object.assign(meta.style, {
+        display: "flex",
+        alignItems: "center",
+        gap: "7px",
+        color: "#7f8996",
+        font: "11px ui-monospace, SFMono-Regular, Consolas, monospace",
+        marginBottom: "3px",
+      });
+      const badge = document.createElement("span");
+      badge.textContent = entry.category;
+      badge.style.color = levelColors[entry.level] || levelColors.info;
+      badge.style.fontWeight = "700";
+      const tick = document.createElement("span");
+      tick.textContent = `Tick ${entry.tick}`;
+      const time = document.createElement("span");
+      time.textContent = logTime(entry.recorded_at);
+      const position = document.createElement("span");
+      position.textContent = entry.position ? formatPosition(entry.position) : "";
+      meta.append(badge, tick, time, position);
+      const title = document.createElement("div");
+      title.textContent = entry.title;
+      Object.assign(title.style, {
+        color: levelColors[entry.level] || levelColors.info,
+        fontWeight: "700",
+        fontSize: "12px",
+      });
+      const message = document.createElement("div");
+      message.textContent = entry.message;
+      Object.assign(message.style, { color: "#c8d0da", marginTop: "2px" });
+      row.append(meta, title, message);
+      if (entry.position) {
+        row.tabIndex = 0;
+        const focus = () => focusTarget(entry.position, entry.title);
+        row.addEventListener("click", focus);
+        row.addEventListener("keydown", (event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            focus();
+          }
+        });
+      }
+      state.logsList.appendChild(row);
+    }
+  }
+
+  function updateLogs(payload) {
+    const next = core.normalizeLogs(payload);
+    const latest = next.entries[next.entries.length - 1] || null;
+    if (
+      latest &&
+      state.lastLogEventId &&
+      latest.event_id !== state.lastLogEventId &&
+      !state.logsOpen
+    ) {
+      const previousIndex = next.entries.findIndex(
+        (entry) => entry.event_id === state.lastLogEventId,
+      );
+      state.unreadLogs += previousIndex >= 0
+        ? next.entries.length - previousIndex - 1
+        : 1;
+      state.unreadLogs = Math.min(state.unreadLogs, 99);
+    }
+    if (latest) {
+      state.lastLogEventId = latest.event_id;
+    }
+    state.logs = next;
+    if (state.logsOpen) {
+      state.unreadLogs = 0;
+      renderLogs();
+    }
+    syncControls();
+  }
+
   function renderStatusBar() {
     const stats = state.stats;
     const setText = (key, text) => {
@@ -796,7 +1349,10 @@
       "bar:population",
       `人口 ${stats.workers}/${stats.vanguards}/${stats.rangers}`,
     );
-    setText("bar:enemies", `敌 ${stats.visible_enemies}`);
+    setText(
+      "bar:enemies",
+      `敌 ${stats.visible_enemies}${stats.core_reinforcement_active ? " · 回援" : ""}`,
+    );
     setText("bar:core", `HP ${stats.core_hp}/${stats.core_shield}`);
     setText("bar:beacon", stats.owns_beacon ? "信标✓" : "信标✗");
 
@@ -804,15 +1360,33 @@
       "stats:tick": String(stats.tick),
       "stats:mode": mode,
       "stats:recall": state.control.recall ? "已召回" : "正常",
+      "stats:raid_enabled": stats.raid_enabled ? "开启" : "关闭",
+      "stats:raid_recall": stats.raid_recall ? "召回中" : "正常",
+      "stats:raid_selected": `${stats.raid_selected_vanguards ?? 0}/${stats.raid_selected_rangers ?? 0}`,
+      "stats:raid_target": formatPosition(stats.raid_core_position),
+      "stats:raid_sweep_radius": String(stats.raid_sweep_radius ?? 18),
+      "stats:migration_candidate": formatPosition(stats.migration_candidate),
+      "stats:migration_target": formatPosition(stats.migration_target),
+      "stats:migration_site_checked": stats.migration_site_checked ? "是" : "否",
+      "stats:migration_site_score": `${stats.migration_site_score}/9`,
       "stats:resources": `${stats.resources}/${stats.capacity}`,
       "stats:population": `${stats.workers}/${stats.vanguards}/${stats.rangers}`,
       "stats:core": `${stats.core_hp}/${stats.core_shield}`,
       "stats:core_position": formatPosition(stats.core_position),
       "stats:beacon_position": formatPosition(stats.beacon_position),
       "stats:visible_enemies": String(stats.visible_enemies),
+      "stats:core_threat_count": String(stats.core_threat_count),
+      "stats:core_reinforcement_active": stats.core_reinforcement_active
+        ? "进行中"
+        : "未触发",
       "stats:owns_beacon": stats.owns_beacon ? "是" : "否",
       "stats:visible_resource_cells": String(stats.visible_resource_cells),
       "stats:known_resource_cells": String(stats.known_resource_cells),
+      "stats:browser_resource_hints": String(stats.browser_resource_hints),
+      "stats:browser_intel_online": stats.browser_intel_online ? "在线" : "离线",
+      "stats:browser_intel_age_seconds": stats.browser_intel_online
+        ? `${stats.browser_intel_age_seconds} 秒`
+        : "-",
       "stats:worker_cargo": String(stats.worker_cargo),
       "stats:exploring_workers": String(stats.exploring_workers),
       "stats:max_worker_search_radius": String(stats.max_worker_search_radius),
@@ -917,6 +1491,9 @@
     if (state.settingsPanel) {
       state.settingsPanel.style.display = state.settingsOpen ? "block" : "none";
     }
+    if (state.settingsButton) {
+      state.settingsButton.style.color = state.settingsOpen ? "#9bcbbd" : "#d9e1eb";
+    }
     if (state.modeButton) {
       const mode = state.control.mode;
       state.modeButton.textContent =
@@ -933,14 +1510,52 @@
       state.recallButton.textContent = recall ? "解除召回" : "一键召回";
       state.recallButton.style.color = recall ? "#d98a7a" : "#9bcbbd";
     }
+    if (state.raidButton) {
+      const enabled = Boolean(state.control.raid_enabled);
+      state.raidButton.textContent = enabled ? "偷袭 开" : "偷袭 关";
+      state.raidButton.style.color = enabled ? "#e0b36b" : "#8f9cad";
+    }
+    if (state.raidRecallButton) {
+      const recall = Boolean(state.control.raid_recall);
+      state.raidRecallButton.textContent = recall ? "偷袭解除召回" : "偷袭召回";
+      state.raidRecallButton.style.color = recall ? "#d98a7a" : "#9bcbbd";
+    }
     if (state.settingInputs.has("beacon_target_distance")) {
       const entry = state.settingInputs.get("beacon_target_distance");
       entry.input.value = String(state.control.beacon_target_distance ?? 0);
     }
+    for (const key of ["raid_vanguards", "raid_rangers"]) {
+      const entry = state.settingInputs.get(key);
+      if (entry) {
+        entry.input.value = String(state.control[key] ?? (key === "raid_vanguards" ? 1 : 2));
+      }
+    }
     if (state.statsPanel) {
       state.statsPanel.style.display = state.statsOpen ? "block" : "none";
     }
+    if (state.statsButton) {
+      state.statsButton.style.color = state.statsOpen ? "#9bcbbd" : "#d9e1eb";
+    }
+    if (state.locatorButton) {
+      state.locatorButton.style.color = state.locatorOpen ? "#9bcbbd" : "#d9e1eb";
+    }
+    if (state.logsButton) {
+      state.logsButton.textContent = state.unreadLogs
+        ? `日志 ${state.unreadLogs}`
+        : "日志";
+      state.logsButton.style.color = state.logsOpen
+        ? "#9bcbbd"
+        : state.unreadLogs
+          ? "#e0b36b"
+          : "#d9e1eb";
+    }
+    if (state.logsPanel) {
+      state.logsPanel.style.display = state.logsOpen ? "flex" : "none";
+    }
     for (const [key, binding] of state.settingInputs) {
+      if (binding.kind === "number") {
+        continue;
+      }
       const value = state.settings[key];
       if (binding.kind === "checkbox") {
         binding.input.checked = Boolean(value);
@@ -969,33 +1584,49 @@
     if (state.locatorPanel) {
       state.locatorPanel.style.display = visible && state.locatorOpen ? "block" : "none";
     }
+    if (state.logsPanel) {
+      state.logsPanel.style.display = visible && state.logsOpen ? "flex" : "none";
+    }
   }
 
   function positionControls(rect) {
     if (!state.toolbar || !state.settingsPanel || !state.statusBar) {
       return;
     }
-    const left = Math.max(8, rect.left + 10);
-    const top = Math.max(8, rect.top + 10);
-    state.toolbar.style.left = `${left}px`;
-    state.toolbar.style.top = `${top}px`;
-    state.settingsPanel.style.left = `${left}px`;
-    state.settingsPanel.style.top = `${top + 37}px`;
-    // 状态栏放在右上角
-    const statusBarWidth = Math.min(720, Math.max(260, rect.width - 20));
-    const barLeft = Math.max(8, rect.right - statusBarWidth - 10);
-    state.statusBar.style.left = `${barLeft}px`;
-    state.statusBar.style.top = `${Math.max(8, rect.top + 10)}px`;
-    // 统计面板紧跟状态栏下方
-    const panelLeft = Math.max(8, rect.right - Math.min(390, rect.width - 20) - 10);
-    if (state.statsPanel) {
-      state.statsPanel.style.left = `${panelLeft}px`;
-      state.statsPanel.style.top = `${Math.max(8, rect.top + 46)}px`;
+    const initial = core.calculateControlLayout(rect, 0, window.innerHeight);
+    if (!initial) {
+      return;
     }
-    if (state.locatorPanel) {
-      state.locatorPanel.style.left = `${Math.max(8, rect.right - Math.min(330, rect.width - 20) - 10)}px`;
-      state.locatorPanel.style.top = `${Math.max(8, rect.top + 46)}px`;
+    state.statusBar.style.left = `${initial.dock.left}px`;
+    state.statusBar.style.top = `${initial.dock.top}px`;
+    state.statusBar.style.width = `${initial.dock.width}px`;
+
+    const dockHeight = Math.ceil(state.statusBar.getBoundingClientRect().height);
+    const layout = core.calculateControlLayout(
+      rect,
+      dockHeight,
+      window.innerHeight,
+    );
+    if (!layout) {
+      return;
     }
+    state.statusBar.style.left = `${layout.dock.left}px`;
+    state.statusBar.style.top = `${layout.dock.top}px`;
+    state.statusBar.style.width = `${layout.dock.width}px`;
+
+    const placePanel = (panel, placement) => {
+      if (!panel) {
+        return;
+      }
+      panel.style.left = `${placement.left}px`;
+      panel.style.top = `${placement.top}px`;
+      panel.style.width = `${placement.width}px`;
+      panel.style.maxHeight = `${placement.maxHeight}px`;
+    };
+    placePanel(state.settingsPanel, layout.settings);
+    placePanel(state.statsPanel, layout.stats);
+    placePanel(state.locatorPanel, layout.locator);
+    placePanel(state.logsPanel, layout.logs);
   }
 
   function findMapCanvas(now) {
@@ -1006,6 +1637,7 @@
     ) {
       const rect = state.mapCanvas.getBoundingClientRect();
       if (rect.width >= 300 && rect.height >= 220) {
+        bindMapClick(state.mapCanvas);
         return state.mapCanvas;
       }
     }
@@ -1034,9 +1666,90 @@
         bestScore = score;
       }
     }
+    if (state.clickMapCanvas && state.clickMapCanvas !== best && state.mapClickHandler) {
+      state.clickMapCanvas.removeEventListener(
+        "click",
+        state.mapClickHandler,
+        true,
+      );
+      state.clickMapCanvas = null;
+    }
     state.mapCanvas = best;
     state.camera = null;
+    if (best) {
+      bindMapClick(best);
+    }
     return best;
+  }
+
+  function selectMapCell(event, mapCanvas) {
+    if (event.button !== 0 || !arenaPageVisible() || !state.camera) {
+      return;
+    }
+    const rect = mapCanvas.getBoundingClientRect();
+    const localX = event.clientX - rect.left;
+    const localY = event.clientY - rect.top;
+    if (localX < 0 || localY < 0 || localX >= rect.width || localY >= rect.height) {
+      return;
+    }
+    const cell = core.screenToGrid(
+      localX,
+      localY,
+      state.camera,
+      rect.width,
+      rect.height,
+    );
+    if (cell) {
+      state.selectedCell = cell;
+    }
+  }
+
+  function bindPageClick() {
+    if (state.pageClickHandler) {
+      return;
+    }
+    state.pageClickHandler = (event) => {
+      if (!arenaPageVisible() || event.button !== 0) {
+        return;
+      }
+      const target = event.target;
+      if (target instanceof Element && target.closest(`[${OVERLAY_ATTRIBUTE}]`)) {
+        return;
+      }
+      const mapCanvas = state.mapCanvas && state.mapCanvas.isConnected
+        ? state.mapCanvas
+        : findMapCanvas(performance.now());
+      if (!mapCanvas || !state.camera) {
+        return;
+      }
+      const rect = mapCanvas.getBoundingClientRect();
+      if (
+        event.clientX < rect.left ||
+        event.clientX >= rect.right ||
+        event.clientY < rect.top ||
+        event.clientY >= rect.bottom
+      ) {
+        return;
+      }
+      selectMapCell(event, mapCanvas);
+    };
+    window.addEventListener("pointerdown", state.pageClickHandler, true);
+  }
+
+  function bindMapClick(mapCanvas) {
+    if (state.clickMapCanvas === mapCanvas) {
+      return;
+    }
+    if (state.clickMapCanvas && state.mapClickHandler) {
+      state.clickMapCanvas.removeEventListener(
+        "click",
+        state.mapClickHandler,
+        true,
+      );
+    }
+    state.mapClickHandler = (event) => selectMapCell(event, mapCanvas);
+    mapCanvas.addEventListener("click", state.mapClickHandler, true);
+    state.clickMapCanvas = mapCanvas;
   }
 
   function resizeOverlay(rect) {
@@ -1104,6 +1817,51 @@
 
   function screenPoint(position, width, height) {
     return core.gridToScreen(position, state.camera, width, height);
+  }
+
+  function observeTickTiming(stats) {
+    const tick = Number(stats && stats.tick);
+    const now = performance.now();
+    if (
+      !Number.isInteger(tick) ||
+      tick < 0 ||
+      state.tickTiming.lastTick === null ||
+      tick <= state.tickTiming.lastTick ||
+      !state.tickTiming.lastAt
+    ) {
+      if (Number.isInteger(tick) && tick >= 0) {
+        state.tickTiming.lastTick = tick;
+        state.tickTiming.lastAt = now;
+      }
+      return;
+    }
+    const tickDelta = tick - state.tickTiming.lastTick;
+    const seconds = (now - state.tickTiming.lastAt) / 1000;
+    const sample = seconds / tickDelta;
+    if (Number.isFinite(sample) && sample >= 0.5 && sample <= 30) {
+      state.tickTiming.secondsPerTick =
+        state.tickTiming.secondsPerTick * 0.75 + sample * 0.25;
+    }
+    state.tickTiming.lastTick = tick;
+    state.tickTiming.lastAt = now;
+  }
+
+  function selectedDistance() {
+    const corePosition = core.normalizePosition(state.stats?.core_position);
+    if (!state.selectedCell || !corePosition) {
+      return null;
+    }
+    return core.gridDistance(state.selectedCell, corePosition);
+  }
+
+  function formatTravelMinutes(minutes) {
+    if (!Number.isFinite(minutes)) {
+      return "无法估算";
+    }
+    if (minutes < 0.1) {
+      return "<0.1 分钟";
+    }
+    return `${minutes < 10 ? minutes.toFixed(1) : Math.round(minutes)} 分钟`;
   }
 
   function pointOnCanvas(point, width, height, margin = 40) {
@@ -1262,6 +2020,71 @@
     }
   }
 
+  function drawBrowserResources(context, width, height) {
+    if (!state.settings.showResources) {
+      return;
+    }
+    const hints = Array.isArray(state.browserIntel.resources)
+      ? state.browserIntel.resources
+      : [];
+    const confirmed = new Set(
+      (Array.isArray(state.payload.resources) ? state.payload.resources : [])
+        .map((position) => `${position[0]},${position[1]}`),
+    );
+    const cell = state.camera.cell;
+    for (const resource of hints) {
+      if (!Array.isArray(resource) || confirmed.has(`${resource[0]},${resource[1]}`)) {
+        continue;
+      }
+      const point = screenPoint(resource, width, height);
+      if (!pointOnCanvas(point, width, height, cell)) {
+        continue;
+      }
+      const half = Math.max(3, Math.min(9, cell * 0.3));
+      context.save();
+      context.globalAlpha = Math.min(0.48, state.settings.opacity * 0.85);
+      context.strokeStyle = "#e09b55";
+      context.lineWidth = Math.max(1, state.settings.lineWidth * 0.7);
+      context.setLineDash([2, 4]);
+      context.strokeRect(point.x - half, point.y - half, half * 2, half * 2);
+      context.setLineDash([]);
+      context.fillStyle = "#e09b55";
+      context.beginPath();
+      context.arc(point.x, point.y, Math.max(1.5, Math.min(3.5, cell * 0.11)), 0, Math.PI * 2);
+      context.fill();
+      context.font = "600 9px ui-monospace, SFMono-Regular, Consolas, monospace";
+      context.fillStyle = "rgba(224,155,85,0.9)";
+      context.fillText(`[${resource[0]}, ${resource[1]}]`, point.x + half + 3, point.y - half - 2);
+      context.restore();
+    }
+  }
+
+  function captureBrowserResources(now, mapCanvas) {
+    if (now - state.lastBrowserIntelCapture < 2000 || !mapCanvas) {
+      return;
+    }
+    state.lastBrowserIntelCapture = now;
+    const resources = core.findResourceCells(mapCanvas);
+    if (!resources.length) {
+      state.browserEmptyCaptures += 1;
+      if (state.browserEmptyCaptures < 3) {
+        return;
+      }
+    } else {
+      state.browserEmptyCaptures = 0;
+    }
+    window.postMessage({
+      channel: CHANNEL,
+      kind: "browser-intel",
+      payload: {
+        version: 1,
+        source: "browser",
+        captured_at: new Date().toISOString(),
+        resources,
+      },
+    }, "*");
+  }
+
   function drawUnitLabels(context, width, height) {
     if (!state.settings.showUnitLabels) {
       return;
@@ -1342,6 +2165,81 @@
     context.fillStyle = "#eef2f7";
     context.fillText(label, x + 6, y + 15);
     context.restore();
+  }
+
+  function drawSelection(context, rect) {
+    if (!state.selectedCell) {
+      return;
+    }
+    const center = screenPoint(state.selectedCell, rect.width, rect.height);
+    const size = Math.max(8, state.camera.cell);
+    if (center && pointOnCanvas(center, rect.width, rect.height, size)) {
+      context.save();
+      context.fillStyle = "rgba(240, 185, 60, 0.14)";
+      context.strokeStyle = "rgba(240, 185, 60, 0.95)";
+      context.lineWidth = 2;
+      context.setLineDash([5, 3]);
+      context.fillRect(center.x - size / 2, center.y - size / 2, size, size);
+      context.strokeRect(center.x - size / 2, center.y - size / 2, size, size);
+      context.setLineDash([]);
+      context.restore();
+    }
+
+    const distance = selectedDistance();
+    const eta = core.estimateTravelMinutes(
+      distance,
+      state.tickTiming.secondsPerTick,
+    );
+    const lines = [
+      `选中 [${state.selectedCell[0]}, ${state.selectedCell[1]}]`,
+      distance === null
+        ? "Core 坐标暂不可用"
+        : `距 Core ${distance} 格 · 预计 ${formatTravelMinutes(eta)}`,
+    ];
+    context.save();
+    context.font = "600 12px system-ui, -apple-system, Segoe UI, sans-serif";
+    const width = Math.max(...lines.map((line) => context.measureText(line).width)) + 22;
+    const boxWidth = Math.min(rect.width - 20, Math.max(210, width));
+    const x = Math.max(10, rect.width - boxWidth - 10);
+    const y = Math.max(10, rect.height - 58);
+    context.fillStyle = "rgba(7, 10, 16, 0.9)";
+    context.fillRect(x, y, boxWidth, 48);
+    context.strokeStyle = "rgba(240, 185, 60, 0.72)";
+    context.lineWidth = 1;
+    context.strokeRect(x, y, boxWidth, 48);
+    context.fillStyle = "#f0b93c";
+    context.fillText(lines[0], x + 11, y + 19);
+    context.fillStyle = "#eef2f7";
+    context.fillText(lines[1], x + 11, y + 38);
+    context.restore();
+  }
+
+  function renderDistanceCard(rect) {
+    const card = state.distanceCard;
+    if (!card || !state.distanceCardPosition || !state.distanceCardDetail) {
+      return;
+    }
+    if (!state.selectedCell) {
+      card.style.display = "none";
+      return;
+    }
+    const distance = selectedDistance();
+    const eta = core.estimateTravelMinutes(
+      distance,
+      state.tickTiming.secondsPerTick,
+    );
+    state.distanceCardPosition.textContent =
+      `选中 [${state.selectedCell[0]}, ${state.selectedCell[1]}]`;
+    state.distanceCardDetail.textContent = distance === null
+      ? "Core 坐标暂不可用"
+      : `距 Core ${distance} 格 · 预计 ${formatTravelMinutes(eta)}`;
+    const width = Math.min(290, Math.max(210, rect.width - 20));
+    card.style.width = `${width}px`;
+    card.style.setProperty("display", "block", "important");
+    card.style.setProperty("visibility", "visible", "important");
+    const height = Math.ceil(card.getBoundingClientRect().height);
+    card.style.left = `${Math.max(8, rect.right - width - 10)}px`;
+    card.style.top = `${Math.max(8, Math.min(window.innerHeight - height - 8, rect.bottom - height - 10))}px`;
   }
 
   function drawHud(context, rect, hover) {
@@ -1510,6 +2408,9 @@
         state.overlay.style.display = "none";
       }
       setControlsVisible(false);
+      if (state.distanceCard) {
+        state.distanceCard.style.display = "none";
+      }
       requestAnimationFrame(render);
       return;
     }
@@ -1517,6 +2418,9 @@
     if (!mapCanvas) {
       state.overlay.style.display = "none";
       setControlsVisible(false);
+      if (state.distanceCard) {
+        state.distanceCard.style.display = "none";
+      }
       requestAnimationFrame(render);
       return;
     }
@@ -1533,7 +2437,10 @@
       return;
     }
 
+    captureBrowserResources(now, mapCanvas);
+
     drawResources(state.context, rect.width, rect.height);
+    drawBrowserResources(state.context, rect.width, rect.height);
     if (state.settings.showRoutes) {
       const routes = Array.isArray(state.payload.routes) ? state.payload.routes : [];
       for (const route of routes) {
@@ -1543,9 +2450,11 @@
       }
     }
     drawUnitLabels(state.context, rect.width, rect.height);
-    const hover = hoverCell(rect);
-    drawHover(state.context, rect, hover);
-    drawRally(state.context, rect);
+      const hover = hoverCell(rect);
+      drawHover(state.context, rect, hover);
+      drawSelection(state.context, rect);
+      renderDistanceCard(rect);
+      drawRally(state.context, rect);
     drawLocator(state.context, rect);
     drawHud(state.context, rect, hover);
     renderStatusBar();
@@ -1565,16 +2474,43 @@
       }
       if (message.kind === "routes" && message.payload && typeof message.payload === "object") {
         state.payload = message.payload;
+      } else if (
+        (message.kind === "browser-intel" || message.kind === "browser-intel:server") &&
+        message.payload &&
+        typeof message.payload === "object"
+      ) {
+        state.browserIntel = {
+          version: 1,
+          source: "browser",
+          captured_at: typeof message.payload.captured_at === "string" ? message.payload.captured_at : null,
+          resources: Array.isArray(message.payload.resources) ? message.payload.resources : [],
+        };
       } else if (message.kind === "stats" && message.payload && typeof message.payload === "object") {
+        observeTickTiming(message.payload);
         state.stats = message.payload;
+        centerFollowedUnit();
         renderStatusBar();
         if (state.locatorOpen) {
           renderLocator();
         }
+      } else if (message.kind === "logs" && message.payload && typeof message.payload === "object") {
+        updateLogs(message.payload);
       } else if (message.kind === "control" && message.payload && typeof message.payload === "object") {
         state.control = {
-          mode: message.payload.mode === "beacon" ? "beacon" : message.payload.mode === "aggress" ? "aggress" : "develop",
+          mode: ["develop", "aggress", "beacon", "migrate"].includes(message.payload.mode)
+            ? message.payload.mode
+            : "develop",
           recall: Boolean(message.payload.recall),
+          raid_enabled: Boolean(message.payload.raid_enabled),
+          raid_recall: Boolean(message.payload.raid_recall),
+          raid_vanguards:
+            typeof message.payload.raid_vanguards === "number"
+              ? message.payload.raid_vanguards
+              : state.control.raid_vanguards ?? 1,
+          raid_rangers:
+            typeof message.payload.raid_rangers === "number"
+              ? message.payload.raid_rangers
+              : state.control.raid_rangers ?? 2,
           beacon_target_distance:
             typeof message.payload.beacon_target_distance === "number"
               ? message.payload.beacon_target_distance
@@ -1584,6 +2520,14 @@
             message.payload.rally_point.length === 2
               ? [Number(message.payload.rally_point[0]), Number(message.payload.rally_point[1])]
               : null,
+          aggress_vanguards:
+            typeof message.payload.aggress_vanguards === "number"
+              ? message.payload.aggress_vanguards
+              : state.control.aggress_vanguards ?? 0,
+          aggress_rangers:
+            typeof message.payload.aggress_rangers === "number"
+              ? message.payload.aggress_rangers
+              : state.control.aggress_rangers ?? 0,
         };
         syncControls();
         renderStatusBar();
@@ -1613,6 +2557,18 @@
     if (!editing && event.altKey && event.shiftKey && event.code === "KeyR") {
       event.preventDefault();
       toggleRoutes();
+    } else if (!editing && event.code === "Escape") {
+      state.selectedCell = null;
+    } else if (!editing && event.altKey && event.shiftKey && event.code === "KeyL") {
+      event.preventDefault();
+      state.logsOpen = !state.logsOpen;
+      if (state.logsOpen) {
+        state.statsOpen = false;
+        state.locatorOpen = false;
+        state.unreadLogs = 0;
+        renderLogs();
+      }
+      syncControls();
     } else if (!editing && event.altKey && event.shiftKey && event.code === "Digit1") {
       event.preventDefault();
       updateControl({ mode: "develop" });

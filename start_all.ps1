@@ -1,38 +1,51 @@
-﻿# Arena Hero 一键启动（后台运行，关闭本窗口不影响 agent 与 overlay server）
-# 用法：powershell -ExecutionPolicy Bypass -File start_all.ps1
-$ErrorActionPreference = 'Continue'
+# Start the Arena Hero agent and route overlay in the background.
+$ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 
-# 0. 清理旧的 arena_hero 进程（避免端口 8765 被多个 server 抢占导致扩展报错）
-$old = Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
-    Where-Object { $_.CommandLine -like '*arena_hero*' }
+# Stop only this project's two Python entry points.
+$agentEntry = [IO.Path]::GetFullPath((Join-Path $root 'arena_hero_tactic.py'))
+$overlayEntry = [IO.Path]::GetFullPath((Join-Path $root 'arena_hero_route_overlay_server.py'))
+$old = @(
+    Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+        Where-Object {
+            $_.CommandLine -like "*$agentEntry*" -or
+            $_.CommandLine -like "*$overlayEntry*"
+        }
+)
 foreach ($process in $old) {
     Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
 }
 Start-Sleep -Milliseconds 800
 
-# 1. overlay server（8765 端口，供 Chrome 扩展读取路线/状态/控制）
 Start-Process -FilePath "$root\.venv\Scripts\python.exe" `
     -ArgumentList "$root\arena_hero_route_overlay_server.py", `
         "--routes-file", "$root\.arena_hero_routes.json", `
         "--stats-file", "$root\.arena_hero_stats.json", `
         "--control-file", "$root\.arena_hero_control.json", `
+        "--logs-file", "$root\arena_hero_events_zh.jsonl", `
+        "--browser-intel-file", "$root\.arena_hero_browser_intel.json", `
         "--port", "8765" `
     -WorkingDirectory $root `
     -WindowStyle Hidden
 
 Start-Sleep -Milliseconds 500
 
-# 2. agent（连接游戏跑策略；自动读取 .env 中的 key；日志写入 agent.log）
-Start-Process -FilePath "$root\.venv\Scripts\python.exe" `
-    -ArgumentList "$root\arena_hero_tactic.py" `
-    -WorkingDirectory $root `
-    -RedirectStandardOutput "$root\agent.log" `
-    -RedirectStandardError "$root\agent_err.log" `
-    -WindowStyle Hidden
+. (Join-Path $root 'arena_hero_credentials.ps1')
+$key = Get-ArenaHeroApiKey -Root $root
+try {
+    $env:ARENA_HERO_API_KEY = $key
+    Start-Process -FilePath "$root\.venv\Scripts\python.exe" `
+        -ArgumentList "$root\arena_hero_tactic.py" `
+        -WorkingDirectory $root `
+        -RedirectStandardOutput "$root\agent.log" `
+        -RedirectStandardError "$root\agent_err.log" `
+        -WindowStyle Hidden
+}
+finally {
+    Remove-Item Env:ARENA_HERO_API_KEY -ErrorAction SilentlyContinue
+}
 
-Write-Host "Arena Hero 已启动（后台）:"
-Write-Host "  - overlay server  → http://127.0.0.1:8765"
-Write-Host "  - agent           → 日志见 agent.log"
-Write-Host "  （已清理 $($old.Count) 个旧进程）"
-Write-Host "关闭本窗口不影响以上进程运行。"
+Write-Host 'Arena Hero started in the background:'
+Write-Host '  overlay: http://127.0.0.1:8765'
+Write-Host '  agent:   see agent.log'
+Write-Host "  stopped $($old.Count) old project process(es)"

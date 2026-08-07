@@ -40,8 +40,6 @@ def _turn(tick: int, *, resources: int, units: tuple[UnitView | CoreView, ...]) 
         respawn_at_tick=None,
         resources=resources,
         population=sum(1 for u in units if isinstance(u, UnitView)),
-        population_tier=0,
-        upkeep_next_tick=0,
         champion_beacon=ChampionBeacon(position=(40, 40)),
         objects=tuple(objects),
         events=(),
@@ -145,16 +143,20 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(stats_payload["mode"], "aggress")
             self.assertEqual(stats_payload["resources"], 25)
             self.assertEqual(
-            control_payload,
-            {
-                "mode": "aggress",
-                "recall": False,
-                "beacon_target_distance": 0,
-                "rally_point": None,
-                "aggress_vanguards": 0,
-                "aggress_rangers": 0,
-            },
-        )
+                control_payload,
+                {
+                    "mode": "aggress",
+                    "recall": False,
+                    "raid_enabled": False,
+                    "raid_recall": False,
+                    "raid_vanguards": 1,
+                    "raid_rangers": 2,
+                    "beacon_target_distance": 0,
+                    "rally_point": None,
+                    "aggress_vanguards": 0,
+                    "aggress_rangers": 0,
+                },
+            )
 
 
 if __name__ == "__main__":

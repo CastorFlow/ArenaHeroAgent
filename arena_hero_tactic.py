@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
-import importlib
+import importlib.util
 import json
 import os
 import sys
+import traceback
 from getpass import getpass
 from pathlib import Path
+from types import ModuleType
 
 from arena_hero import (
     APIError,
@@ -16,13 +18,34 @@ from arena_hero import (
     ProtocolError,
     TransportError,
     Turn,
+    TurnClosedError,
 )
 
+from arena_hero_event_log import ChineseEventLogger, DEFAULT_LOG_PATH
 import arena_hero_strategy as strategy_module
 
 
 DecisionSummary = strategy_module.DecisionSummary
 TacticMemory = strategy_module.TacticMemory
+
+
+def _load_strategy_candidate(path: Path, version: int) -> ModuleType:
+    """Load a changed strategy without mutating the currently working module."""
+
+    module_name = f"_arena_hero_strategy_hot_{version}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load strategy from {path}")
+    candidate = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = candidate
+    try:
+        spec.loader.exec_module(candidate)
+        candidate.TacticMemory
+        candidate.SmartTactic
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+    return candidate
 
 
 def choose_actions(turn: Turn, memory: TacticMemory | None = None) -> DecisionSummary:
@@ -96,13 +119,17 @@ def play(
     memory_path: Path = Path(".arena_hero_memory.json"),
     telemetry_path: Path = Path("arena_hero_telemetry.jsonl"),
     stats_path: Path = Path(".arena_hero_stats.json"),
+    event_log_path: Path = DEFAULT_LOG_PATH,
 ) -> None:
     completed_turns = 0
     strategy = strategy_module
     strategy_file = Path(strategy.__file__ or "arena_hero_strategy.py")
     strategy_mtime = strategy_file.stat().st_mtime_ns
+    pending_strategy_mtime: int | None = None
     memory = strategy.TacticMemory.load(memory_path)
     tactic = strategy.SmartTactic(memory)
+    fallback_strategy: ModuleType | None = None
+    event_logger = ChineseEventLogger(event_log_path)
 
     with ArenaHeroClient(
         api_key=api_key,
@@ -112,17 +139,87 @@ def play(
         for turn in game.turns():
             current_mtime = strategy_file.stat().st_mtime_ns
             if current_mtime != strategy_mtime:
-                memory.save(memory_path)
-                strategy = importlib.reload(strategy)
-                strategy_file = Path(strategy.__file__ or strategy_file)
-                strategy_mtime = strategy_file.stat().st_mtime_ns
-                memory = strategy.TacticMemory.load(memory_path)
-                tactic = strategy.SmartTactic(memory)
-                print(f"tick={turn.tick} strategy_reloaded=True", flush=True)
-            summary = tactic.choose_actions(turn)
+                if pending_strategy_mtime != current_mtime:
+                    pending_strategy_mtime = current_mtime
+                    print(f"tick={turn.tick} strategy_reload_pending=True", flush=True)
+                else:
+                    try:
+                        memory.save(memory_path)
+                        candidate = _load_strategy_candidate(
+                            strategy_file,
+                            current_mtime,
+                        )
+                        candidate_memory = candidate.TacticMemory.load(memory_path)
+                        candidate_tactic = candidate.SmartTactic(candidate_memory)
+                    except Exception:
+                        strategy_mtime = current_mtime
+                        pending_strategy_mtime = None
+                        print(
+                            f"tick={turn.tick} strategy_reload_failed=True",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        traceback.print_exc()
+                    else:
+                        fallback_strategy = strategy
+                        strategy = candidate
+                        strategy_file = Path(strategy.__file__ or strategy_file)
+                        strategy_mtime = current_mtime
+                        pending_strategy_mtime = None
+                        memory = candidate_memory
+                        tactic = candidate_tactic
+                        print(f"tick={turn.tick} strategy_reloaded=True", flush=True)
+            else:
+                pending_strategy_mtime = None
+            previous_labels = dict(memory.unit_labels)
+            try:
+                summary = tactic.choose_actions(turn)
+            except TurnClosedError as exc:
+                print(
+                    f"tick={turn.tick} skipped={type(exc).__name__}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+            except Exception:
+                print(
+                    f"tick={turn.tick} strategy_runtime_failed=True",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                traceback.print_exc()
+                if fallback_strategy is not None:
+                    strategy = fallback_strategy
+                    fallback_strategy = None
+                    memory = strategy.TacticMemory.load(memory_path)
+                    tactic = strategy.SmartTactic(memory)
+                    print(
+                        f"tick={turn.tick} strategy_rolled_back=True",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                continue
+            log_labels = {**previous_labels, **memory.unit_labels}
             try:
                 accepted = turn.submit()
+            except TurnClosedError as exc:
+                error = type(exc).__name__
+                event_logger.append_turn(turn, log_labels, mode=memory.mode)
+                _append_telemetry(
+                    telemetry_path,
+                    summary,
+                    accepted=False,
+                    error=error,
+                )
+                print(
+                    f"tick={turn.tick} skipped={error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
             except APIError as exc:
+                event_logger.append_turn(turn, log_labels, mode=memory.mode)
+                event_logger.append_client_error(turn.tick, exc.error)
                 _append_telemetry(
                     telemetry_path,
                     summary,
@@ -136,6 +233,7 @@ def play(
                 continue
 
             completed_turns += 1
+            event_logger.append_turn(turn, log_labels, mode=memory.mode)
             memory.save(memory_path)
             memory.write_stats(stats_path, turn)
             _append_telemetry(telemetry_path, summary, accepted=True)
@@ -183,6 +281,13 @@ def main() -> int:
         type=Path,
         default=Path(os.environ.get("ARENA_HERO_STATS_FILE", ".arena_hero_stats.json")),
     )
+    parser.add_argument(
+        "--event-log-file",
+        type=Path,
+        default=Path(
+            os.environ.get("ARENA_HERO_EVENT_LOG_FILE", str(DEFAULT_LOG_PATH))
+        ),
+    )
     args = parser.parse_args()
 
     if args.max_turns is not None and args.max_turns < 1:
@@ -197,6 +302,7 @@ def main() -> int:
             memory_path=args.memory_file,
             telemetry_path=args.telemetry_file,
             stats_path=args.stats_file,
+            event_log_path=args.event_log_file,
         )
     except KeyboardInterrupt:
         print("Stopped by user.", flush=True)

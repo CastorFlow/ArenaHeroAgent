@@ -56,7 +56,7 @@ class RouteOverlayServerTests(unittest.TestCase):
                     self.assertEqual(json.load(response), {"status": "ok"})
                 with urlopen(f"http://{host}:{port}/routes", timeout=2) as response:
                     payload = json.load(response)
-                    self.assertEqual(response.headers["Access-Control-Allow-Origin"], "*")
+                    self.assertIsNone(response.headers["Access-Control-Allow-Origin"])
             finally:
                 server.shutdown()
                 server.server_close()
@@ -123,6 +123,63 @@ class RouteOverlayServerTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=2)
 
+    def test_logs_endpoint_returns_sanitized_chinese_entries(self) -> None:
+        with TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            routes_path = directory_path / ".arena_hero_routes.json"
+            routes_path.write_text("{}", encoding="utf-8")
+            logs_path = directory_path / "arena_hero_events_zh.jsonl"
+            logs_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "version": 1,
+                                "recorded_at": "2026-08-05T10:11:12+08:00",
+                                "tick": 88,
+                                "event_id": "event-88",
+                                "source": "server",
+                                "category": "战斗",
+                                "level": "danger",
+                                "title": "单位阵亡",
+                                "message": "先锋#4 在 [3, -2] 阵亡",
+                                "event_type": "UNIT_DAMAGED",
+                                "reason_code": "ATTACK",
+                                "position": [3, -2],
+                                "actor": "敌方游侠",
+                                "target": "先锋#4",
+                                "values": {"api_key": "must-not-leak"},
+                                "authorization": "must-not-leak",
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "not-json",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            server = create_server(routes_path, logs_path=logs_path, port=0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address
+            try:
+                with urlopen(f"http://{host}:{port}/logs", timeout=2) as response:
+                    payload = json.load(response)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+        self.assertEqual(payload["latest_tick"], 88)
+        self.assertEqual(len(payload["entries"]), 1)
+        self.assertEqual(payload["entries"][0]["title"], "单位阵亡")
+        self.assertEqual(payload["entries"][0]["position"], [3, -2])
+        serialized = json.dumps(payload, ensure_ascii=False).lower()
+        self.assertNotIn("api_key", serialized)
+        self.assertNotIn("authorization", serialized)
+        self.assertNotIn("must-not-leak", serialized)
+
     def test_control_get_post_round_trip(self) -> None:
         with TemporaryDirectory() as directory:
             directory_path = Path(directory)
@@ -142,6 +199,10 @@ class RouteOverlayServerTests(unittest.TestCase):
                     {
                         "mode": "develop",
                         "recall": False,
+                        "raid_enabled": False,
+                        "raid_recall": False,
+                        "raid_vanguards": 1,
+                        "raid_rangers": 2,
                         "beacon_target_distance": 0,
                         "rally_point": None,
                         "aggress_vanguards": 0,
@@ -162,6 +223,10 @@ class RouteOverlayServerTests(unittest.TestCase):
                     {
                         "mode": "aggress",
                         "recall": True,
+                        "raid_enabled": False,
+                        "raid_recall": False,
+                        "raid_vanguards": 1,
+                        "raid_rangers": 2,
                         "beacon_target_distance": 0,
                         "rally_point": None,
                         "aggress_vanguards": 0,
@@ -176,6 +241,10 @@ class RouteOverlayServerTests(unittest.TestCase):
                     {
                         "mode": "aggress",
                         "recall": True,
+                        "raid_enabled": False,
+                        "raid_recall": False,
+                        "raid_vanguards": 1,
+                        "raid_rangers": 2,
                         "beacon_target_distance": 0,
                         "rally_point": None,
                         "aggress_vanguards": 0,
@@ -187,6 +256,10 @@ class RouteOverlayServerTests(unittest.TestCase):
                     {
                         "mode": "aggress",
                         "recall": True,
+                        "raid_enabled": False,
+                        "raid_recall": False,
+                        "raid_vanguards": 1,
+                        "raid_rangers": 2,
                         "beacon_target_distance": 0,
                         "rally_point": None,
                         "aggress_vanguards": 0,
@@ -224,6 +297,114 @@ class RouteOverlayServerTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=2)
 
+    def test_control_accepts_independent_raid_settings(self) -> None:
+        with TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            routes_path = directory_path / ".arena_hero_routes.json"
+            routes_path.write_text("{}", encoding="utf-8")
+            control_path = directory_path / ".arena_hero_control.json"
+            server = create_server(
+                routes_path,
+                control_path=control_path,
+                port=0,
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address
+            try:
+                request = Request(
+                    f"http://{host}:{port}/control",
+                    data=json.dumps(
+                        {
+                            "raid_enabled": True,
+                            "raid_recall": True,
+                            "raid_vanguards": 3,
+                            "raid_rangers": 4,
+                        }
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(request, timeout=2) as response:
+                    posted = json.load(response)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+        self.assertEqual(
+            posted,
+            {
+                "mode": "develop",
+                "recall": False,
+                "raid_enabled": True,
+                "raid_recall": True,
+                "raid_vanguards": 3,
+                "raid_rangers": 4,
+                "beacon_target_distance": 0,
+                "rally_point": None,
+                "aggress_vanguards": 0,
+                "aggress_rangers": 0,
+            },
+        )
+
+    def test_partial_control_update_preserves_existing_settings(self) -> None:
+        with TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            routes_path = directory_path / ".arena_hero_routes.json"
+            routes_path.write_text("{}", encoding="utf-8")
+            control_path = directory_path / ".arena_hero_control.json"
+            control_path.write_text(
+                json.dumps(
+                    {
+                        "mode": "aggress",
+                        "recall": False,
+                        "beacon_target_distance": 50,
+                        "rally_point": [-20, 80],
+                        "aggress_vanguards": 6,
+                        "aggress_rangers": 7,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            server = create_server(
+                routes_path,
+                control_path=control_path,
+                port=0,
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address
+            try:
+                request = Request(
+                    f"http://{host}:{port}/control",
+                    data=json.dumps({"recall": True}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(request, timeout=2) as response:
+                    posted = json.load(response)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+        self.assertEqual(
+            posted,
+            {
+                "mode": "aggress",
+                "recall": True,
+                "raid_enabled": False,
+                "raid_recall": False,
+                "raid_vanguards": 1,
+                "raid_rangers": 2,
+                "beacon_target_distance": 50,
+                "rally_point": [-20, 80],
+                "aggress_vanguards": 6,
+                "aggress_rangers": 7,
+            },
+        )
+
     def test_control_rejects_web_page_origin(self) -> None:
         with TemporaryDirectory() as directory:
             routes_path = Path(directory) / ".arena_hero_routes.json"
@@ -250,6 +431,60 @@ class RouteOverlayServerTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=2)
 
+    def test_browser_intel_round_trip_is_sanitized(self) -> None:
+        with TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            routes_path = directory_path / ".arena_hero_routes.json"
+            routes_path.write_text("{}", encoding="utf-8")
+            intel_path = directory_path / ".arena_hero_browser_intel.json"
+            server = create_server(
+                routes_path,
+                browser_intel_path=intel_path,
+                port=0,
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address
+            base = f"http://{host}:{port}"
+            try:
+                request = Request(
+                    f"{base}/browser-intel",
+                    data=json.dumps(
+                        {
+                            "version": 99,
+                            "source": "page",
+                            "captured_at": "2026-08-05T12:00:00+08:00",
+                            "resources": [[-64, -168], [-64, -168], [1, True], [2, 3]],
+                            "api_key": "must-not-leak",
+                        }
+                    ).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Origin": "chrome-extension://overlay-test",
+                    },
+                    method="POST",
+                )
+                with urlopen(request, timeout=2) as response:
+                    posted = json.load(response)
+                with urlopen(f"{base}/browser-intel", timeout=2) as response:
+                    loaded = json.load(response)
+                stored = json.loads(intel_path.read_text(encoding="utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+        expected = {
+            "version": 1,
+            "source": "browser",
+            "captured_at": "2026-08-05T12:00:00+08:00",
+            "resources": [[-64, -168], [2, 3]],
+        }
+        self.assertEqual(posted, expected)
+        self.assertEqual(loaded, expected)
+        self.assertEqual(stored, expected)
+        self.assertNotIn("must-not-leak", json.dumps(posted))
+
     def test_control_accepts_beacon_mode(self) -> None:
         with TemporaryDirectory() as directory:
             directory_path = Path(directory)
@@ -273,6 +508,10 @@ class RouteOverlayServerTests(unittest.TestCase):
                     {
                         "mode": "beacon",
                         "recall": False,
+                        "raid_enabled": False,
+                        "raid_recall": False,
+                        "raid_vanguards": 1,
+                        "raid_rangers": 2,
                         "beacon_target_distance": 0,
                         "rally_point": None,
                         "aggress_vanguards": 0,
@@ -299,10 +538,15 @@ class RouteOverlayServerTests(unittest.TestCase):
         self.assertNotIn("api.arenahero.io", source)
         self.assertIn("chrome.storage.local", source)
         self.assertIn("alt+shift+r", source)
+        self.assertIn("alt+shift+l", source)
         self.assertIn("alt+shift+1", source)
+        self.assertIn("/logs", source)
         self.assertIn("showresources", source)
         self.assertIn("showunitlabels", source)
         self.assertIn("officialdialogvisible", source)
+        self.assertIn("calculatecontrollayout", source)
+        self.assertIn("getboundingclientrect().height", source)
+        self.assertIn("2147483000", source)
 
 
 if __name__ == "__main__":
