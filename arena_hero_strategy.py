@@ -42,7 +42,32 @@ MODE_DEVELOP = "develop"
 MODE_AGGRESS = "aggress"
 MODE_BEACON = "beacon"
 MODE_MIGRATE = "migrate"
-MODE_VALUES = {MODE_DEVELOP, MODE_AGGRESS, MODE_BEACON, MODE_MIGRATE}
+MODE_LIGHTNING = "lightning"
+MODE_VALUES = {
+    MODE_DEVELOP,
+    MODE_AGGRESS,
+    MODE_BEACON,
+    MODE_MIGRATE,
+    MODE_LIGHTNING,
+}
+# 闪电模式：在远离高强度战区的贫瘠坐标方环（挖空方形甜甜圈，500 ≤
+# max(|x|,|y|) ≤ 700）内泊 Core，靠击杀刚复活、无护卫的敌方 Core（每杀 +5
+# 资源）加速发育。战斗单位各自独立路线扫场，不组队。
+# lightning_ring = (inner_radius, outer_radius)，默认方环；可经控制文件覆盖。
+LIGHTNING_DEFAULT_RING = (500, 700)
+# 巡逻半径偏外环（用户：内圈火力猛，Core 不深入）。0.75 → 半径 ≈650。
+LIGHTNING_PATROL_RADIUS_FRACTION = 0.75
+# 巡逻点沿半径 pr 的方形周界四角轮转；到位（进入 CORE_BEACON_HYSTERESIS 死区）后换下一角。
+LIGHTNING_PATROL_COMPASS = (
+    (1, 0), (1, 1), (0, 1), (-1, 1),
+    (-1, 0), (-1, -1), (0, -1), (1, -1),
+)
+# 猎手 claim 的敌方 Core 半径内出现敌方战斗单位即视为对方上线造兵，释放 claim 撤退。
+LIGHTNING_HUNT_GUARD_RADIUS = 8
+# 猎手扇区探索的步长（限制不出方环）。
+LIGHTNING_SECTOR_STEP = 6
+# 闪电模式常驻兵力上限（不触 20 人口涨价档）。
+LIGHTNING_MAX_POPULATION = 10
 DEVELOP_TARGET_WORKERS = 12
 DEVELOP_TARGET_VANGUARDS = 3
 DEVELOP_TARGET_RANGERS = 3
@@ -519,6 +544,12 @@ class TacticMemory:
     aggress_sweep_last_advance_tick: int = 0
     core_reinforcement_until_tick: int = 0
     last_enemy_visible_tick: int = 0
+    # 闪电模式状态：方环 (inner_r, outer_r)、当前巡逻点、轮转相位、每单位 claim 的敌方 Core、扇区分配。
+    lightning_ring: tuple = field(default_factory=lambda: tuple(LIGHTNING_DEFAULT_RING))
+    lightning_patrol_waypoint: tuple[int, int] | None = None
+    lightning_patrol_phase: int = 0
+    lightning_claims: dict[str, str] = field(default_factory=dict)
+    lightning_sectors: dict[str, tuple[int, int]] = field(default_factory=dict)
     aggress_heal_rotations: dict[str, HealRotation] = field(default_factory=dict)
     aggress_heal_role_swaps: list[HealRoleSwap] = field(default_factory=list)
     aggress_beacon_guard_carrier_id: str | None = None
@@ -872,6 +903,30 @@ class TacticMemory:
             memory.first_observed_tick = int(data.get("first_observed_tick", 0))
             memory.observed_turns = int(data.get("observed_turns", 0))
             memory.units_lost = int(data.get("units_lost", 0))
+            raw_ring = data.get("lightning_ring")
+            if isinstance(raw_ring, list) and len(raw_ring) == 2:
+                inner_r, outer_r = int(raw_ring[0]), int(raw_ring[1])
+                if outer_r >= inner_r > 0:
+                    memory.lightning_ring = (inner_r, outer_r)
+            raw_waypoint = data.get("lightning_patrol_waypoint")
+            if isinstance(raw_waypoint, list) and len(raw_waypoint) == 2:
+                memory.lightning_patrol_waypoint = (
+                    int(raw_waypoint[0]),
+                    int(raw_waypoint[1]),
+                )
+            memory.lightning_patrol_phase = int(
+                data.get("lightning_patrol_phase", 0)
+            )
+            memory.lightning_claims = {
+                str(unit_id): str(core_id)
+                for unit_id, core_id in data.get("lightning_claims", {}).items()
+            }
+            raw_sectors = data.get("lightning_sectors", {})
+            memory.lightning_sectors = {
+                str(unit_id): (int(sector[0]), int(sector[1]))
+                for unit_id, sector in raw_sectors.items()
+                if isinstance(sector, list) and len(sector) == 2
+            }
             return memory
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             return cls()
@@ -1051,6 +1106,24 @@ class TacticMemory:
             "first_observed_tick": self.first_observed_tick,
             "observed_turns": self.observed_turns,
             "units_lost": self.units_lost,
+            "lightning_ring": [
+                self.lightning_ring[0],
+                self.lightning_ring[1],
+            ],
+            "lightning_patrol_waypoint": (
+                [
+                    self.lightning_patrol_waypoint[0],
+                    self.lightning_patrol_waypoint[1],
+                ]
+                if self.lightning_patrol_waypoint is not None
+                else None
+            ),
+            "lightning_patrol_phase": self.lightning_patrol_phase,
+            "lightning_claims": dict(sorted(self.lightning_claims.items())),
+            "lightning_sectors": {
+                unit_id: [sector[0], sector[1]]
+                for unit_id, sector in sorted(self.lightning_sectors.items())
+            },
         }
         temporary = path.with_suffix(path.suffix + ".tmp")
         temporary.write_text(
@@ -1706,6 +1779,19 @@ class TacticMemory:
                     raw_value, bool
                 ):
                     setattr(self, key, max(0, int(raw_value)))
+            raw_ring = data.get("lightning_ring")
+            if (
+                isinstance(raw_ring, list)
+                and len(raw_ring) == 2
+                and all(
+                    isinstance(v, (int, float)) and not isinstance(v, bool)
+                    for v in raw_ring
+                )
+            ):
+                inner_r = int(raw_ring[0])
+                outer_r = int(raw_ring[1])
+                if outer_r >= inner_r > 0:
+                    self.lightning_ring = (inner_r, outer_r)
             self.control_mtime = mtime
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             pass
@@ -2801,6 +2887,7 @@ class SmartTactic:
             or not self.memory.auto_migrate
             or self.memory.migration_site_checked
             or self.memory.mode == MODE_MIGRATE
+            or self.memory.mode == MODE_LIGHTNING
             or not any(unit.position == candidate for unit in turn.units)
         ):
             return
@@ -6477,6 +6564,162 @@ class SmartTactic:
             >= CORE_AUTO_MOBILITY_MIN_COMBAT
         )
 
+    def _lightning_patrol_radius(self) -> int:
+        """巡逻半径偏外环（内圈火力猛，Core 不深入）。"""
+        inner_r, outer_r = self.memory.lightning_ring
+        if outer_r <= inner_r:
+            return outer_r
+        return round(inner_r + (outer_r - inner_r) * LIGHTNING_PATROL_RADIUS_FRACTION)
+
+    def _lightning_clamp_to_donut(self, position: Position) -> Position:
+        """把一个点沿 max-norm 径向投到方环内（inner_r ≤ max(|x|,|y|) ≤ outer_r）。"""
+        inner_r, outer_r = self.memory.lightning_ring
+        x, y = position
+        radius = max(abs(x), abs(y))
+        if radius == 0:
+            return (inner_r, 0)
+        if radius < inner_r:
+            scale = inner_r / radius
+        elif radius > outer_r:
+            scale = outer_r / radius
+        else:
+            return position
+        return (round(x * scale), round(y * scale))
+
+    def _lightning_patrol_waypoint(self, turn: Turn) -> Position:
+        """Core 巡逻点：沿半径 pr 的方形周界四角轮转转圈。
+
+        越界（环内或环外）时最近角即目标——走到环上的路本身就算正常巡逻。
+        到达死区后推进到下一角，形成绕环转圈。
+        """
+        core = turn.core
+        pr = self._lightning_patrol_radius()
+        # 半径 pr 的方形周界四角（顺时针）。
+        corners = ((pr, pr), (pr, -pr), (-pr, -pr), (-pr, pr))
+        waypoint = self.memory.lightning_patrol_waypoint
+        phase = self.memory.lightning_patrol_phase % 4
+        if waypoint is None:
+            # 首次：选最近的周界角作起点。
+            phase = min(
+                range(4),
+                key=lambda i: _distance(core.position, corners[i]),
+            )
+            self.memory.lightning_patrol_phase = phase
+            waypoint = corners[phase]
+            self.memory.lightning_patrol_waypoint = waypoint
+            return waypoint
+        if _distance(core.position, waypoint) <= CORE_BEACON_HYSTERESIS:
+            # 到达死区，推进到下一角。
+            phase = (phase + 1) % 4
+            self.memory.lightning_patrol_phase = phase
+            waypoint = corners[phase]
+            self.memory.lightning_patrol_waypoint = waypoint
+        return waypoint
+
+    def _lightning_claim_for(self, unit_id: str) -> str | None:
+        """Return this unit's claimed enemy-core UUID, releasing stale claims."""
+        core_id = self.memory.lightning_claims.get(unit_id)
+        if core_id is None:
+            return None
+        sighting = self.memory.enemy_sightings.get(core_id)
+        if sighting is None or not sighting.is_core:
+            # 记录已失效（格确认空 / Core 被摧毁）→ 释放 claim。
+            self.memory.lightning_claims.pop(unit_id, None)
+            return None
+        return core_id
+
+    def _lightning_target_position(
+        self,
+        turn: Turn,
+        core_id: str,
+    ) -> tuple[Position, CoreView | None]:
+        """Recorded coord, plus the live CoreView when the target is in vision."""
+        visible_core = next(
+            (
+                enemy
+                for enemy in turn.visible_enemies
+                if isinstance(enemy, CoreView) and str(enemy.id) == core_id
+            ),
+            None,
+        )
+        if visible_core is not None:
+            return visible_core.position, visible_core
+        sighting = self.memory.enemy_sightings[core_id]
+        return sighting.position, None
+
+    def _lightning_target_attended(
+        self,
+        turn: Turn,
+        target_position: Position,
+    ) -> bool:
+        """True when a visible enemy combat unit guards the target coord.
+
+        对方一旦上线造出先锋/游侠即视为有守卫，应释放 claim 撤退。
+        雾区内的守卫看不到，到达后再复核。
+        """
+        return any(
+            isinstance(enemy, UnitView)
+            and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+            and _distance(enemy.position, target_position)
+            <= LIGHTNING_HUNT_GUARD_RADIUS
+            for enemy in turn.visible_enemies
+        )
+
+    def _lightning_acquire_target(
+        self,
+        turn: Turn,
+        unit: Unit,
+    ) -> str | None:
+        """Claim the nearest recorded unguarded enemy core not already claimed."""
+        claimed_by_others = set(self.memory.lightning_claims.values())
+        candidates: list[tuple[str, EnemySighting]] = []
+        for core_id, sighting in self.memory.enemy_sightings.items():
+            if not sighting.is_core or core_id in claimed_by_others:
+                continue
+            if self._lightning_target_attended(turn, sighting.position):
+                continue
+            candidates.append((core_id, sighting))
+        if not candidates:
+            return None
+        core_id, sighting = min(
+            candidates,
+            key=lambda pair: (
+                _distance(unit.position, pair[1].position),
+                pair[0],
+            ),
+        )
+        self.memory.lightning_claims[str(unit.id)] = core_id
+        return core_id
+
+    def _lightning_sector_target(
+        self,
+        turn: Turn,
+        unit: Unit,
+    ) -> Position | None:
+        """无猎杀目标时，单位在方环内受限探索（不出环），拓展视野。"""
+        pr = self._lightning_patrol_radius()
+        ordered = sorted(
+            (u for u in (*turn.vanguards, *turn.rangers)),
+            key=_uuid_key,
+        )
+        try:
+            index = ordered.index(unit)
+        except ValueError:
+            index = 0
+        # 每单位一个周界角作扇区锚，偏移一点拓展覆盖。
+        corners = ((pr, pr), (pr, -pr), (-pr, -pr), (-pr, pr))
+        anchor = corners[index % 4]
+        phase = (turn.tick // 16 + index) % len(LIGHTNING_PATROL_COMPASS)
+        dx, dy = LIGHTNING_PATROL_COMPASS[phase]
+        target = (
+            anchor[0] + dx * LIGHTNING_SECTOR_STEP,
+            anchor[1] + dy * LIGHTNING_SECTOR_STEP,
+        )
+        target = self._lightning_clamp_to_donut(target)
+        if target == unit.position:
+            return None
+        return target
+
     def _aggress_core_reinforcement_state(
         self,
         turn: Turn,
@@ -6521,6 +6764,8 @@ class SmartTactic:
             self._choose_vanguards_migrate(turn, planner, acted_units, decisions)
         elif self.memory.mode == MODE_DEVELOP:
             self._choose_vanguards_develop(turn, planner, acted_units, decisions)
+        elif self.memory.mode == MODE_LIGHTNING:
+            self._choose_vanguards_lightning(turn, planner, acted_units, decisions)
         else:
             self._choose_vanguards_defend(turn, planner, acted_units, decisions)
 
@@ -8209,6 +8454,8 @@ class SmartTactic:
             self._choose_rangers_migrate(turn, planner, acted_units, decisions)
         elif self.memory.mode == MODE_DEVELOP:
             self._choose_rangers_develop(turn, planner, acted_units, decisions)
+        elif self.memory.mode == MODE_LIGHTNING:
+            self._choose_rangers_lightning(turn, planner, acted_units, decisions)
         else:
             self._choose_rangers_defend(turn, planner, acted_units, decisions)
 
@@ -9300,6 +9547,157 @@ class SmartTactic:
             if turn.core is not None and _distance(ranger.position, turn.core.position) > 3:
                 planner.toward(ranger, turn.core.position, "ranger_screen")
 
+    def _choose_vanguards_lightning(
+        self,
+        turn: Turn,
+        planner: MovementPlanner,
+        acted_units: set[UUID],
+        decisions: list[str],
+    ) -> None:
+        """闪电模式先锋：各自独立路线，猎杀记录的无护卫敌方 Core，否则扇区探索。"""
+        if turn.core is None:
+            return
+        # Core 告急或刚受伤 → 全体回防。
+        if self._core_emergency_threats(turn) or self._core_recently_damaged(turn):
+            self._choose_vanguards_recall(turn, planner, acted_units, decisions)
+            return
+        for vanguard in sorted(turn.vanguards, key=_uuid_key):
+            if vanguard.id in acted_units:
+                continue
+            uid = str(vanguard.id)
+            core_id = self._lightning_claim_for(uid)
+            target_position: Position | None = None
+            visible_core: CoreView | None = None
+            if core_id is not None:
+                target_position, visible_core = self._lightning_target_position(
+                    turn, core_id
+                )
+                if self._lightning_target_attended(turn, target_position):
+                    # 对方上线造兵 → 释放，回扇区。
+                    self.memory.lightning_claims.pop(uid, None)
+                    core_id = None
+                    target_position = None
+                    visible_core = None
+            if core_id is None:
+                core_id = self._lightning_acquire_target(turn, vanguard)
+                if core_id is not None:
+                    target_position, visible_core = self._lightning_target_position(
+                        turn, core_id
+                    )
+            if core_id is not None and target_position is not None:
+                direction = next(
+                    (
+                        candidate
+                        for candidate in DIRECTION_ORDER
+                        if _destination(vanguard.position, candidate)
+                        == target_position
+                    ),
+                    None,
+                )
+                if visible_core is not None and direction is not None:
+                    vanguard.sweep(direction)
+                    decisions.append(
+                        f"lightning:{_short_id(vanguard.id)} sweep "
+                        f"target={target_position}"
+                    )
+                    self.memory.decision_totals["lightning:vanguard_sweep"] += 1
+                elif not planner.toward(
+                    vanguard, target_position, "lightning_hunt"
+                ):
+                    vanguard.wait()
+                acted_units.add(vanguard.id)
+                continue
+            # 无猎杀目标 → 扇区探索，拓展视野，不出方框。
+            sector = self._lightning_sector_target(turn, vanguard)
+            if sector is not None and not planner.toward(
+                vanguard, sector, "lightning_sector_sweep"
+            ):
+                vanguard.wait()
+            acted_units.add(vanguard.id)
+
+    def _choose_rangers_lightning(
+        self,
+        turn: Turn,
+        planner: MovementPlanner,
+        acted_units: set[UUID],
+        decisions: list[str],
+    ) -> None:
+        """闪电模式游侠：各自独立路线，远程猎杀无护卫敌方 Core，否则扇区探索。"""
+        if turn.core is None:
+            return
+        if self._core_emergency_threats(turn) or self._core_recently_damaged(turn):
+            self._choose_rangers_recall(turn, planner, acted_units, decisions)
+            return
+        for ranger in sorted(turn.rangers, key=_uuid_key):
+            if ranger.id in acted_units:
+                continue
+            uid = str(ranger.id)
+            core_id = self._lightning_claim_for(uid)
+            target_position: Position | None = None
+            visible_core: CoreView | None = None
+            if core_id is not None:
+                target_position, visible_core = self._lightning_target_position(
+                    turn, core_id
+                )
+                if self._lightning_target_attended(turn, target_position):
+                    self.memory.lightning_claims.pop(uid, None)
+                    core_id = None
+                    target_position = None
+                    visible_core = None
+            if core_id is None:
+                core_id = self._lightning_acquire_target(turn, ranger)
+                if core_id is not None:
+                    target_position, visible_core = self._lightning_target_position(
+                        turn, core_id
+                    )
+            if core_id is not None and target_position is not None:
+                shots = [
+                    (enemy, cell)
+                    for enemy, cell in self._ranger_shot_candidates(
+                        turn, ranger, planner
+                    )
+                    if isinstance(enemy, CoreView)
+                    and str(enemy.id) == core_id
+                ]
+                if shots:
+                    enemy, cell = min(shots, key=lambda pair: pair[1])
+                    ranger.shoot(enemy, expected_cell=cell)
+                    self._mark_ranger_shot(enemy, cell)
+                    decisions.append(
+                        f"lightning:{_short_id(ranger.id)} shoot "
+                        f"target={target_position}"
+                    )
+                    self.memory.decision_totals["lightning:ranger_shoot"] += 1
+                else:
+                    firing_cells = self._firing_cells(
+                        target_position, planner.obstacles
+                    )
+                    firing_target = (
+                        min(
+                            firing_cells,
+                            key=lambda cell: (
+                                planner.final_occupancy(cell),
+                                planner.threat.get(cell, 0),
+                                _distance(ranger.position, cell),
+                                cell,
+                            ),
+                        )
+                        if firing_cells
+                        else target_position
+                    )
+                    if not planner.toward(
+                        ranger, firing_target, "lightning_hunt_seek_firing"
+                    ):
+                        ranger.wait()
+                acted_units.add(ranger.id)
+                continue
+            sector = self._lightning_sector_target(turn, ranger)
+            if sector is not None and not planner.toward(
+                ranger, sector, "lightning_sector_sweep"
+            ):
+                ranger.wait()
+            acted_units.add(ranger.id)
+
     def _core_patrol_slots(
         self,
         turn: Turn,
@@ -9549,7 +9947,7 @@ class SmartTactic:
             )
         )
 
-        if recovery_active:
+        if recovery_active and mode != MODE_LIGHTNING:
             combat_units = vanguards + rangers
             worker_floor = 3 if mode == MODE_BEACON else AGGRESS_BASE_WORKERS
             if workers < worker_floor and budget >= worker_cost:
@@ -9705,6 +10103,33 @@ class SmartTactic:
                 >= DEFENSE_REPLACEMENT_RESERVE
             ):
                 return UnitType.WORKER
+            return None
+
+        if mode == MODE_LIGHTNING:
+            # 严格阶梯（攒钱优先，不向下 fallthrough 到更便宜的兵种）：
+            # 1) 首先先锋(10)——首战力打野；买不起就攒钱，绝不先造工人。
+            # 2) 首游侠(12)——需容量≥15 即 pop≥3；若 pop<3 先补工人抬容量。
+            # 3) 补到 3 工人经济，再第 2 先锋 / 第 2 游侠。常驻 ≤ LIGHTNING_MAX_POPULATION。
+            # 容量 max(10,pop*5) 自然阻止过早造游侠（pop1-2 时 cap10<12）。
+            if current_population >= LIGHTNING_MAX_POPULATION:
+                return None
+            if vanguards < 1:
+                if budget >= vanguard_cost:
+                    return UnitType.VANGUARD
+                return None
+            if rangers < 1:
+                # 游侠 12 需容量 15（pop≥3）；若仍 pop<3 先补工人抬容量。
+                if current_population < 3 and budget >= worker_cost:
+                    return UnitType.WORKER
+                if budget >= ranger_cost:
+                    return UnitType.RANGER
+                return None
+            if workers < 3 and budget >= worker_cost:
+                return UnitType.WORKER
+            if vanguards < 2 and budget >= vanguard_cost:
+                return UnitType.VANGUARD
+            if rangers < 2 and budget >= ranger_cost:
+                return UnitType.RANGER
             return None
 
         if mode == MODE_BEACON:
@@ -9930,6 +10355,27 @@ class SmartTactic:
                         beacon_target=retreat,
                     )
                 return
+            if self.memory.mode == MODE_LIGHTNING:
+                # 闪电模式：Core 在方环内绕半径 pr 的周界转圈巡逻。安全方环里
+                # 不需要战斗护卫才动——巡逻本身帮工人找资源、帮猎手发现 Core。
+                # _choose_core_migration 内部已有 8 格内有敌中止 + hp/盾低中止，
+                # 上游 _choose_core 已先处理治疗/修盾/产兵，故不设 auto_mobility 门槛。
+                waypoint = self._lightning_patrol_waypoint(turn)
+                decisions.append(
+                    f"lightning patrol waypoint={waypoint} "
+                    f"phase={self.memory.lightning_patrol_phase}"
+                )
+                self.memory.decision_totals["lightning:patrol"] += 1
+                self._choose_core_migration(
+                    turn,
+                    planner,
+                    incoming_deposit,
+                    decisions,
+                    beacon_target=waypoint,
+                    noncombat_enemies_safe=True,
+                    ignore_beacon_progress=True,
+                )
+                return
             # cargo 工人被障碍挡回不来（长时间打转且离 core 远）→ 允许 core 自愈迁移靠拢
             cargo_blocked = False
             for worker in turn.workers:
@@ -9967,6 +10413,8 @@ class SmartTactic:
         beacon_target: Position | None = None,
         shelter_target: Position | None = None,
         migration_target: Position | None = None,
+        noncombat_enemies_safe: bool = False,
+        ignore_beacon_progress: bool = False,
     ) -> None:
         core = turn.core
         if core is None or core.view.state is not CoreState.NORMAL:
@@ -10001,11 +10449,17 @@ class SmartTactic:
             return
         if core.hp < 5 or core.shield < 3:
             return
-        if any(
-            _distance(core.position, enemy.position) <= 8
-            for enemy in turn.visible_enemies
-        ):
-            return
+        if noncombat_enemies_safe:
+            # 闪电模式：工人视野提前发现敌方战斗单位时，Core 应绕开，而不是冲过去
+            # 再停。只有被战斗单位包围（每个方向都更接近某个战斗单位）才停下补盾。
+            combat_enemies = [
+                enemy
+                for enemy in turn.visible_enemies
+                if isinstance(enemy, UnitView)
+                and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+            ]
+        else:
+            combat_enemies = []
         owns_beacon = _owns_beacon(turn)
 
         if migration_target is not None:
@@ -10087,15 +10541,35 @@ class SmartTactic:
                     and migration_target is None
                 ):
                     continue
+            # 闪电模式绕行：工人视野提前发现敌方战斗单位时，Core 应避开该方向，
+            # 而非冲过去再停。给"走过去更靠近某个战斗单位"的方向加大惩罚。
+            # 工人/Core 无攻击力不计；只有先锋(sweep)/游侠(shoot)真能伤 Core。
+            combat_proximity_penalty = 0.0
+            if combat_enemies:
+                nearest_after = min(
+                    _distance(destination, enemy.position)
+                    for enemy in combat_enemies
+                )
+                nearest_before = min(
+                    _distance(core.position, enemy.position)
+                    for enemy in combat_enemies
+                )
+                if nearest_after < nearest_before:
+                    # 越靠近越重罚；走进游侠射程(3)或先锋相邻(1)致命，几乎一票否决。
+                    if nearest_after <= 3:
+                        combat_proximity_penalty = 50.0
+                    else:
+                        combat_proximity_penalty = 12.0
             score = (
                 target_distance
                 + planner.threat.get(destination, 0) * 20
                 + heading_penalty
+                + combat_proximity_penalty
                 - _chunk_quota(_chunk_of(destination)) * 0.1
                 - min(10, self.memory.visited.get(destination, 0)) * 0.05
                 - (
                     beacon_progress * BEACON_PROGRESS_WEIGHT
-                    if shelter_target is None
+                    if shelter_target is None and not ignore_beacon_progress
                     else 0
                 )
             )
@@ -10104,6 +10578,23 @@ class SmartTactic:
             )
         if not candidates:
             return
+        # 闪电模式被战斗单位包围：所有可行步都更靠近某个战斗单位 → 停下让 Core 修盾。
+        if noncombat_enemies_safe and combat_enemies:
+            best_closer_count = 0
+            total_enemies = len(combat_enemies)
+            for _, _, _, dest in candidates:
+                closer = sum(
+                    1
+                    for enemy in combat_enemies
+                    if _distance(dest, enemy.position)
+                    < _distance(core.position, enemy.position)
+                )
+                if closer == total_enemies:
+                    best_closer_count += 1
+            if best_closer_count == len(candidates):
+                decisions.append("core patrol_hold reason=combat_surrounded")
+                self.memory.decision_totals["lightning:patrol_hold_combat"] += 1
+                return
 
         _, _, direction, destination = min(candidates)
         core.start_move(direction)

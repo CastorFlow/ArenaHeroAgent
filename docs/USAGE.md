@@ -215,6 +215,7 @@ python arena_hero_route_overlay_server.py --port 8765
 | `auto_migrate` | boolean | 候选格通过防守面检查后自动进入迁移模式 |
 | `aggress_vanguards` | non-negative integer | 指定侵略先锋数量；0 使用自动分配 |
 | `aggress_rangers` | non-negative integer | 指定侵略游侠数量；0 使用自动分配 |
+| `lightning_ring` | `[inner_r, outer_r]` | 闪电模式方环（挖空甜甜圈）`inner_r ≤ max(\|x\|,\|y\|) ≤ outer_r`；默认 `[500, 700]`，仅 `mode=lightning` 生效 |
 
 控制文件在每个 Turn 开始时按修改时间热读取。浏览器 Manual 动作仍然按服务器规则优先于 Agent 对同一对象的动作。
 

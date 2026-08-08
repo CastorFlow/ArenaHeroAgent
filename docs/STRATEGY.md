@@ -210,3 +210,67 @@ Arena Hero 服务器按对象合并计划：Manual 显式动作 > Agent 显式�
 | 稳定性 | accepted=false、`UNIT_MOVE_FAILED`、`CORE_MOVE_FAILED`、`agent_err.log` |
 
 短时间资源为 0 通常是刚产兵，不等于经济停滞。连续多个刷新周期没有采集/回仓、工人距离不下降且伴随卡住计数，才需要调整搜索或物流参数。
+
+## 12. 闪电模式（lightning）
+
+在远离高强度战区的贫瘠坐标**方环**（挖空方形甜甜圈，`500 ≤ max(|x|,|y|) ≤ 700`，
+可用 `.arena_hero_control.json` 的 `lightning_ring` 覆盖为 `[inner, outer]`）内泊一个
+安全 Core，靠击杀刚复活、无护卫的敌方 Core（每杀 +5 资源）加速前期发育，而不
+是纯靠慢速采集。适用于当前发育太慢、且偏远区已观察到大量离线/挂机复活 Core
+的场景。方环中心（半径 <500）挖空——那里离原点近、对手密集火力猛，Core 不深入。
+
+### 12.1 资源容量锁死的建造顺序
+
+资源容量为 `max(10, population×5)`：pop 1–2 时容量只有 10，**第一个战斗
+单位只能是先锋（10 资源）**，造游侠（12）必须先把容量提到 15（pop≥3）。
+因此顺序固定：
+
+1. 起手 1 免费工人（pop1, cap10）→ 攒 10 出**先锋**（首战力，去打野）。
+2. 攒 5 出**工人 #2**（pop3, cap15，抬容量到 15）。
+3. 攒 12 出**游侠**（pop4, cap20，第二路独立猎手）。
+4. 攒 5 出**工人 #3**（补到 3 工人经济）。
+5. 之后按战损补先锋/游侠，常驻 ≤10 单位（不触 20 人口涨价档）。
+
+### 12.2 Core 方环巡逻
+
+- 巡逻半径 `pr` 偏外环（`LIGHTNING_PATROL_RADIUS_FRACTION=0.75` → 默认 ≈650），
+  Core 沿半径 pr 的方形周界四角轮转转圈，留在方环外半，不深入。
+- Core 若不在方环内（max-norm 半径 <inner 或 >outer），最近周界角即下一巡逻点
+  ——走到环上的路本身就算正常巡逻，无单独入框阶段。
+- 到达死区（`CORE_BEACON_HYSTERESIS=8`）后推进到下一角，形成绕环转圈。
+- **巡逻不需战斗护卫门槛**：安全方环里 Core 从游戏开始就巡逻（不设
+  `_core_auto_mobility_ready` 的 ≥1先锋+≥1游侠 门槛，否则贫瘠区要等攒够战斗
+  单位才动）。巡逻本身帮工人找资源、帮猎手发现 Core。
+- **绕行危险方向**：工人视野提前发现敌方先锋/游侠时，Core 选不更靠近它的
+  方向绕开（给"走过去更靠近战斗单位"的方向加评分惩罚；走进射程≤3 致命罚），
+  而非冲过去再停。敌方工人/Core 无攻击力不拦。只有被战斗单位包围（每个可行
+  步都更靠近其一）才停下修盾。仅 lightning 模式如此；其他模式保持原 8 格
+  hard-stop 行为。
+- 复用 `_choose_core_migration` 漏斗——**自动继承载货工人 8 格服务半径暂停和
+  8 格内有敌中止 + hp/盾低中止**。产兵格满时优先产兵；迁移中不产兵（已有守卫）。
+- Core 受威胁（`_core_emergency_threats`）或刚受伤时全体战斗单位召回护核。
+
+### 12.3 分布式独立猎手（战斗单位不组队）
+
+先锋和游侠各自一条独立路线，拓展巡逻视野，互不结伴：
+
+- **扇区分配**：按单位 UUID 序把方环周界四角作扇区锚，每单位一个，在环内
+  受限探索（`_lightning_clamp_to_donut` 沿 max-norm 径向投回环内，不出环）。
+- **寻猎**：单位无 claim 时，从 `enemy_sightings`（is_core，永不按时间老化）
+  选**最近、未被别的单位 claim、且目标格附近无敌方战斗单位**的 Core，claim 之
+  （`lightning_claims`，一单位一目标防扑同一个）。
+- **执行**：先锋相邻 Core 时 `sweep`，否则 `planner.toward` 逼近；游侠在射程
+  1–3 用 `shoot_cell` 射 Core，否则走到 firing cell。
+- **到达复核**：目标进入视野后重新判定无护卫；若对方上线造出先锋/游侠
+  （`LIGHTNING_HUNT_GUARD_RADIUS=8` 内出现敌方战斗单位）→ **释放 claim，
+  撤退回扇区**。单先锋可磨死修盾 Core（对方 5 资源修 5 次盾后无力）。
+- **击杀后**：sighting 自然失效（格确认空），回扇区继续扫。
+
+### 12.4 记忆与失效
+
+复用 `enemy_sightings`：敌方 Core 坐标长期保留，只在格被重新观察且确认无人时
+丢弃。`lightning_claims`/`lightning_sectors`/`lightning_patrol_*` 持久化到
+`.arena_hero_memory.json`。控制字段 `lightning_ring` 每回合按 mtime 热读取，
+同 `beacon_target_distance`。
+
+

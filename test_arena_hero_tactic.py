@@ -68,7 +68,9 @@ from arena_hero_strategy import (
     MODE_AGGRESS,
     MODE_BEACON,
     MODE_DEVELOP,
+    MODE_LIGHTNING,
     MODE_MIGRATE,
+    LIGHTNING_DEFAULT_RING,
     MovementPlanner,
     PlannedMove,
     RAID_SWEEP_INITIAL_RADIUS,
@@ -84,6 +86,7 @@ from arena_hero_strategy import (
     _chunk_quota,
     _core_attack_surface_profile,
     _core_logistics_corridor,
+    _destination,
     _distance,
     _refill_tick_at_or_after,
     _terrain_guard_offsets,
@@ -263,6 +266,22 @@ def enemy_ranger(
         position=position,
         hp=hp,
         unit_type=UnitType.RANGER,
+    )
+
+
+def enemy_vanguard(
+    position: tuple[int, int],
+    *,
+    hp: int = 4,
+    unit_id: UUID = UUID(int=0x8002),
+) -> UnitView:
+    return UnitView(
+        kind="UNIT",
+        id=unit_id,
+        controlled=False,
+        position=position,
+        hp=hp,
+        unit_type=UnitType.VANGUARD,
     )
 
 
@@ -7240,6 +7259,183 @@ class StuckHealPredictionTests(unittest.TestCase):
             self.assertFalse(
                 any("rally_advance" in item for item in summary.decisions)
             )
+
+
+class LightningModeTests(unittest.TestCase):
+    """闪电模式：建造顺序、独立猎手 claim/释放、巡逻不越框、Core 告急召回。"""
+
+    def _box_core(self) -> CoreView:
+        # Core 落在默认方框内，避免被入框迁移逻辑覆盖猎手行为。
+        return core((600, 600))
+
+    def test_cap10_forces_vanguard_not_ranger(self) -> None:
+        # pop1 → 容量 10，资源 10：必须产先锋（游侠要 12 存不下）。
+        turn, _ = make_turn(
+            own_core=self._box_core(),
+            units=(worker(WORKER_LOW, (601, 600)),),
+            resources=10,
+        )
+        SmartTactic(TacticMemory(mode=MODE_LIGHTNING)).choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.core_action, SpawnAction)
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.VANGUARD)
+
+    def test_second_worker_raises_cap_before_ranger(self) -> None:
+        # pop2（工人+先锋），容量仍 10：应产工人#2 抬容量，而非卡在游侠。
+        turn, _ = make_turn(
+            own_core=self._box_core(),
+            units=(
+                worker(WORKER_LOW, (601, 600)),
+                vanguard((602, 600)),
+            ),
+            resources=10,
+        )
+        SmartTactic(TacticMemory(mode=MODE_LIGHTNING)).choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.core_action, SpawnAction)
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.WORKER)
+
+    def test_vanguard_claims_and_sweeps_unguarded_core(self) -> None:
+        turn, _ = make_turn(
+            own_core=self._box_core(),
+            units=(vanguard((609, 600)),),
+            enemies=(enemy_core((610, 600)),),
+        )
+        SmartTactic(TacticMemory(mode=MODE_LIGHTNING)).choose_actions(turn)
+
+        action = turn.plan.unit_actions[VANGUARD_ID]
+        self.assertIsInstance(action, SweepAction)
+        self.assertEqual(action.direction, Direction.RIGHT)
+
+    def test_releases_claim_when_enemy_vanguard_guards_target(self) -> None:
+        # 敌方先锋在目标 Core 旁（8 格内）→ 视为有守卫，先锋不应扑上去 sweep。
+        turn, _ = make_turn(
+            own_core=self._box_core(),
+            units=(vanguard((605, 600)),),
+            enemies=(
+                enemy_core((610, 600)),
+                enemy_vanguard((611, 600)),
+            ),
+        )
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        SmartTactic(memory).choose_actions(turn)
+
+        # 无 claim，且先锋动作不是朝向该 Core 的 sweep。
+        self.assertEqual(memory.lightning_claims, {})
+        action = turn.plan.unit_actions.get(VANGUARD_ID)
+        self.assertFalse(
+            isinstance(action, SweepAction)
+            and _destination((605, 600), action.direction) == (610, 600)
+        )
+
+    def test_patrol_waypoint_stays_inside_donut(self) -> None:
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        tactic = SmartTactic(memory)
+        # 巡逻不需战斗护卫门槛（贫瘠区不能等攒够先锋+游侠才动）。
+        # Core 置于方环内（max-norm 半径在 500..700），仅 1 工人、0 战斗单位。
+        turn, _ = make_turn(
+            own_core=core((535, -201)),
+            units=(worker(WORKER_LOW, (536, -201)),),
+        )
+        tactic.choose_actions(turn)
+        waypoint = memory.lightning_patrol_waypoint
+        self.assertIsNotNone(waypoint)
+        inner_r, outer_r = LIGHTNING_DEFAULT_RING
+        radius = max(abs(waypoint[0]), abs(waypoint[1]))
+        # 巡逻点应在巡逻半径 pr（方环外半）的方形周界上。
+        self.assertGreaterEqual(radius, inner_r)
+        self.assertLessEqual(radius, outer_r)
+
+    def test_core_threat_recalls_vanguard_instead_of_hunting(self) -> None:
+        # 敌方先锋贴近 Core → 视为告急，先锋召回护核而非去猎杀远处 Core。
+        turn, _ = make_turn(
+            own_core=self._box_core(),
+            units=(vanguard((601, 600)),),
+            enemies=(
+                enemy_core((610, 600)),
+                enemy_vanguard((602, 600)),
+            ),
+        )
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        SmartTactic(memory).choose_actions(turn)
+
+        # 无猎杀 claim（没有去猎杀远处的敌方 Core）；先锋可能在召回时横扫
+        # 贴近 Core 的敌方先锋，那是防御行为，不算猎杀。
+        self.assertEqual(memory.lightning_claims, {})
+
+    def test_patrol_continues_past_noncombat_enemy_worker(self) -> None:
+        # 敌方工人在 Core 8 格内（无攻击力）→ Core 继续巡逻，不停摆。
+        turn, _ = make_turn(
+            own_core=core((535, -201)),
+            units=(worker(WORKER_LOW, (540, -201)),),
+            enemies=(enemy_worker((536, -201)),),
+        )
+        SmartTactic(TacticMemory(mode=MODE_LIGHTNING)).choose_actions(turn)
+        self.assertIsInstance(turn.plan.core_action, StartMoveAction)
+
+    def test_patrol_detours_around_combat_enemy(self) -> None:
+        # 敌方先锋在 Core 右侧 6 格（能 sweep 到接近的 Core）。Core 朝巡逻点
+        # (650,-650) 走应选不更靠近该先锋的方向绕开，而非直冲或原地停下。
+        turn, _ = make_turn(
+            own_core=core((535, -201)),
+            units=(worker(WORKER_LOW, (545, -180)),),  # 工人远处发现先锋
+            enemies=(enemy_vanguard((541, -201)),),
+        )
+        SmartTactic(TacticMemory(mode=MODE_LIGHTNING)).choose_actions(turn)
+        self.assertIsInstance(turn.plan.core_action, StartMoveAction)
+        dest = _destination((535, -201), turn.plan.core_action.direction)
+        # 绕行：新位置不应比原位置更靠近那个先锋。
+        self.assertGreaterEqual(
+            _distance(dest, (541, -201)),
+            _distance((535, -201), (541, -201)),
+        )
+
+    def test_patrol_flees_adjacent_combat_enemy(self) -> None:
+        # 敌方先锋紧贴 Core 相邻（sweep 可直接命中）。Core 应选逃离方向（远离先锋）
+        # 而非原地停留（留在 sweep 范围内会被持续打），也不朝先锋走。
+        turn, _ = make_turn(
+            own_core=core((535, -201)),
+            units=(worker(WORKER_LOW, (540, -201)),),
+            enemies=(enemy_vanguard((536, -201)),),
+        )
+        SmartTactic(TacticMemory(mode=MODE_LIGHTNING)).choose_actions(turn)
+        self.assertIsInstance(turn.plan.core_action, StartMoveAction)
+        dest = _destination((535, -201), turn.plan.core_action.direction)
+        # 逃离：新位置比原位置更远离先锋。
+        self.assertGreater(
+            _distance(dest, (536, -201)),
+            _distance((535, -201), (536, -201)),
+        )
+
+
+    def test_banks_toward_vanguard_not_spends_on_worker(self) -> None:
+        # 2 工人 0 先锋、资源 5（买不起先锋 10）→ 应攒钱，不 fallthrough 造第 3 工人。
+        turn, _ = make_turn(
+            own_core=self._box_core(),
+            units=(
+                worker(WORKER_LOW, (601, 600)),
+                worker(WORKER_HIGH, (602, 600)),
+            ),
+            resources=5,
+        )
+        SmartTactic(TacticMemory(mode=MODE_LIGHTNING)).choose_actions(turn)
+        # 不产兵（攒钱等先锋），Core 转去巡逻；绝不在买不起先锋时 fallthrough 造工人。
+        self.assertNotIsInstance(turn.plan.core_action, SpawnAction)
+
+    def test_patrol_moves_toward_waypoint_not_origin(self) -> None:
+        # Core 在 (535,-201)，最近巡逻角 (650,-650)。应朝巡逻点（远离原点）
+        # 走，而非被 beacon_progress 拉向原点（旧 bug 会漂向 LEFT/UP）。
+        turn, _ = make_turn(
+            own_core=core((535, -201)),
+            units=(worker(WORKER_LOW, (540, -201)),),
+        )
+        SmartTactic(TacticMemory(mode=MODE_LIGHTNING)).choose_actions(turn)
+        self.assertIsInstance(turn.plan.core_action, StartMoveAction)
+        dest = _destination((535, -201), turn.plan.core_action.direction)
+        self.assertLess(
+            _distance(dest, (650, -650)),
+            _distance((535, -201), (650, -650)),
+        )
 
 
 if __name__ == "__main__":

@@ -10,5 +10,6 @@
   "migration_candidate": null,
   "auto_migrate": false,
   "aggress_vanguards": 0,
-  "aggress_rangers": 0
+  "aggress_rangers": 0,
+  "lightning_ring": [500, 700]
 }
