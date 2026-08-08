@@ -62,8 +62,14 @@ LIGHTNING_PATROL_COMPASS = (
     (1, 0), (1, 1), (0, 1), (-1, 1),
     (-1, 0), (-1, -1), (0, -1), (1, -1),
 )
-# 猎手 claim 的敌方 Core 半径内出现敌方战斗单位即视为对方上线造兵，释放 claim 撤退。
+# 猎手 claim 的敌方 Core 半径内出现敌方战斗单位即视为"附近有守卫"，作为障碍绕开。
 LIGHTNING_HUNT_GUARD_RADIUS = 8
+# 守卫贴脸到此距离内（真能 sweep/shoot 到进攻方）才释放 claim 撤退；更远的绕开即可。
+LIGHTNING_HUNT_GUARD_CLOSE_RADIUS = 3
+# 目标 Core 周围 GUARD_RADIUS 内近期 sighting 达此数即视为重兵把守，放弃猎杀。
+# 补住"守卫在雾里看不见 → 误判无护卫 → 凑过去卡死"的漏洞。
+LIGHTNING_CROWD_THRESHOLD = 2
+LIGHTNING_CROWD_SIGHTING_MAX_AGE = 40
 # 猎手扇区探索的步长（限制不出方环）。
 LIGHTNING_SECTOR_STEP = 6
 # 闪电模式常驻兵力上限（不触 20 人口涨价档）。
@@ -549,6 +555,9 @@ class TacticMemory:
     lightning_patrol_waypoint: tuple[int, int] | None = None
     lightning_patrol_phase: int = 0
     lightning_claims: dict[str, str] = field(default_factory=dict)
+    # 判定为重兵把守而永久放弃的敌方 Core UUID 集合。世界很大、复活磁铁会不断
+    # 送来新的无护卫 Core，没必要死磕被围住的。acquire 永久跳过这些 ID。
+    lightning_blacklist: set[str] = field(default_factory=set)
     lightning_sectors: dict[str, tuple[int, int]] = field(default_factory=dict)
     aggress_heal_rotations: dict[str, HealRotation] = field(default_factory=dict)
     aggress_heal_role_swaps: list[HealRoleSwap] = field(default_factory=list)
@@ -921,6 +930,9 @@ class TacticMemory:
                 str(unit_id): str(core_id)
                 for unit_id, core_id in data.get("lightning_claims", {}).items()
             }
+            memory.lightning_blacklist = {
+                str(core_id) for core_id in data.get("lightning_blacklist", ())
+            }
             raw_sectors = data.get("lightning_sectors", {})
             memory.lightning_sectors = {
                 str(unit_id): (int(sector[0]), int(sector[1]))
@@ -1120,6 +1132,7 @@ class TacticMemory:
             ),
             "lightning_patrol_phase": self.lightning_patrol_phase,
             "lightning_claims": dict(sorted(self.lightning_claims.items())),
+            "lightning_blacklist": sorted(self.lightning_blacklist),
             "lightning_sectors": {
                 unit_id: [sector[0], sector[1]]
                 for unit_id, sector in sorted(self.lightning_sectors.items())
@@ -6652,18 +6665,70 @@ class SmartTactic:
         turn: Turn,
         target_position: Position,
     ) -> bool:
-        """True when a visible enemy combat unit guards the target coord.
+        """True only when a visible combat unit is close enough to hit the attacker.
 
-        对方一旦上线造出先锋/游侠即视为有守卫，应释放 claim 撤退。
-        雾区内的守卫看不到，到达后再复核。
+        守卫在目标 CLOSE_RADIUS（3）内——真能 sweep/shoot 到进攻方——才算贴脸，
+        此时绕不开，应释放 claim 撤退。更远（4-8）的守卫可能只是路过/视野边缘
+        闪现，不释放；改由 _lightning_guard_cells 把它们当障碍绕开，从侧面包抄。
+        这样避免"进一步看见远处守卫→释放→退一步看不见→又 claim→又进"的震荡。
         """
         return any(
             isinstance(enemy, UnitView)
             and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
             and _distance(enemy.position, target_position)
-            <= LIGHTNING_HUNT_GUARD_RADIUS
+            <= LIGHTNING_HUNT_GUARD_CLOSE_RADIUS
             for enemy in turn.visible_enemies
         )
+
+    def _lightning_target_crowded(
+        self,
+        target_position: Position,
+        *,
+        max_age: int = LIGHTNING_CROWD_SIGHTING_MAX_AGE,
+    ) -> bool:
+        """目标周围是否近期 sighting 密集（含雾里看不见的守卫）。
+
+        enemy_sightings 记录见过的敌方单位（is_core=False 的可能是工人也可能是
+        战斗单位——dataclass 没存 unit_type，保守都算）。若目标 GUARD_RADIUS 内
+        近期 sighting 数 ≥ CROWD_THRESHOLD，视为重兵把守的 Core，应放弃猎杀，
+        不该硬凑。这补住"守卫在雾里看不见 → acquire 误判无护卫 → 凑过去卡死"
+        的漏洞。
+        """
+        turn_tick = self.memory.last_tick
+        nearby = 0
+        for sighting in self.memory.enemy_sightings.values():
+            if sighting.is_core:
+                continue
+            if turn_tick - sighting.seen_tick > max_age:
+                continue
+            if _distance(sighting.position, target_position) <= LIGHTNING_HUNT_GUARD_RADIUS:
+                nearby += 1
+        return nearby >= LIGHTNING_CROWD_THRESHOLD
+
+    def _lightning_guard_cells(
+        self,
+        turn: Turn,
+        target_position: Position,
+    ) -> set[Position]:
+        """可见的敌方战斗单位及其四邻格，作为寻路 avoid 集合让猎手绕开守卫。
+
+        守卫本体 + 四邻（先锋 sweep 打相邻格，游侠 shoot 打 1-3 射线），把这片
+        当障碍，planner.toward 自然选别的路从侧面包抄，而不是正对守卫进退。
+        只覆盖目标附近的守卫（≤ LIGHTNING_HUNT_GUARD_RADIUS），远处的不相关。
+        """
+        cells: set[Position] = set()
+        for enemy in turn.visible_enemies:
+            if not (
+                isinstance(enemy, UnitView)
+                and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+            ):
+                continue
+            if _distance(enemy.position, target_position) > LIGHTNING_HUNT_GUARD_RADIUS:
+                continue
+            cells.add(enemy.position)
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                cells.add((enemy.position[0] + dx, enemy.position[1] + dy))
+        return cells
 
     def _lightning_acquire_target(
         self,
@@ -6676,7 +6741,16 @@ class SmartTactic:
         for core_id, sighting in self.memory.enemy_sightings.items():
             if not sighting.is_core or core_id in claimed_by_others:
                 continue
+            if core_id in self.memory.lightning_blacklist:
+                # 永久放弃过的重兵 Core，不再回头。
+                continue
             if self._lightning_target_attended(turn, sighting.position):
+                # 贴脸有守卫 → 黑名单，永久跳过。
+                self.memory.lightning_blacklist.add(core_id)
+                continue
+            if self._lightning_target_crowded(sighting.position):
+                # 雾里也围着守卫的重兵 Core → 黑名单，永久放弃。
+                self.memory.lightning_blacklist.add(core_id)
                 continue
             candidates.append((core_id, sighting))
         if not candidates:
@@ -6696,8 +6770,16 @@ class SmartTactic:
         turn: Turn,
         unit: Unit,
     ) -> Position | None:
-        """无猎杀目标时，单位在方环内受限探索（不出环），拓展视野。"""
+        """无猎杀目标时，单位沿方环周界探索（不出环），拓展视野。
+
+        以单位当前位置投影到方环周界为锚，再沿周界顺时针小步偏移。这样单位
+        永远在"自己附近"的环上走，不会穿越原点跑到对面象限（旧 bug：固定四角
+        把第四象限的单位派去第一象限）。每单位偏移相位不同以分散覆盖。
+        """
         pr = self._lightning_patrol_radius()
+        anchor = self._lightning_clamp_to_donut(unit.position)
+        # 沿周界顺时针推进：周界点的主轴分量饱和（±pr），次轴未饱和；
+        # 把次轴向饱和方向推一格即"沿周界走一圈"。方向由单位位置象限决定。
         ordered = sorted(
             (u for u in (*turn.vanguards, *turn.rangers)),
             key=_uuid_key,
@@ -6706,16 +6788,20 @@ class SmartTactic:
             index = ordered.index(unit)
         except ValueError:
             index = 0
-        # 每单位一个周界角作扇区锚，偏移一点拓展覆盖。
-        corners = ((pr, pr), (pr, -pr), (-pr, -pr), (-pr, pr))
-        anchor = corners[index % 4]
+        # 每单位一个相位偏移（tick//16 让它随时间推进，单位 index 分散覆盖）。
         phase = (turn.tick // 16 + index) % len(LIGHTNING_PATROL_COMPASS)
         dx, dy = LIGHTNING_PATROL_COMPASS[phase]
-        target = (
-            anchor[0] + dx * LIGHTNING_SECTOR_STEP,
-            anchor[1] + dy * LIGHTNING_SECTOR_STEP,
-        )
+        step = max(1, LIGHTNING_SECTOR_STEP // 2)
+        target = (anchor[0] + dx * step, anchor[1] + dy * step)
         target = self._lightning_clamp_to_donut(target)
+        # 巡逻半径对齐：把目标 max-norm 拉到 pr，让它沿周界而非环内游荡。
+        tx, ty = target
+        t_radius = max(abs(tx), abs(ty))
+        if 0 < t_radius and t_radius != pr:
+            scale = pr / t_radius
+            target = self._lightning_clamp_to_donut(
+                (round(tx * scale), round(ty * scale))
+            )
         if target == unit.position:
             return None
         return target
@@ -9572,8 +9658,13 @@ class SmartTactic:
                 target_position, visible_core = self._lightning_target_position(
                     turn, core_id
                 )
-                if self._lightning_target_attended(turn, target_position):
-                    # 对方上线造兵 → 释放，回扇区。
+                if self._lightning_target_attended(turn, target_position) or (
+                    # 雾里被守卫围满的重兵 Core（sighting 更新后）→ 释放换目标。
+                    visible_core is None
+                    and self._lightning_target_crowded(target_position)
+                ):
+                    # 对方上线造兵 / 重兵围守 → 永久黑名单，释放，不再回头。
+                    self.memory.lightning_blacklist.add(core_id)
                     self.memory.lightning_claims.pop(uid, None)
                     core_id = None
                     target_position = None
@@ -9601,10 +9692,17 @@ class SmartTactic:
                         f"target={target_position}"
                     )
                     self.memory.decision_totals["lightning:vanguard_sweep"] += 1
-                elif not planner.toward(
-                    vanguard, target_position, "lightning_hunt"
-                ):
-                    vanguard.wait()
+                else:
+                    # 朝目标走，但把守卫格+其邻格当障碍绕开（从侧面包抄），
+                    # 而不是正对守卫进退。toward 返回 False = 绕不开（被堵死）。
+                    guard_cells = self._lightning_guard_cells(turn, target_position)
+                    if not planner.toward(
+                        vanguard,
+                        target_position,
+                        "lightning_hunt",
+                        avoid=guard_cells,
+                    ):
+                        vanguard.wait()
                 acted_units.add(vanguard.id)
                 continue
             # 无猎杀目标 → 扇区探索，拓展视野，不出方框。
@@ -9639,7 +9737,11 @@ class SmartTactic:
                 target_position, visible_core = self._lightning_target_position(
                     turn, core_id
                 )
-                if self._lightning_target_attended(turn, target_position):
+                if self._lightning_target_attended(turn, target_position) or (
+                    visible_core is None
+                    and self._lightning_target_crowded(target_position)
+                ):
+                    self.memory.lightning_blacklist.add(core_id)
                     self.memory.lightning_claims.pop(uid, None)
                     core_id = None
                     target_position = None
@@ -9669,13 +9771,27 @@ class SmartTactic:
                     )
                     self.memory.decision_totals["lightning:ranger_shoot"] += 1
                 else:
-                    firing_cells = self._firing_cells(
-                        target_position, planner.obstacles
-                    )
+                    guard_cells = self._lightning_guard_cells(turn, target_position)
+                    firing_cells = {
+                        cell
+                        for cell in self._firing_cells(
+                            target_position, planner.obstacles
+                        )
+                        if cell not in guard_cells
+                    }
                     firing_target = (
                         min(
                             firing_cells,
                             key=lambda cell: (
+                                sum(
+                                    1
+                                    for g in turn.visible_enemies
+                                    if isinstance(g, UnitView)
+                                    and g.unit_type
+                                    in {UnitType.VANGUARD, UnitType.RANGER}
+                                    and _distance(cell, g.position)
+                                    <= LIGHTNING_HUNT_GUARD_CLOSE_RADIUS
+                                ),
                                 planner.final_occupancy(cell),
                                 planner.threat.get(cell, 0),
                                 _distance(ranger.position, cell),
@@ -9686,7 +9802,10 @@ class SmartTactic:
                         else target_position
                     )
                     if not planner.toward(
-                        ranger, firing_target, "lightning_hunt_seek_firing"
+                        ranger,
+                        firing_target,
+                        "lightning_hunt_seek_firing",
+                        avoid=guard_cells,
                     ):
                         ranger.wait()
                 acted_units.add(ranger.id)
@@ -10578,20 +10697,19 @@ class SmartTactic:
             )
         if not candidates:
             return
-        # 闪电模式被战斗单位包围：所有可行步都更靠近某个战斗单位 → 停下让 Core 修盾。
-        if noncombat_enemies_safe and combat_enemies:
-            best_closer_count = 0
-            total_enemies = len(combat_enemies)
-            for _, _, _, dest in candidates:
-                closer = sum(
-                    1
+        # 闪电模式被战斗单位包围兜底：≥2 个战斗单位从不同方向夹击，且不存在
+        # 任何"逃离方向"（比所有战斗单位都远）时，才停下修盾。单个战斗单位
+        # 总能绕开（评分惩罚已让 Core 选远离方向），不算包围。
+        if noncombat_enemies_safe and len(combat_enemies) >= 2:
+            has_escape = any(
+                all(
+                    _distance(dest, enemy.position)
+                    > _distance(core.position, enemy.position)
                     for enemy in combat_enemies
-                    if _distance(dest, enemy.position)
-                    < _distance(core.position, enemy.position)
                 )
-                if closer == total_enemies:
-                    best_closer_count += 1
-            if best_closer_count == len(candidates):
+                for _, _, _, dest in candidates
+            )
+            if not has_escape:
                 decisions.append("core patrol_hold reason=combat_surrounded")
                 self.memory.decision_totals["lightning:patrol_hold_combat"] += 1
                 return

@@ -7308,7 +7308,7 @@ class LightningModeTests(unittest.TestCase):
         self.assertEqual(action.direction, Direction.RIGHT)
 
     def test_releases_claim_when_enemy_vanguard_guards_target(self) -> None:
-        # 敌方先锋在目标 Core 旁（8 格内）→ 视为有守卫，先锋不应扑上去 sweep。
+        # 守卫贴脸目标 Core（1 格，≤close radius 3）→ 释放 claim，不扑上去 sweep。
         turn, _ = make_turn(
             own_core=self._box_core(),
             units=(vanguard((605, 600)),),
@@ -7327,6 +7327,73 @@ class LightningModeTests(unittest.TestCase):
             isinstance(action, SweepAction)
             and _destination((605, 600), action.direction) == (610, 600)
         )
+
+    def test_blacklists_crowded_core_permanently(self) -> None:
+        # 重兵 Core 一旦放弃 → 永久黑名单，即使之后 sighting 老化也不再 claim。
+        from arena_hero_strategy import EnemySighting
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        memory.enemy_sightings = {
+            "crowded-core": EnemySighting(position=(515, -216), seen_tick=1000, is_core=True),
+            "g-1": EnemySighting(position=(514, -214), seen_tick=1010, is_core=False),
+            "g-2": EnemySighting(position=(514, -218), seen_tick=1011, is_core=False),
+        }
+        memory.last_tick = 1015
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(vanguard((620, 600)),),
+        )
+        SmartTactic(memory).choose_actions(turn)
+        self.assertIn("crowded-core", memory.lightning_blacklist)
+        # 模拟 sighting 老化后（守卫 sighting 超龄，crowd 不再触发）仍不 claim。
+        memory.enemy_sightings = {
+            "crowded-core": EnemySighting(position=(515, -216), seen_tick=1000, is_core=True),
+        }
+        memory.last_tick = 9999  # 守卫 sighting 已删，即使还在黑名单也不 claim
+        turn2, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(vanguard((620, 600)),),
+        )
+        SmartTactic(memory).choose_actions(turn2)
+        self.assertEqual(memory.lightning_claims, {})
+        self.assertIn("crowded-core", memory.lightning_blacklist)
+
+    def test_skips_crowded_target_with_fogged_guards(self) -> None:
+        # 目标 Core 周围雾里有 2 个近期敌方 sighting（当前不可见）→ 视为重兵把守，
+        # 不 claim，先锋转扇区探索。补住"雾里守卫看不见→误判无护卫→凑过去卡死"。
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        from arena_hero_strategy import EnemySighting
+        memory.enemy_sightings = {
+            "core-1": EnemySighting(position=(515, -216), seen_tick=1000, is_core=True),
+            "g-1": EnemySighting(position=(514, -214), seen_tick=1010, is_core=False),
+            "g-2": EnemySighting(position=(514, -218), seen_tick=1011, is_core=False),
+        }
+        memory.last_tick = 1015
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(vanguard((620, 600)),),
+            # 当前视野无敌方单位（守卫在雾里）。
+        )
+        SmartTactic(memory).choose_actions(turn)
+        # 不 claim 重兵 Core。
+        self.assertEqual(memory.lightning_claims, {})
+
+    def test_keeps_claim_and_detours_around_distant_guard(self) -> None:
+        # 守卫在目标 5 格（>close 3，不贴脸）且不触发家防（离自家 Core 远）→
+        # 不释放 claim；先锋保留 claim，朝目标走但把守卫格当障碍绕开。
+        # 自家 Core (600,600)；敌方 Core (640,600)；守卫先锋 (635,600)（目标 5 格）。
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(vanguard((620, 600)),),
+            enemies=(
+                enemy_core((640, 600)),
+                enemy_vanguard((635, 600)),  # 目标和先锋之间，离目标 5 格
+            ),
+        )
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        SmartTactic(memory).choose_actions(turn)
+        # claim 保留（不释放）；先锋走了，不原地卡死。
+        self.assertEqual(len(memory.lightning_claims), 1)
+        self.assertIn(VANGUARD_ID, turn.plan.unit_actions)
 
     def test_patrol_waypoint_stays_inside_donut(self) -> None:
         memory = TacticMemory(mode=MODE_LIGHTNING)
@@ -7421,6 +7488,24 @@ class LightningModeTests(unittest.TestCase):
         SmartTactic(TacticMemory(mode=MODE_LIGHTNING)).choose_actions(turn)
         # 不产兵（攒钱等先锋），Core 转去巡逻；绝不在买不起先锋时 fallthrough 造工人。
         self.assertNotIsInstance(turn.plan.core_action, SpawnAction)
+
+    def test_sector_target_stays_near_units_quadrant(self) -> None:
+        # 回归：单位在第四象限 (y<0)，扇区目标不该在第一象限 (y>0)。
+        # 旧 bug 用固定四角把单位派去 (644,644)，要穿越原点。
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        tactic = SmartTactic(memory)
+        turn, _ = make_turn(
+            own_core=core((535, -201)),
+            units=(vanguard((516, -222)),),
+        )
+        sector = tactic._lightning_sector_target(turn, turn.vanguards[0])
+        self.assertIsNotNone(sector)
+        # 单位 y=-222（负），扇区目标也应在 y<0 半侧，不被派去 y>0。
+        self.assertLess(sector[1], 0, f"sector {sector} should stay in y<0 half")
+        # 且在方环内。
+        radius = max(abs(sector[0]), abs(sector[1]))
+        self.assertGreaterEqual(radius, 500)
+        self.assertLessEqual(radius, 700)
 
     def test_patrol_moves_toward_waypoint_not_origin(self) -> None:
         # Core 在 (535,-201)，最近巡逻角 (650,-650)。应朝巡逻点（远离原点）
