@@ -77,19 +77,6 @@ LIGHTNING_MAX_POPULATION = 10
 # 游侠同心周界 lane 间距：相邻游侠的方环半径错开 6 格（游侠视野 5，6>直径 10/2
 # 不重叠），径向铺开多条同心周界，N 游侠沿各自周界同向绕圈共同覆盖 Core 轨道。
 LIGHTNING_SCOUT_LANE_GAP = 6
-# 游侠防横跳窗口：最近这么多 tick 内若只在 ≤2 个格间打转（乱石堆死角、目标在
-# 障碍对侧导致 A* 抖动），跳过当前角推进下一角，换目标绕开卡死区。
-LIGHTNING_SCOUT_OSCILLATION_WINDOW = 6
-# 打转逃生：八方位探针，每方向评估前方扇区半径。
-LIGHTNING_ESCAPE_COMPASS = (
-    (1, 0), (1, 1), (0, 1), (-1, 1),
-    (-1, 0), (-1, -1), (0, -1), (1, -1),
-)
-LIGHTNING_ESCAPE_SECTOR_RADIUS = 3
-# 障碍密集判定:周围障碍占比 ≥ 此阈值视为乱石堆,持续触发逃生(连走多步出口袋)。
-LIGHTNING_CLUTTER_THRESHOLD = 0.18
-# 逃生冷却 tick 数:触发逃生后持续走这么多步,彻底脱离抖动区再恢复 toward。
-LIGHTNING_ESCAPE_COOLDOWN = 8
 # 先锋 V 字纵深出探的深度（一来回 ~64 tick，Core 1格/4tick 前进 ~16 格，
 # 下一轮覆盖全新带；内陆最远 32 格，危险时 ~16 tick 回防）。
 LIGHTNING_VEE_DEPTH = 32
@@ -588,8 +575,6 @@ class TacticMemory:
     # 游侠独立绕圈游标：UUID → 当前周界角序号(0..3)，到达角死区后推进。
     # 与 Core 位置解耦——游侠沿自己 lane 的周界独立绕圈，不等 Core。
     lightning_scout_phase: dict[str, int] = field(default_factory=dict)
-    # 游侠逃生冷却：UUID → 截止 tick。触发逃生后持续走几步(连走出口袋)再恢复 toward。
-    lightning_escape_until: dict[str, int] = field(default_factory=dict)
     # 先锋 V 字纵深状态机：UUID → {phase: "OUT"/"IN", leg: 0/1, origin: (x,y), target: (x,y)}。
     lightning_vee_state: dict[str, dict] = field(default_factory=dict)
     aggress_heal_rotations: dict[str, HealRotation] = field(default_factory=dict)
@@ -618,6 +603,8 @@ class TacticMemory:
     observations: list[str] = field(default_factory=list, repr=False)
     unit_positions: dict[str, Position] = field(default_factory=dict, repr=False)
     last_position_tick: dict[str, int] = field(default_factory=dict, repr=False)
+    # 每单位最近一次移动方向(惯性用,防绕圈掉头横跳)。运行时维护,repr=False。
+    unit_headings: dict[str, Direction] = field(default_factory=dict, repr=False)
     recent_positions: dict[str, list[Position]] = field(default_factory=dict, repr=False)
     enemy_positions: dict[str, Position] = field(default_factory=dict, repr=False)
     enemy_prev: dict[str, Position] = field(default_factory=dict, repr=False)
@@ -980,10 +967,6 @@ class TacticMemory:
                 str(unit_id): int(phase) % 4
                 for unit_id, phase in data.get("lightning_scout_phase", {}).items()
             }
-            memory.lightning_escape_until = {
-                str(unit_id): int(tick)
-                for unit_id, tick in data.get("lightning_escape_until", {}).items()
-            }
             memory.lightning_vee_state = {}
             for unit_id, state in data.get("lightning_vee_state", {}).items():
                 if not isinstance(state, dict):
@@ -1202,7 +1185,6 @@ class TacticMemory:
             },
             "lightning_scout_lanes": dict(sorted(self.lightning_scout_lanes.items())),
             "lightning_scout_phase": dict(sorted(self.lightning_scout_phase.items())),
-            "lightning_escape_until": dict(sorted(self.lightning_escape_until.items())),
             "lightning_vee_state": {
                 unit_id: {
                     "phase": state["phase"],
@@ -1654,13 +1636,18 @@ class TacticMemory:
         }
         if len(self.visited) > 10_000:
             self.visited = Counter(dict(self.visited.most_common(10_000)))
-        # 追踪单位位置（用于卡住检测：位置变化时刷新 tick）
+        # 追踪单位位置（用于卡住检测：位置变化时刷新 tick）+ 最近移动方向(惯性)。
         for unit in turn.units:
             uid = str(unit.id)
             previous = self.unit_positions.get(uid)
             self.unit_positions[uid] = unit.position
-            if previous != unit.position:
+            if previous != unit.position and previous is not None:
                 self.last_position_tick[uid] = turn.tick
+                # 推断移动方向(正交一格),用于游侠绕圈惯性防横跳。
+                for direction in DIRECTION_ORDER:
+                    if _destination(previous, direction) == unit.position:
+                        self.unit_headings[uid] = direction
+                        break
             recent = self.recent_positions.setdefault(uid, [])
             recent.append(unit.position)
             if len(recent) > STUCK_TICKS:
@@ -6965,7 +6952,6 @@ class SmartTactic:
         for dead in [k for k in self.memory.lightning_scout_lanes if k not in live]:
             self.memory.lightning_scout_lanes.pop(dead, None)
             self.memory.lightning_scout_phase.pop(dead, None)
-            self.memory.lightning_escape_until.pop(dead, None)
         live_lanes = sorted(
             self.memory.lightning_scout_lanes.items(), key=lambda kv: kv[1]
         )
@@ -7004,90 +6990,56 @@ class SmartTactic:
             return None
         return target
 
-    def _lightning_escape_direction(
+    def _lightning_step_toward(
         self,
         turn: Turn,
+        planner: MovementPlanner,
         unit: Unit,
-    ) -> tuple[int, int] | None:
-        """打转时的开阔逃生方向:八方位里选前方扇区最开阔的。
+        goal: Position,
+        reason: str,
+    ) -> bool:
+        """游侠绕圈单步移动:抄 Core 巡逻的四邻打分选择,不走 A*。
 
-        A* 绕圈遇死角时启发式死磕目标方向,不肯先远离障碍,导致横跳;且 A* 对
-        被障碍半围的点常返回空 path → toward 走 fallback 仍抖。这里直接评估
-        每方向前方 3 格半径扇区的障碍密度,选最开阔的方向给 dispatcher 单步
-        移动,强行脱离口袋后再恢复绕圈。同密度时偏好沿 Core 行进方向(别逆行)。
+        A*(_find_path)在乱石堆死角返回空 path、fallback 在两格间横跳;Core 巡逻
+        从不卡死是因为它只评估四邻 4 个方向:离目标最近 + 不撞障碍/敌人 + 方向惯性
+        (掉头重罚防横跳)。游侠绕圈照抄这套:四邻里选最优,遇到障碍方向直接跳过,
+        自然沿障碍轮廓绕行,不会抖。返回 True 表示已移动。
         """
-        obstacles = set(self.memory.known_obstacles) | set(turn.obstacle_cells)
-        pos = unit.position
-        fwd = self._lightning_core_heading_vector(turn)
-        r = LIGHTNING_ESCAPE_SECTOR_RADIUS
-        best_dir = None
-        best_score = (10 ** 9, 0)
-        for dx, dy in LIGHTNING_ESCAPE_COMPASS:
-            # 该方向前方扇区(r×r)内的障碍数;扇区沿 (dx,dy) 前移,覆盖真实绕行空间。
-            blocked = 0
-            total = 0
-            for ox in range(-r, r + 1):
-                for oy in range(-r, r + 1):
-                    # 只算前向半平面(与 (dx,dy) 同向),排除身后。
-                    if dx * ox + dy * oy < 0:
-                        continue
-                    cell = (pos[0] + dx * r + ox, pos[1] + dy * r + oy)
-                    total += 1
-                    if cell in obstacles:
-                        blocked += 1
-            fwd_dot = dx * fwd[0] + dy * fwd[1]
-            score = (blocked, -fwd_dot)
-            if score < best_score:
-                best_score = score
-                best_dir = (dx, dy)
-        if best_dir is None:
-            return None
-        # 游戏移动只支持正交(UP/DOWN/LEFT/RIGHT),对角逃生方向需降维到正交:
-        # 取 x、y 两分量中各自扇区更开阔的一个。
-        bx, by = best_dir
-        if bx != 0 and by != 0:
-            x_score = self._escape_axis_score(obstacles, pos, (bx, 0), r)
-            y_score = self._escape_axis_score(obstacles, pos, (0, by), r)
-            best_dir = (bx, 0) if x_score <= y_score else (0, by)
-        return best_dir
-
-    def _escape_axis_score(self, obstacles, pos, axis, r):
-        blocked = 0
-        dx, dy = axis
-        for ox in range(-r, r + 1):
-            for oy in range(-r, r + 1):
-                if dx * ox + dy * oy < 0:
-                    continue
-                if (pos[0] + dx * r + ox, pos[1] + dy * r + oy) in obstacles:
-                    blocked += 1
-        return blocked
-
-    def _lightning_is_oscillating(self, uid: str) -> bool:
-        """游侠最近窗口内是否在 ≤2 格间打转。"""
-        recent = self.memory.recent_positions.get(uid, [])
-        return (
-            len(recent) >= LIGHTNING_SCOUT_OSCILLATION_WINDOW
-            and len(set(recent[-LIGHTNING_SCOUT_OSCILLATION_WINDOW:])) <= 2
-        )
-
-    def _lightning_in_clutter(self, turn: Turn, unit: Unit) -> bool:
-        """游侠是否处在障碍密集区(3 格半径内障碍占比 ≥ 阈值)。
-
-        用于持续触发逃生:单步 escape 走 1 格后会脱出横跳窗口、却又陷回 toward
-        抖动;用"障碍密集"作持续触发,保证连走多步真正出口袋,直到进入开阔区。
-        """
-        obstacles = set(self.memory.known_obstacles) | set(turn.obstacle_cells)
-        pos = unit.position
-        r = LIGHTNING_ESCAPE_SECTOR_RADIUS
-        radius = r + 1  # 稍大一圈评估,确认还在密集区边缘
-        blocked = 0
-        total = 0
-        for ox in range(-radius, radius + 1):
-            for oy in range(-radius, radius + 1):
-                total += 1
-                if (pos[0] + ox, pos[1] + oy) in obstacles:
-                    blocked += 1
-        return total > 0 and blocked / total >= LIGHTNING_CLUTTER_THRESHOLD
+        if unit.position == goal:
+            return False
+        # 该单位最近一次移动方向,用于惯性(防掉头横跳)。
+        heading = self.memory.unit_headings.get(str(unit.id))
+        candidates: list[tuple[float, int, Direction]] = []
+        for direction in DIRECTION_ORDER:
+            destination = _destination(unit.position, direction)
+            if (
+                destination in planner.obstacles
+                or destination in planner.enemy_cells
+                or planner.final_occupancy(destination) >= 2
+            ):
+                continue
+            # 方向惯性:掉头反向重罚,保持当前方向无罚,转弯轻罚。
+            if heading is None:
+                heading_penalty = 0.0
+            elif direction == heading:
+                heading_penalty = 0.0
+            elif direction == OPPOSITE_DIRECTION[heading]:
+                heading_penalty = 6.0
+            else:
+                heading_penalty = 1.0
+            target_distance = _distance(destination, goal)
+            score = (
+                target_distance
+                + planner.threat.get(destination, 0) * 4.0
+                + heading_penalty
+                # 轻微偏好未走过的格,避免在环上反复蹭同一片。
+                + min(6.0, self.memory.visited.get(destination, 0) * 0.05)
+            )
+            candidates.append((score, DIRECTION_RANK[direction], direction))
+        if not candidates:
+            return False
+        _, _, best = min(candidates, key=lambda triple: (triple[0], triple[1]))
+        return planner._queue(unit, best, reason, goal=goal)
 
     def _lightning_vanguard_vee_target(
         self,
@@ -10051,10 +10003,11 @@ class SmartTactic:
                         vanguard.wait()
                 acted_units.add(vanguard.id)
                 continue
-            # 无猎杀目标 → V 字纵深出探（正交于 Core 行进方向深入内陆）。
+            # 无猎杀目标 → V 字纵深出探（正交于 Core 行进方向深入内陆）。同样
+            # 不走 A*，用 Core 风格四邻打分单步(防乱石堆横跳)。
             vee = self._lightning_vanguard_vee_target(turn, vanguard)
-            if vee is not None and not planner.toward(
-                vanguard, vee, "lightning_vanguard_vee"
+            if vee is not None and not self._lightning_step_toward(
+                turn, planner, vanguard, vee, "lightning_vanguard_vee"
             ):
                 vanguard.wait()
             acted_units.add(vanguard.id)
@@ -10155,51 +10108,15 @@ class SmartTactic:
                         ranger.wait()
                 acted_units.add(ranger.id)
                 continue
-            # 无猎杀目标 → 同心环绕圈侦察。乱石堆里 A* 会抖动(目标在障碍对侧时
-            # fallback 在两格间横跳)且对被障碍半围的点常返回空 path。故先判是否
-            # 卡在障碍区(横跳 或 周围障碍密集 或 仍在逃生冷却):是则绕过 A*、
-            # 持续单步朝开阔方向逃生。单步走 1 格不够(脱窗/出密集区后又陷抖动),
-            # 故触发后设一段冷却期,保证连走多步真正出口袋再恢复 toward。
-            uid_r = str(ranger.id)
-            now = turn.tick
-            in_escape = (
-                self._lightning_is_oscillating(uid_r)
-                or self._lightning_in_clutter(turn, ranger)
-                or self.memory.lightning_escape_until.get(uid_r, 0) > now
-            )
-            if in_escape:
-                escaped = False
-                esc_dir = self._lightning_escape_direction(turn, ranger)
-                if esc_dir is not None:
-                    direction = next(
-                        (
-                            cand
-                            for cand in DIRECTION_ORDER
-                            if cand.delta == esc_dir
-                        ),
-                        None,
-                    )
-                    if direction is not None and planner._queue(
-                        ranger, direction, "lightning_ranger_escape"
-                    ):
-                        escaped = True
-                        self.memory.decision_totals["lightning:ranger_escape"] += 1
-                        # 延长冷却:走出密集区后仍继续几步,彻底脱离抖动区。
-                        self.memory.lightning_escape_until[uid_r] = (
-                            now + LIGHTNING_ESCAPE_COOLDOWN
-                        )
-                if not escaped:
-                    scout = self._lightning_ranger_scout_target(turn, ranger)
-                    if scout is None or not planner.toward(
-                        ranger, scout, "lightning_ranger_scout"
-                    ):
-                        ranger.wait()
-            else:
-                scout = self._lightning_ranger_scout_target(turn, ranger)
-                if scout is not None and not planner.toward(
-                    ranger, scout, "lightning_ranger_scout"
-                ):
-                    ranger.wait()
+            # 无猎杀目标 → 同心环绕圈侦察。游侠绕圈**不走 A***(_find_path 在乱石
+            # 堆死角会返回空 path、fallback 在两格间横跳),改用 Core 巡逻同款的
+            # 四邻打分单步选择:朝当前周界角,四邻里选离角最近、不撞障碍、且带方向
+            # 惯性的格。Core 这套从不卡死,游侠照抄即可。
+            scout = self._lightning_ranger_scout_target(turn, ranger)
+            if scout is not None and not self._lightning_step_toward(
+                turn, planner, ranger, scout, "lightning_ranger_scout"
+            ):
+                ranger.wait()
             acted_units.add(ranger.id)
 
     def _core_patrol_slots(

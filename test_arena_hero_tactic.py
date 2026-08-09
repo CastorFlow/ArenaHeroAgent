@@ -7551,51 +7551,38 @@ class LightningModeTests(unittest.TestCase):
             self.assertGreaterEqual(max(abs(s[0]), abs(s[1])), 500)
             self.assertLessEqual(max(abs(s[0]), abs(s[1])), 700)
 
-    def test_ranger_scout_escape_when_oscillating(self) -> None:
-        # 游侠横跳(乱石堆死角)→ _lightning_escape_direction 选开阔方向。
-        # 空旷地形(无障碍)时八方位扇区障碍数全 0,同分按 fwd 分量 → 朝 Core 行进方向。
+    def test_ranger_step_does_not_use_astar(self) -> None:
+        # 游侠绕圈走 Core 风格四邻打分(_lightning_step_toward),不走 A*。
+        # 空旷地形朝目标角单调推进,产生 lightning_ranger_scout 决策(非 fallback)。
+        from arena_hero_strategy import MovementPlanner
         memory = TacticMemory(mode=MODE_LIGHTNING)
-        memory.lightning_patrol_phase = 0  # Core 朝第一象限角 → fwd=(+,+)
+        memory.lightning_patrol_phase = 2  # 目标第三象限角 (-650,-650)
         tactic = SmartTactic(memory)
         turn, _ = make_turn(
             own_core=core((600, 600)),
             units=(ranger((645, 646), UUID(int=0xB005)),),
         )
-        esc_dir = tactic._lightning_escape_direction(turn, turn.rangers[0])
-        self.assertIsNotNone(esc_dir)
-        # 逃生方向朝 Core 行进方向(+x, +y)。
-        self.assertGreaterEqual(esc_dir[0], 0, f"escape {esc_dir} should lean +x")
-        self.assertGreaterEqual(esc_dir[1], 0, f"escape {esc_dir} should lean +y")
-        self.assertTrue(esc_dir[0] > 0 or esc_dir[1] > 0)
-
-    def test_ranger_scout_escape_out_of_obstacle_pocket(self) -> None:
-        # 游侠被障碍墙半围、周界角在墙对侧 → A* 死磕墙抖动;横跳后逃生方向应朝
-        # 开阔侧(右侧),通过 _lightning_escape_direction 选出。
-        memory = TacticMemory(mode=MODE_LIGHTNING)
-        memory.lightning_patrol_phase = 2  # Core 朝第三象限角 → fwd=(-,-),左下
-        tactic = SmartTactic(memory)
-        # 游侠在 (650, -653),左/下/上是障碍墙(真口袋),右侧 x+ 开阔。
-        walls = tuple((x, -653) for x in range(645, 650))  # 左侧墙
-        walls += tuple((650, y) for y in range(-656, -653))  # 下方墙
-        walls += tuple((650, y) for y in range(-653, -650))  # 上方墙
-        turn, _ = make_turn(
-            own_core=core((600, 600)),
-            units=(ranger((650, -653), UUID(int=0xB006)),),
-            obstacle_cells=walls,
+        decisions: list[str] = []
+        planner = MovementPlanner(turn, memory, decisions)
+        tactic._choose_rangers_lightning(turn, planner, set(), decisions)
+        # 产生了 scout 决策,且不是 fallback(A* 抖动的标志)。
+        self.assertTrue(
+            any("reason=lightning_ranger_scout" in d for d in decisions),
+            f"expected scout step decision, got {decisions}",
         )
-        # 把障碍记入 known_obstacles(扇区评估用它 + turn.obstacle_cells)。
-        memory.known_obstacles = set(walls)
-        esc_dir = tactic._lightning_escape_direction(turn, turn.rangers[0])
-        self.assertIsNotNone(esc_dir)
-        # 逃生应朝开阔的右侧(+x),而非朝墙的左侧/上下。
-        self.assertGreater(esc_dir[0], 0, f"escape dir {esc_dir} should head +x (open side)")
+        self.assertFalse(
+            any(":fallback" in d for d in decisions),
+            f"should not use A* fallback, got {decisions}",
+        )
 
-    def test_ranger_escape_moves_when_oscillating(self) -> None:
-        # 端到端:游侠横跳 + 被墙半围 → dispatcher 应直接单步逃生(不走 A*),
-        # 产生 lightning_ranger_escape 决策,而非 fallback 抖动。
+    def test_ranger_step_follows_obstacle_contour_no_oscillation(self) -> None:
+        # 游侠遇障碍墙时四邻打分会沿轮廓绕行(选不撞墙且离目标近的方向),
+        # 不会在两格间横跳。墙在左侧、目标在更左 → 游侠应朝上下绕,而非撞墙抖。
+        from arena_hero_strategy import MovementPlanner
         memory = TacticMemory(mode=MODE_LIGHTNING)
-        memory.lightning_patrol_phase = 2
+        memory.lightning_patrol_phase = 2  # 目标 (-650,-650),在左下
         tactic = SmartTactic(memory)
+        # 游侠在 (650,-653),左侧一堵墙挡住去路。
         walls = tuple((x, -653) for x in range(645, 650))
         turn, _ = make_turn(
             own_core=core((600, 600)),
@@ -7603,15 +7590,36 @@ class LightningModeTests(unittest.TestCase):
             obstacle_cells=walls,
         )
         memory.known_obstacles = set(walls)
-        uid = str(turn.rangers[0].id)
-        memory.recent_positions[uid] = [(650, -653), (649, -653)] * 3
         decisions: list[str] = []
-        from arena_hero_strategy import MovementPlanner
         planner = MovementPlanner(turn, memory, decisions)
-        tactic._choose_rangers_lightning(turn, planner, set(), decisions)
-        self.assertTrue(
-            any("lightning_ranger_escape" in d for d in decisions),
-            f"expected escape decision, got {decisions}",
+        # 连走 6 步,每步重建 planner 模拟游侠移动,断言不在两格间横跳。
+        positions = [(650, -653)]
+        uid = str(turn.rangers[0].id)
+        for _ in range(6):
+            decisions_step: list[str] = []
+            r_unit = ranger(positions[-1], UUID(int=0xB006))
+            step_turn, _ = make_turn(
+                own_core=core((600, 600)),
+                units=(r_unit,),
+                obstacle_cells=walls,
+            )
+            planner_step = MovementPlanner(step_turn, memory, decisions_step)
+            tactic._choose_rangers_lightning(step_turn, planner_step, set(), decisions_step)
+            # 找出这一步游侠去了哪。
+            moved = False
+            for d in decisions_step:
+                if "ranger:" in d and " to=" in d and "WAIT" not in d:
+                    to = d.split("to=")[1].split()
+                    pos = (int(to[0].strip("(,")), int(to[1].strip(")")))
+                    positions.append(pos)
+                    moved = True
+                    break
+            if not moved:
+                positions.append(positions[-1])
+        # 6 步内至少走到 4 个不同格(不在 ≤2 格间横跳)。
+        uniq = len(set(positions))
+        self.assertGreaterEqual(
+            uniq, 4, f"ranger stuck oscillating: {positions}"
         )
 
     def test_ranger_scout_aligns_to_core_patrol_phase(self) -> None:
