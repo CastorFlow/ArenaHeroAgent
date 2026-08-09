@@ -88,6 +88,8 @@ LIGHTNING_ESCAPE_COMPASS = (
 LIGHTNING_ESCAPE_SECTOR_RADIUS = 3
 # 障碍密集判定:周围障碍占比 ≥ 此阈值视为乱石堆,持续触发逃生(连走多步出口袋)。
 LIGHTNING_CLUTTER_THRESHOLD = 0.18
+# 逃生冷却 tick 数:触发逃生后持续走这么多步,彻底脱离抖动区再恢复 toward。
+LIGHTNING_ESCAPE_COOLDOWN = 8
 # 先锋 V 字纵深出探的深度（一来回 ~64 tick，Core 1格/4tick 前进 ~16 格，
 # 下一轮覆盖全新带；内陆最远 32 格，危险时 ~16 tick 回防）。
 LIGHTNING_VEE_DEPTH = 32
@@ -586,6 +588,8 @@ class TacticMemory:
     # 游侠独立绕圈游标：UUID → 当前周界角序号(0..3)，到达角死区后推进。
     # 与 Core 位置解耦——游侠沿自己 lane 的周界独立绕圈，不等 Core。
     lightning_scout_phase: dict[str, int] = field(default_factory=dict)
+    # 游侠逃生冷却：UUID → 截止 tick。触发逃生后持续走几步(连走出口袋)再恢复 toward。
+    lightning_escape_until: dict[str, int] = field(default_factory=dict)
     # 先锋 V 字纵深状态机：UUID → {phase: "OUT"/"IN", leg: 0/1, origin: (x,y), target: (x,y)}。
     lightning_vee_state: dict[str, dict] = field(default_factory=dict)
     aggress_heal_rotations: dict[str, HealRotation] = field(default_factory=dict)
@@ -976,6 +980,10 @@ class TacticMemory:
                 str(unit_id): int(phase) % 4
                 for unit_id, phase in data.get("lightning_scout_phase", {}).items()
             }
+            memory.lightning_escape_until = {
+                str(unit_id): int(tick)
+                for unit_id, tick in data.get("lightning_escape_until", {}).items()
+            }
             memory.lightning_vee_state = {}
             for unit_id, state in data.get("lightning_vee_state", {}).items():
                 if not isinstance(state, dict):
@@ -1194,6 +1202,7 @@ class TacticMemory:
             },
             "lightning_scout_lanes": dict(sorted(self.lightning_scout_lanes.items())),
             "lightning_scout_phase": dict(sorted(self.lightning_scout_phase.items())),
+            "lightning_escape_until": dict(sorted(self.lightning_escape_until.items())),
             "lightning_vee_state": {
                 unit_id: {
                     "phase": state["phase"],
@@ -6956,6 +6965,7 @@ class SmartTactic:
         for dead in [k for k in self.memory.lightning_scout_lanes if k not in live]:
             self.memory.lightning_scout_lanes.pop(dead, None)
             self.memory.lightning_scout_phase.pop(dead, None)
+            self.memory.lightning_escape_until.pop(dead, None)
         live_lanes = sorted(
             self.memory.lightning_scout_lanes.items(), key=lambda kv: kv[1]
         )
@@ -10147,11 +10157,17 @@ class SmartTactic:
                 continue
             # 无猎杀目标 → 同心环绕圈侦察。乱石堆里 A* 会抖动(目标在障碍对侧时
             # fallback 在两格间横跳)且对被障碍半围的点常返回空 path。故先判是否
-            # 卡在障碍区(横跳 或 周围障碍密集):是则绕过 A*、持续单步朝开阔方向
-            # 逃生,直到脱离密集区再恢复绕圈。单步走 1 格不够(脱窗后又陷抖动),
-            # 故用"障碍密集"作持续触发,保证连走多步真正出口袋。
+            # 卡在障碍区(横跳 或 周围障碍密集 或 仍在逃生冷却):是则绕过 A*、
+            # 持续单步朝开阔方向逃生。单步走 1 格不够(脱窗/出密集区后又陷抖动),
+            # 故触发后设一段冷却期,保证连走多步真正出口袋再恢复 toward。
             uid_r = str(ranger.id)
-            if self._lightning_is_oscillating(uid_r) or self._lightning_in_clutter(turn, ranger):
+            now = turn.tick
+            in_escape = (
+                self._lightning_is_oscillating(uid_r)
+                or self._lightning_in_clutter(turn, ranger)
+                or self.memory.lightning_escape_until.get(uid_r, 0) > now
+            )
+            if in_escape:
                 escaped = False
                 esc_dir = self._lightning_escape_direction(turn, ranger)
                 if esc_dir is not None:
@@ -10168,8 +10184,11 @@ class SmartTactic:
                     ):
                         escaped = True
                         self.memory.decision_totals["lightning:ranger_escape"] += 1
+                        # 延长冷却:走出密集区后仍继续几步,彻底脱离抖动区。
+                        self.memory.lightning_escape_until[uid_r] = (
+                            now + LIGHTNING_ESCAPE_COOLDOWN
+                        )
                 if not escaped:
-                    # 逃生方向被占/堵 → 退而走 toward 的 fallback(总比干等好)。
                     scout = self._lightning_ranger_scout_target(turn, ranger)
                     if scout is None or not planner.toward(
                         ranger, scout, "lightning_ranger_scout"
