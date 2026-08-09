@@ -7551,6 +7551,29 @@ class LightningModeTests(unittest.TestCase):
             self.assertGreaterEqual(max(abs(s[0]), abs(s[1])), 500)
             self.assertLessEqual(max(abs(s[0]), abs(s[1])), 700)
 
+    def test_ranger_scout_skips_corner_when_oscillating(self) -> None:
+        # 游侠在两格间横跳(乱石堆死角)→ 跳过当前角推进下一角,换目标绕开。
+        from arena_hero_strategy import LIGHTNING_SCOUT_OSCILLATION_WINDOW
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        memory.lightning_patrol_phase = 0  # 第一象限角
+        tactic = SmartTactic(memory)
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(ranger((645, 646), UUID(int=0xB005)),),
+        )
+        uid = str(turn.rangers[0].id)
+        # 模拟横跳:recent_positions 在 (645,646)/(646,646) 间反复。
+        memory.recent_positions[uid] = [
+            (645, 646), (646, 646), (645, 646), (646, 646),
+            (645, 646), (646, 646),
+        ][:LIGHTNING_SCOUT_OSCILLATION_WINDOW]
+        self.assertGreaterEqual(
+            len(memory.recent_positions[uid]), LIGHTNING_SCOUT_OSCILLATION_WINDOW
+        )
+        tactic._lightning_ranger_scout_target(turn, turn.rangers[0])
+        # 横跳检测触发 → phase 推进(从 0 到 1),换角。
+        self.assertEqual(memory.lightning_scout_phase[uid], 1)
+
     def test_ranger_scout_aligns_to_core_patrol_phase(self) -> None:
         # 游侠首次探路的角应跟 Core 巡逻 phase 对齐(朝 Core 前方),而非最近角。
         # Core 巡逻 phase=2 → 第三象限角 (-650,-650);游侠即使在第一象限附近,

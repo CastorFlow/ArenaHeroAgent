@@ -77,6 +77,9 @@ LIGHTNING_MAX_POPULATION = 10
 # 游侠同心周界 lane 间距：相邻游侠的方环半径错开 6 格（游侠视野 5，6>直径 10/2
 # 不重叠），径向铺开多条同心周界，N 游侠沿各自周界同向绕圈共同覆盖 Core 轨道。
 LIGHTNING_SCOUT_LANE_GAP = 6
+# 游侠防横跳窗口：最近这么多 tick 内若只在 ≤2 个格间打转（乱石堆死角、目标在
+# 障碍对侧导致 A* 抖动），跳过当前角推进下一角，换目标绕开卡死区。
+LIGHTNING_SCOUT_OSCILLATION_WINDOW = 6
 # 先锋 V 字纵深出探的深度（一来回 ~64 tick，Core 1格/4tick 前进 ~16 格，
 # 下一轮覆盖全新带；内陆最远 32 格，危险时 ~16 tick 回防）。
 LIGHTNING_VEE_DEPTH = 32
@@ -6975,6 +6978,17 @@ class SmartTactic:
         target = corners[phase]
         # 到达当前角死区 → 推进下一角(独立绕圈,不等 Core)。
         if _distance(ranger.position, target) <= CORE_BEACON_HYSTERESIS:
+            phase = (phase + 1) % 4
+            self.memory.lightning_scout_phase[uid] = phase
+            target = corners[phase]
+        # 防横跳:若最近若干 tick 在 ≤2 个格间打转(乱石堆死角、目标在障碍对侧
+        # 导致 A* 抖动),跳过当前角推进到下一角,换目标绕开卡死区。
+        recent = self.memory.recent_positions.get(uid, [])
+        if (
+            len(recent) >= LIGHTNING_SCOUT_OSCILLATION_WINDOW
+            and len(set(recent[-LIGHTNING_SCOUT_OSCILLATION_WINDOW:])) <= 2
+            and _distance(ranger.position, target) > CORE_BEACON_HYSTERESIS
+        ):
             phase = (phase + 1) % 4
             self.memory.lightning_scout_phase[uid] = phase
             target = corners[phase]
