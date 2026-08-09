@@ -74,6 +74,19 @@ LIGHTNING_CROWD_SIGHTING_MAX_AGE = 40
 LIGHTNING_SECTOR_STEP = 6
 # 闪电模式常驻兵力上限（不触 20 人口涨价档）。
 LIGHTNING_MAX_POPULATION = 10
+# 游侠并排探路：在 Core 前方领先格数（刚好出 Core 视野 5 之外铺新视野）。
+LIGHTNING_SCOUT_LEAD = 8
+# 游侠相邻侦察 lane 间距：游侠视野 5，两 lane 中心错开 6 格则相邻视野留 1 格缝
+# 不重叠（中心距 6 > 直径 10/2=5 → 各自视野边缘留 1 格缝）。奇数游侠以中轴对称展开。
+LIGHTNING_SCOUT_LANE_GAP = 6
+# 先锋 V 字纵深出探的深度（一来回 ~64 tick，Core 1格/4tick 前进 ~16 格，
+# 下一轮覆盖全新带；内陆最远 32 格，危险时 ~16 tick 回防）。
+LIGHTNING_VEE_DEPTH = 32
+LIGHTNING_VEE_REACH_TOLERANCE = 3
+LIGHTNING_VEE_HOME_TOLERANCE = 5
+# 同一敌方 Core 最多多少单位同时集火（防全员扑一个导致 Core 失防、或扑远目标
+# 时旁边敌方 Core 没人盯）。
+LIGHTNING_FOCUS_MAX_ATTACKERS = 3
 DEVELOP_TARGET_WORKERS = 12
 DEVELOP_TARGET_VANGUARDS = 3
 DEVELOP_TARGET_RANGERS = 3
@@ -559,6 +572,10 @@ class TacticMemory:
     # 送来新的无护卫 Core，没必要死磕被围住的。acquire 永久跳过这些 ID。
     lightning_blacklist: set[str] = field(default_factory=set)
     lightning_sectors: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # 游侠并排探路：UUID → 固定 lane index（单条数轴上奇数位对称展开，防相位抖动）。
+    lightning_scout_lanes: dict[str, int] = field(default_factory=dict)
+    # 先锋 V 字纵深状态机：UUID → {phase: "OUT"/"IN", leg: 0/1, origin: (x,y), target: (x,y)}。
+    lightning_vee_state: dict[str, dict] = field(default_factory=dict)
     aggress_heal_rotations: dict[str, HealRotation] = field(default_factory=dict)
     aggress_heal_role_swaps: list[HealRoleSwap] = field(default_factory=list)
     aggress_beacon_guard_carrier_id: str | None = None
@@ -939,6 +956,28 @@ class TacticMemory:
                 for unit_id, sector in raw_sectors.items()
                 if isinstance(sector, list) and len(sector) == 2
             }
+            memory.lightning_scout_lanes = {
+                str(unit_id): int(lane)
+                for unit_id, lane in data.get("lightning_scout_lanes", {}).items()
+            }
+            memory.lightning_vee_state = {}
+            for unit_id, state in data.get("lightning_vee_state", {}).items():
+                if not isinstance(state, dict):
+                    continue
+                origin = state.get("origin")
+                target = state.get("target")
+                if (
+                    isinstance(origin, list)
+                    and len(origin) == 2
+                    and isinstance(target, list)
+                    and len(target) == 2
+                ):
+                    memory.lightning_vee_state[str(unit_id)] = {
+                        "phase": str(state.get("phase", "OUT")),
+                        "leg": int(state.get("leg", 0)),
+                        "origin": (int(origin[0]), int(origin[1])),
+                        "target": (int(target[0]), int(target[1])),
+                    }
             return memory
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             return cls()
@@ -1136,6 +1175,16 @@ class TacticMemory:
             "lightning_sectors": {
                 unit_id: [sector[0], sector[1]]
                 for unit_id, sector in sorted(self.lightning_sectors.items())
+            },
+            "lightning_scout_lanes": dict(sorted(self.lightning_scout_lanes.items())),
+            "lightning_vee_state": {
+                unit_id: {
+                    "phase": state["phase"],
+                    "leg": state["leg"],
+                    "origin": [state["origin"][0], state["origin"][1]],
+                    "target": [state["target"][0], state["target"][1]],
+                }
+                for unit_id, state in sorted(self.lightning_vee_state.items())
             },
         }
         temporary = path.with_suffix(path.suffix + ".tmp")
@@ -6730,27 +6779,53 @@ class SmartTactic:
                 cells.add((enemy.position[0] + dx, enemy.position[1] + dy))
         return cells
 
+    def _lightning_blacklist_core(self, core_id: str) -> None:
+        """把一个敌方 Core 永久拉黑:释放所有 claim 它的单位(集火编队同步撤退),
+        从 sightings 清脏数据。供"判为重兵把守"时统一调用。
+        """
+        self.memory.lightning_blacklist.add(core_id)
+        owners = [
+            uid
+            for uid, cid in self.memory.lightning_claims.items()
+            if cid == core_id
+        ]
+        for uid in owners:
+            self.memory.lightning_claims.pop(uid, None)
+        self.memory.enemy_sightings.pop(core_id, None)
+
     def _lightning_acquire_target(
         self,
         turn: Turn,
         unit: Unit,
     ) -> str | None:
-        """Claim the nearest recorded unguarded enemy core not already claimed."""
-        claimed_by_others = set(self.memory.lightning_claims.values())
+        """Claim the nearest recorded unguarded enemy core, forming focus fire.
+
+        不排除被其他 unit claim 的目标——同一 Core 允许多 unit 集火,自然汇聚。
+        防全员扑一个致 Core 失防:某 Core 已被 ≥ LIGHTNING_FOCUS_MAX_ATTACKERS 个
+        unit claim 时,跳过它选下一个合格目标。
+        """
+        claim_counts: dict[str, int] = {}
+        for core_id in self.memory.lightning_claims.values():
+            claim_counts[core_id] = claim_counts.get(core_id, 0) + 1
         candidates: list[tuple[str, EnemySighting]] = []
-        for core_id, sighting in self.memory.enemy_sightings.items():
-            if not sighting.is_core or core_id in claimed_by_others:
+        # 遍历快照:主体内可能因 _lightning_blacklist_core 删 sightings 改字典大小。
+        for core_id, sighting in list(self.memory.enemy_sightings.items()):
+            if not sighting.is_core:
                 continue
             if core_id in self.memory.lightning_blacklist:
-                # 永久放弃过的重兵 Core，不再回头。
+                # 永久放弃过的重兵 Core，不再回头;顺手从 sightings 清脏。
+                self.memory.enemy_sightings.pop(core_id, None)
+                continue
+            if claim_counts.get(core_id, 0) >= LIGHTNING_FOCUS_MAX_ATTACKERS:
+                # 已集火满员 → 跳过选下一个,防 Core 失防。
                 continue
             if self._lightning_target_attended(turn, sighting.position):
-                # 贴脸有守卫 → 黑名单，永久跳过。
-                self.memory.lightning_blacklist.add(core_id)
+                # 贴脸有守卫 → 黑名单，永久跳过;同步清 sightings 脏数据。
+                self._lightning_blacklist_core(core_id)
                 continue
             if self._lightning_target_crowded(sighting.position):
-                # 雾里也围着守卫的重兵 Core → 黑名单，永久放弃。
-                self.memory.lightning_blacklist.add(core_id)
+                # 雾里也围着守卫的重兵 Core → 黑名单，永久放弃;清脏。
+                self._lightning_blacklist_core(core_id)
                 continue
             candidates.append((core_id, sighting))
         if not candidates:
@@ -6803,6 +6878,149 @@ class SmartTactic:
                 (round(tx * scale), round(ty * scale))
             )
         if target == unit.position:
+            return None
+        return target
+
+    def _lightning_core_heading_vector(self, turn: Turn) -> tuple[int, int]:
+        """Core 预定行进单位向量(从当前巡逻 waypoint 推出,归一化)。
+
+        waypoint - core.position 取主轴方向归一化为单位向量;若 Core 已到角死区
+        (差很小)用当前 phase 的下一角;再不行用 memory.core_heading;最后 UP 兜底。
+        返回 (dx, dy),至少一个分量为 ±1。用于游侠/先锋算"前方"与"正交"铺视野。
+        """
+        core = turn.core
+        if core is None:
+            return (0, 1)
+        waypoint = self._lightning_patrol_waypoint(turn)
+        dx = waypoint[0] - core.position[0]
+        dy = waypoint[1] - core.position[1]
+        # 死区(已到角):用下一角避免方向归零。
+        if abs(dx) <= CORE_BEACON_HYSTERESIS and abs(dy) <= CORE_BEACON_HYSTERESIS:
+            pr = self._lightning_patrol_radius()
+            corners = ((pr, pr), (pr, -pr), (-pr, -pr), (-pr, pr))
+            nxt = (self.memory.lightning_patrol_phase + 1) % 4
+            dx = corners[nxt][0] - core.position[0]
+            dy = corners[nxt][1] - core.position[1]
+        if dx == 0 and dy == 0:
+            heading = self.memory.core_heading
+            if heading is not None:
+                return (heading.delta[0], heading.delta[1])
+            return (0, 1)
+        # 归一化为单位向量(保留两轴对角方向):每轴 ±1 或 0。
+        sx = (dx > 0) - (dx < 0)
+        sy = (dy > 0) - (dy < 0)
+        return (sx, sy)
+
+    def _lightning_ranger_scout_target(
+        self,
+        turn: Turn,
+        ranger: Unit,
+    ) -> Position | None:
+        """游侠并排探路点:沿 Core 行进方向领先 LEAD 格,横向按 lane 错开铺视野。
+
+        相邻 lane 间距 = LIGHTNING_SCOUT_LANE_GAP(> 游侠视野直径,视野不重叠)。
+        lane 横向偏移相对 Core 对称分布:奇数单位以中轴为锚、偶数向两边展开,
+        让 N 个游侠在 Core 前方排成一条与行进方向垂直的横线,把视野铺开。
+        钳到方环内(_lightning_clamp_to_donut)防越框。
+        """
+        core = turn.core
+        if core is None:
+            return None
+        fwd = self._lightning_core_heading_vector(turn)
+        # 正交向量(行进方向逆时针 90°):用作横向 lane 铺开方向。
+        perp = (-fwd[1], fwd[0])
+        # 按 UUID 序给固定 lane index(认领一次后持久,防每 tick 重排抖动)。
+        ordered = sorted(turn.rangers, key=_uuid_key)
+        uid = str(ranger.id)
+        if uid not in self.memory.lightning_scout_lanes:
+            self.memory.lightning_scout_lanes[uid] = len(ordered)
+        # 清理已不在场的游侠 lane 槽。
+        live = {str(r.id) for r in turn.rangers}
+        for dead in [k for k in self.memory.lightning_scout_lanes if k not in live]:
+            self.memory.lightning_scout_lanes.pop(dead, None)
+        # 重排 lane index 为 0..N-1 紧凑序。
+        live_lanes = sorted(
+            self.memory.lightning_scout_lanes.items(), key=lambda kv: kv[1]
+        )
+        compact = {
+            uid_: i for i, (uid_, _) in enumerate(live_lanes)
+        }
+        self.memory.lightning_scout_lanes = compact
+        lane = compact.get(uid, 0)
+        n = max(1, len(compact))
+        # 对称展开:lane 0..N-1 映射到 [-半, +半] 范围内的整数偏移。
+        half = (n - 1) / 2
+        offset = int(round((lane - half) * LIGHTNING_SCOUT_LANE_GAP))
+        target = (
+            core.position[0] + fwd[0] * LIGHTNING_SCOUT_LEAD + perp[0] * offset,
+            core.position[1] + fwd[1] * LIGHTNING_SCOUT_LEAD + perp[1] * offset,
+        )
+        target = self._lightning_clamp_to_donut(target)
+        if target == ranger.position:
+            return None
+        return target
+
+    def _lightning_vanguard_vee_target(
+        self,
+        turn: Turn,
+        vanguard: Unit,
+    ) -> Position | None:
+        """先锋 V 字纵深猎杀的下一目标点(出探机状态机)。
+
+        OUTBOUND:从 origin 沿 Core 行进方向的正交方向深入 LIGHTNING_VEE_DEPTH 格
+        (leg 0 正向、leg 1 反向,两腿成 V);到达(距目标 ≤ REACH_TOLERANCE)翻 INBOUND。
+        INBOUND:朝当前 Core 位置走;到达 ≤ HOME_TOLERANCE 翻 OUTBOUND,leg 翻转,
+        origin 重设为当前 Core 位置(Core 已前移,下一轮扫新地带)。
+        目标均钳到方环内防越框;翻 INBOUND 的"Core 受威胁"触发由上游 _choose_vanguards_recall
+        强召回处理,这里只管"周期返"。
+        """
+        core = turn.core
+        if core is None:
+            return None
+        uid = str(vanguard.id)
+        state = self.memory.lightning_vee_state.get(uid)
+        fwd = self._lightning_core_heading_vector(turn)
+        perp = (-fwd[1], fwd[0])
+        if state is None:
+            # 首次:OUTBOUND,以当前位置为 origin,目标正交方向纵深 D。
+            origin = vanguard.position
+            sign = 1
+            target = self._lightning_clamp_to_donut(
+                (origin[0] + perp[0] * LIGHTNING_VEE_DEPTH * sign,
+                 origin[1] + perp[1] * LIGHTNING_VEE_DEPTH * sign)
+            )
+            state = {
+                "phase": "OUT",
+                "leg": 0,
+                "origin": origin,
+                "target": target,
+            }
+            self.memory.lightning_vee_state[uid] = state
+        if state["phase"] == "OUT":
+            target = state["target"]
+            if _distance(vanguard.position, target) <= LIGHTNING_VEE_REACH_TOLERANCE:
+                # 到达最远 → 翻 INBOUND,终点为当前 Core 位置。
+                state["phase"] = "IN"
+                state["target"] = core.position
+            # 出框保护:若 origin→target 投影后距离远小于 VEE_DEPTH(clamp 被截),
+            # 视为被框边拦住,提前翻回。
+            elif _distance(state["origin"], target) < LIGHTNING_VEE_DEPTH - LIGHTNING_VEE_REACH_TOLERANCE:
+                state["phase"] = "IN"
+                state["target"] = core.position
+        else:  # IN
+            state["target"] = core.position
+            if _distance(vanguard.position, core.position) <= LIGHTNING_VEE_HOME_TOLERANCE:
+                # 到家 → 翻 OUTBOUND,leg 翻转,origin 重设为当前 Core 位置。
+                state["phase"] = "OUT"
+                state["leg"] = (state["leg"] + 1) % 2
+                state["origin"] = core.position
+                sign = 1 if state["leg"] == 0 else -1
+                state["target"] = self._lightning_clamp_to_donut(
+                    (core.position[0] + perp[0] * LIGHTNING_VEE_DEPTH * sign,
+                     core.position[1] + perp[1] * LIGHTNING_VEE_DEPTH * sign)
+                )
+        target = state["target"]
+        if target == vanguard.position:
             return None
         return target
 
@@ -9640,10 +9858,10 @@ class SmartTactic:
         acted_units: set[UUID],
         decisions: list[str],
     ) -> None:
-        """闪电模式先锋：各自独立路线，猎杀记录的无护卫敌方 Core，否则扇区探索。"""
+        """闪电模式先锋：V 字纵深猎杀无护卫敌方 Core，否则出探机纵深侦察。"""
         if turn.core is None:
             return
-        # Core 告急或刚受伤 → 全体回防。
+        # Core 告急或刚受伤 → 全体回防（盖过 V 字状态机）。
         if self._core_emergency_threats(turn) or self._core_recently_damaged(turn):
             self._choose_vanguards_recall(turn, planner, acted_units, decisions)
             return
@@ -9664,8 +9882,7 @@ class SmartTactic:
                     and self._lightning_target_crowded(target_position)
                 ):
                     # 对方上线造兵 / 重兵围守 → 永久黑名单，释放，不再回头。
-                    self.memory.lightning_blacklist.add(core_id)
-                    self.memory.lightning_claims.pop(uid, None)
+                    self._lightning_blacklist_core(core_id)
                     core_id = None
                     target_position = None
                     visible_core = None
@@ -9705,10 +9922,10 @@ class SmartTactic:
                         vanguard.wait()
                 acted_units.add(vanguard.id)
                 continue
-            # 无猎杀目标 → 扇区探索，拓展视野，不出方框。
-            sector = self._lightning_sector_target(turn, vanguard)
-            if sector is not None and not planner.toward(
-                vanguard, sector, "lightning_sector_sweep"
+            # 无猎杀目标 → V 字纵深出探（正交于 Core 行进方向深入内陆）。
+            vee = self._lightning_vanguard_vee_target(turn, vanguard)
+            if vee is not None and not planner.toward(
+                vanguard, vee, "lightning_vanguard_vee"
             ):
                 vanguard.wait()
             acted_units.add(vanguard.id)
@@ -9720,7 +9937,7 @@ class SmartTactic:
         acted_units: set[UUID],
         decisions: list[str],
     ) -> None:
-        """闪电模式游侠：各自独立路线，远程猎杀无护卫敌方 Core，否则扇区探索。"""
+        """闪电模式游侠：并排探路侦察，远程集火无护卫敌方 Core。"""
         if turn.core is None:
             return
         if self._core_emergency_threats(turn) or self._core_recently_damaged(turn):
@@ -9741,8 +9958,7 @@ class SmartTactic:
                     visible_core is None
                     and self._lightning_target_crowded(target_position)
                 ):
-                    self.memory.lightning_blacklist.add(core_id)
-                    self.memory.lightning_claims.pop(uid, None)
+                    self._lightning_blacklist_core(core_id)
                     core_id = None
                     target_position = None
                     visible_core = None
@@ -9810,9 +10026,11 @@ class SmartTactic:
                         ranger.wait()
                 acted_units.add(ranger.id)
                 continue
-            sector = self._lightning_sector_target(turn, ranger)
-            if sector is not None and not planner.toward(
-                ranger, sector, "lightning_sector_sweep"
+            # 无猎杀目标 → 并排探路侦察（沿 Core 行进方向前方铺开视野，帮工人
+            # 提前探资源、也撞见敌方 Core 进 acquire）。
+            scout = self._lightning_ranger_scout_target(turn, ranger)
+            if scout is not None and not planner.toward(
+                ranger, scout, "lightning_ranger_scout"
             ):
                 ranger.wait()
             acted_units.add(ranger.id)

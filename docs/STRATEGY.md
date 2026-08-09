@@ -250,27 +250,18 @@ Arena Hero 服务器按对象合并计划：Manual 显式动作 > Agent 显式�
   8 格内有敌中止 + hp/盾低中止**。产兵格满时优先产兵；迁移中不产兵（已有守卫）。
 - Core 受威胁（`_core_emergency_threats`）或刚受伤时全体战斗单位召回护核。
 
-### 12.3 分布式独立猎手（战斗单位不组队）
+### 12.3 游侠并排探路 + 先锋 V 字纵深 + 集火
 
-先锋和游侠各自一条独立路线，拓展巡逻视野，互不结伴：
+初版"分布式扇区扫"实战暴露根因:猎手沿 650 周界单条线慢爬,视野(先锋 4 /游侠 5 曼哈顿)覆盖面对方环周长太小,一整夜 0 首杀、`enemy_sightings` 不增长。改造为分工铺视野:
 
-- **扇区分配**：按单位 UUID 序把方环周界四角作扇区锚，每单位一个，在环内
-  受限探索（`_lightning_clamp_to_donut` 沿 max-norm 径向投回环内，不出环）。
-- **寻猎**：单位无 claim 时，从 `enemy_sightings`（is_core，永不按时间老化）
-  选**最近、未被别的单位 claim、且目标格附近无敌方战斗单位**的 Core，claim 之
-  （`lightning_claims`，一单位一目标防扑同一个）。
-- **执行**：先锋相邻 Core 时 `sweep`，否则 `planner.toward` 逼近；游侠在射程
-  1–3 用 `shoot_cell` 射 Core，否则走到 firing cell。
-- **到达复核**：目标进入视野后重新判定无护卫；若对方上线造出先锋/游侠
-  （`LIGHTNING_HUNT_GUARD_RADIUS=8` 内出现敌方战斗单位）→ **释放 claim，
-  撤退回扇区**。单先锋可磨死修盾 Core（对方 5 资源修 5 次盾后无力）。
-- **击杀后**：sighting 自然失效（格确认空），回扇区继续扫。
+- **游侠 = 并排探路前锋**(`_lightning_ranger_scout_target`):沿 Core 预定行进方向(`_lightning_core_heading_vector`,从 `_lightning_patrol_waypoint` 推出)领先 `LIGHTNING_SCOUT_LEAD=8` 格,横向按 lane 错开铺开。相邻 lane 间距 `LIGHTNING_SCOUT_LANE_GAP=6`(> 游侠视野直径,视野不重叠),奇数游侠以中轴对称展开,在 Core 前方排成一条与行进方向垂直的横线。游侠视野扫过的资源格自动进 `turn.resource_cells`,Core 赶到时工人直接采(无需重探)。
+- **先锋 = V 字纵深猎杀**(`_lightning_vanguard_vee_target`,出探机状态机 `lightning_vee_state`):OUTBOUND 从 origin 沿 Core 行进方向的**正交方向**深入 `LIGHTNING_VEE_DEPTH=32` 格(leg 0 正向、leg 1 反向,两腿成 V);到达(距目标 ≤ `LIGHTNING_VEE_REACH_TOLERANCE=3`)或 Core 受威胁(`_core_emergency_threats`/`_core_recently_damaged`)→ 翻 INBOUND;INBOUND 朝当前 Core 位置走,到达 ≤ `LIGHTNING_VEE_HOME_TOLERANCE=5` → 翻 OUTBOUND、leg 翻转、origin 重设为当前 Core 位置(Core 已前移,下一轮扫新地带)。D=32 兼顾探索面积与回防效率:一来回 ~64 tick,Core 1格/4tick 前进 ~16 格,下一轮覆盖全新带;危险时 ~16 tick 内回防。
+- **集火**(`_lightning_acquire_target` 改):取消"已被他人 claim"排除,同一敌方 Core 允许多 unit 同时 claim(`LIGHTNING_FOCUS_MAX_ATTACKERS=3` 上限防全员扑一个致 Core 失防)。多单位自然汇聚到同一目标形成编队集火:先锋贴脸 `sweep`、游侠射程 1–3 `shoot_cell`。
+- **释放与黑名单**(`_lightning_blacklist_core`):判为重兵把守(贴脸有守卫 `_lightning_target_attended` 或雾里围满 `_lightning_target_crowded`)→ **释放所有 claim 该 Core 的单位**(集火编队同步撤退)、永久黑名单、从 `enemy_sightings` 清脏(防已拉黑 Core 残留污染 acquire 判断)。
+- **击杀后**:sighting 自然失效(格确认空),回探路/V 字继续扫。
 
 ### 12.4 记忆与失效
 
-复用 `enemy_sightings`：敌方 Core 坐标长期保留，只在格被重新观察且确认无人时
-丢弃。`lightning_claims`/`lightning_sectors`/`lightning_patrol_*` 持久化到
-`.arena_hero_memory.json`。控制字段 `lightning_ring` 每回合按 mtime 热读取，
-同 `beacon_target_distance`。
+复用 `enemy_sightings`:敌方 Core 坐标长期保留,只在格被重新观察且确认无人时丢弃。`lightning_claims`/`lightning_blacklist`/`lightning_sectors`/`lightning_scout_lanes`/`lightning_vee_state`/`lightning_patrol_*` 持久化到 `.arena_hero_memory.json`。控制字段 `lightning_ring` 每回合按 mtime 热读取,同 `beacon_target_distance`。
 
 

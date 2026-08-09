@@ -7522,6 +7522,204 @@ class LightningModeTests(unittest.TestCase):
             _distance((535, -201), (650, -650)),
         )
 
+    # ---- 侦察改造:并排游侠探路 + 先锋 V 字纵深 + 集火 ----
+
+    def test_ranger_scout_points_lead_core_along_heading(self) -> None:
+        # 2 游侠、Core 在 (600,600),巡逻点 (650,650) → 行进方向 (+x,+y)。
+        # 两个侦察点都应在 Core 北东方向(fwd*LEAD),横向对称偏移、视野不重叠。
+        from arena_hero_strategy import (
+            LIGHTNING_SCOUT_LEAD,
+            LIGHTNING_SCOUT_LANE_GAP,
+        )
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        tactic = SmartTactic(memory)
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(
+                ranger((605, 605), UUID(int=0xB001)),
+                ranger((605, 606), UUID(int=0xB002)),
+            ),
+        )
+        tactic.choose_actions(turn)
+        s1 = tactic._lightning_ranger_scout_target(turn, turn.rangers[0])
+        s2 = tactic._lightning_ranger_scout_target(turn, turn.rangers[1])
+        self.assertIsNotNone(s1)
+        self.assertIsNotNone(s2)
+        # 两个点都在 Core 北东半侧(行进方向)。
+        for s in (s1, s2):
+            self.assertGreaterEqual(s[0], 600, f"scout {s} should lead +x")
+            self.assertGreaterEqual(s[1], 600, f"scout {s} should lead +y")
+        # 横向 lane 对称:两点的横向间距 ≈ LANE_GAP(视野不重叠)。
+        perp_dist = abs(s1[0] - s2[0]) + abs(s1[1] - s2[1])
+        self.assertGreaterEqual(perp_dist, LIGHTNING_SCOUT_LANE_GAP)
+
+    def test_ranger_scout_lanes_do_not_overlap_vision(self) -> None:
+        # 3 游侠并排:相邻 lane 中心距 ≥ LANE_GAP > 2*RANGER_VISION(=10)不重叠。
+        from arena_hero_strategy import LIGHTNING_SCOUT_LANE_GAP
+        rangers = tuple(
+            ranger((605, 600 + i), UUID(int=0xC000 + i)) for i in range(3)
+        )
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        tactic = SmartTactic(memory)
+        turn, _ = make_turn(own_core=core((600, 600)), units=rangers)
+        tactic.choose_actions(turn)
+        pts = [
+            tactic._lightning_ranger_scout_target(turn, r) for r in turn.rangers
+        ]
+        pts = [p for p in pts if p is not None]
+        self.assertEqual(len(pts), 3)
+        # 沿横向(perp 方向)排开,任意两点的曼哈顿距离 ≥ LANE_GAP。
+        for i in range(len(pts)):
+            for j in range(i + 1, len(pts)):
+                d = _distance(pts[i], pts[j])
+                self.assertGreaterEqual(
+                    d, LIGHTNING_SCOUT_LANE_GAP, f"lanes {pts[i]} {pts[j]} overlap"
+                )
+
+    def test_vanguard_vee_outbound_target_orthogonal_to_heading(self) -> None:
+        # Core 在 (600,600),最近巡逻角 (650,650) → 行进方向 (+x,+y)。
+        # 先锋 OUTBOUND 目标应正交(perp=(-fwd_y,fwd_x)=(-1,+1)),
+        # 不沿行进方向延伸;深度 ~ LIGHTNING_VEE_DEPTH;clamp 在方环内。
+        from arena_hero_strategy import LIGHTNING_VEE_DEPTH
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        tactic = SmartTactic(memory)
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(vanguard((600, 605)),),
+        )
+        target = tactic._lightning_vanguard_vee_target(turn, turn.vanguards[0])
+        self.assertIsNotNone(target)
+        # perp=(-1,+1):目标 x 减、y 增(沿 perp,不沿 fwd)。
+        self.assertLess(target[0], 600, "orthogonal: target x should decrease")
+        self.assertGreater(target[1], 605, "orthogonal: target y should increase")
+        # 深度 ~ VEE_DEPTH。
+        self.assertGreater(_distance(target, (600, 605)), LIGHTNING_VEE_DEPTH - 5)
+        # 在方环内。
+        radius = max(abs(target[0]), abs(target[1]))
+        self.assertLessEqual(radius, 700)
+
+    def test_vanguard_vee_flips_to_inbound_on_reaching_depth(self) -> None:
+        # 先锋已接近 OUTBOUND 目标(≤ REACH_TOLERANCE)→ 翻 INBOUND,目标=Core。
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        tactic = SmartTactic(memory)
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(vanguard((600, 630)),),
+        )
+        # 第一调用初始化 OUTBOUND 目标(垂直方向 ~ +32)。
+        tactic._lightning_vanguard_vee_target(turn, turn.vanguards[0])
+        state = memory.lightning_vee_state[str(turn.vanguards[0].id)]
+        state["target"] = (600, 632)  # 先锋(600,630) 距它 2 ≤ tol
+        # 再调一次:先锋在 (600,630) 距 (600,632) ≤3 → 翻 INBOUND。
+        target = tactic._lightning_vanguard_vee_target(turn, turn.vanguards[0])
+        self.assertEqual(memory.lightning_vee_state[str(turn.vanguards[0].id)]["phase"], "IN")
+        self.assertEqual(target, (600, 600))
+
+    def test_vanguard_vee_flips_to_outbound_on_reaching_core(self) -> None:
+        # INBOUND 状态、先锋贴近 Core → 翻 OUTBOUND,leg 翻转,origin 重设。
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        tactic = SmartTactic(memory)
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(vanguard((602, 600)),),  # 距 Core 2 ≤ HOME_TOL
+        )
+        # 手动置 INBOUND 状态。
+        memory.lightning_vee_state[str(turn.vanguards[0].id)] = {
+            "phase": "IN",
+            "leg": 0,
+            "origin": (568, 600),
+            "target": (600, 600),
+        }
+        tactic._lightning_vanguard_vee_target(turn, turn.vanguards[0])
+        state = memory.lightning_vee_state[str(turn.vanguards[0].id)]
+        self.assertEqual(state["phase"], "OUT")
+        self.assertEqual(state["leg"], 1)  # 翻转
+        self.assertEqual(state["origin"], (600, 600))  # origin 重设为 Core
+
+    def test_focus_fire_multiple_units_claim_same_core(self) -> None:
+        # 同一敌方 Core 允许多 unit 同时 claim(集火),不互相排除。
+        from arena_hero_strategy import EnemySighting
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        memory.enemy_sightings = {
+            "target-A": EnemySighting(position=(620, 600), seen_tick=100, is_core=True),
+        }
+        memory.last_tick = 100
+        tactic = SmartTactic(memory)
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(
+                vanguard((610, 600)),
+                ranger((610, 605)),
+            ),
+        )
+        tactic.choose_actions(turn)
+        claims = list(memory.lightning_claims.values())
+        # 两个 unit 都 claim 同一 target-A(集火)。
+        self.assertEqual(claims, ["target-A", "target-A"])
+
+    def test_focus_fire_caps_at_max_attackers(self) -> None:
+        # 已有 3 个 unit claim target-A(上限)→ 第 4 个 unit 不应再 claim 它,
+        # 应跳过(无其他目标 → 不 claim)。
+        from arena_hero_strategy import EnemySighting, LIGHTNING_FOCUS_MAX_ATTACKERS
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        memory.enemy_sightings = {
+            "target-A": EnemySighting(position=(620, 600), seen_tick=100, is_core=True),
+        }
+        memory.last_tick = 100
+        memory.lightning_claims = {
+            "u1": "target-A",
+            "u2": "target-A",
+            "u3": "target-A",
+        }
+        tactic = SmartTactic(memory)
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(vanguard((610, 600), UUID(int=0xD004)),),
+        )
+        acquired = tactic._lightning_acquire_target(turn, turn.vanguards[0])
+        # 已满员 → 不 claim(返回 None),第 4 个 unit 不扑同一目标。
+        self.assertIsNone(acquired)
+
+    def test_blacklist_releases_all_units_claiming_same_core(self) -> None:
+        # 两 unit 都 claim target-A;判为 crowded → 两个 claim 都释放 + 黑名单 +
+        # sightings 清脏。
+        from arena_hero_strategy import EnemySighting
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        memory.enemy_sightings = {
+            "target-A": EnemySighting(position=(620, 600), seen_tick=100, is_core=True),
+            "g-1": EnemySighting(position=(619, 599), seen_tick=100, is_core=False),
+            "g-2": EnemySighting(position=(619, 601), seen_tick=100, is_core=False),
+        }
+        memory.last_tick = 100
+        memory.lightning_claims = {
+            "u1": "target-A",
+            "u2": "target-A",
+        }
+        tactic = SmartTactic(memory)
+        tactic._lightning_blacklist_core("target-A")
+        self.assertIn("target-A", memory.lightning_blacklist)
+        # 两个 unit 的 claim 都释放。
+        self.assertEqual(memory.lightning_claims, {})
+        # sightings 中 target-A 被清(守卫 sighting 不动)。
+        self.assertNotIn("target-A", memory.enemy_sightings)
+
+    def test_blacklisted_core_removed_from_sightings(self) -> None:
+        # 已黑名单的 Core 在 acquire 时被从 sightings 清掉(脏数据不残留)。
+        from arena_hero_strategy import EnemySighting
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        memory.enemy_sightings = {
+            "bl": EnemySighting(position=(620, 600), seen_tick=100, is_core=True),
+        }
+        memory.lightning_blacklist.add("bl")
+        memory.last_tick = 100
+        tactic = SmartTactic(memory)
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(vanguard((610, 600)),),
+        )
+        tactic._lightning_acquire_target(turn, turn.vanguards[0])
+        self.assertNotIn("bl", memory.enemy_sightings)
+
 
 if __name__ == "__main__":
     unittest.main()
