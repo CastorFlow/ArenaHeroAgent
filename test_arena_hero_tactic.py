@@ -7551,6 +7551,26 @@ class LightningModeTests(unittest.TestCase):
             self.assertGreaterEqual(max(abs(s[0]), abs(s[1])), 500)
             self.assertLessEqual(max(abs(s[0]), abs(s[1])), 700)
 
+    def test_ranger_scout_aligns_to_core_patrol_phase(self) -> None:
+        # 游侠首次探路的角应跟 Core 巡逻 phase 对齐(朝 Core 前方),而非最近角。
+        # Core 巡逻 phase=2 → 第三象限角 (-650,-650);游侠即使在第一象限附近,
+        # 起点目标也应是第三象限角,顺方向绕圈、点亮 Core 前方视野。
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        memory.lightning_patrol_phase = 2
+        tactic = SmartTactic(memory)
+        # 游侠在第一象限 (650, 650) 附近(离第一象限角最近,但应被忽略)。
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(ranger((648, 649), UUID(int=0xB004)),),
+        )
+        target = tactic._lightning_ranger_scout_target(turn, turn.rangers[0])
+        uid = str(turn.rangers[0].id)
+        # phase 对齐 Core=2 → 目标在第三象限角(x<0, y<0)。
+        self.assertEqual(memory.lightning_scout_phase[uid], 2)
+        self.assertIsNotNone(target)
+        self.assertLess(target[0], 0, "should head to Core's forward corner (phase 2 = Q3)")
+        self.assertLess(target[1], 0)
+
     def test_ranger_scout_advances_corner_independently_of_core(self) -> None:
         # 游侠已到达当前角(周界角)→ 推进下一角,不等 Core。Core 留在原地不动,
         # 游侠靠自己在周界上转圈。

@@ -6966,9 +6966,11 @@ class SmartTactic:
             (-radius, radius),
         )
         phase = self.memory.lightning_scout_phase.get(uid, 0) % 4
-        # 游侠象限决定起点角(首次按最近角),之后按 phase。
+        # 首次:与 Core 巡逻 phase 对齐(朝 Core 前方的角),而非"最近角"。
+        # 否则游侠会跑向 Core 身后/相反方向的角,浪费并把视野铺在 Core 已走过的后方。
+        # 对齐后游侠顺方向绕圈,顺便点亮 Core 前方视野。
         if uid not in self.memory.lightning_scout_phase:
-            phase = min(range(4), key=lambda i: _distance(ranger.position, corners[i]))
+            phase = self.memory.lightning_patrol_phase % 4
             self.memory.lightning_scout_phase[uid] = phase
         target = corners[phase]
         # 到达当前角死区 → 推进下一角(独立绕圈,不等 Core)。
