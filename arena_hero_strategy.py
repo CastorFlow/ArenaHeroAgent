@@ -38,16 +38,8 @@ STATS_FILENAME = ".arena_hero_stats.json"
 BROWSER_INTEL_FILENAME = ".arena_hero_browser_intel.json"
 ROUTE_OVERLAY_VERSION = 2
 
-MODE_DEVELOP = "develop"
-MODE_AGGRESS = "aggress"
-MODE_BEACON = "beacon"
-MODE_MIGRATE = "migrate"
 MODE_LIGHTNING = "lightning"
 MODE_VALUES = {
-    MODE_DEVELOP,
-    MODE_AGGRESS,
-    MODE_BEACON,
-    MODE_MIGRATE,
     MODE_LIGHTNING,
 }
 # 闪电模式：在远离高强度战区的贫瘠坐标方环（挖空方形甜甜圈，500 ≤
@@ -76,6 +68,9 @@ LIGHTNING_SECTOR_STEP = 6
 # 注意:20+ 触发官方涨价档(+30%/5人口),后期长期造游侠会多吃涨价——这是
 # "非必要不进攻、发育为主、要更多角色扩轨道"路线接受的取舍。
 LIGHTNING_MAX_POPULATION = 20
+# 绝对人口上限：资源容量管理允许额外工人（20-100 区间纯工人，用于消耗资源+扩容量）。
+# 战斗配置保持 20 人不变，额外工人不影响游侠/先锋比例。
+ABSOLUTE_MAX_POPULATION = 100
 # 游侠同心周界 lane 间距：相邻游侠的方环半径错开 6 格（游侠视野 5，6>直径 10/2
 # 不重叠），径向铺开多条同心周界，N 游侠沿各自周界同向绕圈共同覆盖 Core 轨道。
 LIGHTNING_SCOUT_LANE_GAP = 6
@@ -160,22 +155,6 @@ DEVELOP_BEACON_EXPEDITION_RANGERS = 2
 DEVELOP_SEARCH_INITIAL_RADIUS = 10
 DEVELOP_SEARCH_STEP = 8
 # 侵略模式：4 工人维持经济，游侠占战斗编制多数。
-# 6 名先锋覆盖 Core 守军 3 名与信标小队 3 名；9 名游侠提供远程火力。
-AGGRESS_BASE_WORKERS = 4
-# Recovery bridge: one extra worker beyond the four-worker baseline while the
-# six-slot home combat reserve is still incomplete.
-RECOVERY_BRIDGE_MAX_WORKERS = 7
-AGGRESS_TARGET_VANGUARDS = 6
-AGGRESS_TARGET_RANGERS = 9
-# 编队距离：同类型组合 ≤ 此距离视为一队
-FORMATION_SAME_TYPE_MAX_DISTANCE = 2
-# 编队距离：先锋与游侠间 ≤ 此距离视为组合编队
-FORMATION_VANGUARD_RANGER_MAX_DISTANCE = 3
-# 侵略前沿散布偏移（9 方位，避免全队挤一个巡逻点）
-SPREAD_OFFSETS = (
-    (0, 0), (4, 0), (-4, 0), (0, 4), (0, -4),
-    (4, 4), (-4, -4), (4, -4), (-4, 4),
-)
 # 召回时先锋贴身 core 的分散位（core 4 邻 + 对角，避免全挤 core 位置）
 VANGUARD_RECALL_OFFSETS = (
     (1, 0), (-1, 0), (0, 1), (0, -1),
@@ -188,9 +167,6 @@ RANGER_RECALL_OFFSETS = (
 )
 # core 是否允许自动迁移（false = 固定不动）
 CORE_MIGRATION_ENABLED = False
-# 侵略模式下，安全时允许 Core 寻找已确认的单入口掩体。
-AGGRESS_CORE_SHELTER_ENABLED = True
-AGGRESS_CORE_SHELTER_SEARCH_RADIUS = 8
 CORE_SHELTER_MEMORY_MAX_DISTANCE = 12
 # 信标目标距离控制的容差带（格）：距离偏差超过此值才迁移，避免来回抖动
 CORE_BEACON_HYSTERESIS = 8
@@ -206,178 +182,20 @@ DEVELOP_WIDE_SEARCH_MAX_RADIUS = 28
 # by a distant scout.  Keep new Develop-mode assignments inside the same local
 # production radius unless a Worker is already close enough to finish it.
 DEVELOP_RESOURCE_TARGET_CORE_LEASH_DISTANCE = 38
-# Economy recovery in Aggress mode must find the next dynamic-node refill,
-# not send every Worker on a one-minute cross-map expedition.  Keep the sweep
-# inside the local production area and let remembered productive chunks win.
-AGGRESS_RESOURCE_SWEEP_INITIAL_RADIUS = 10
-AGGRESS_RESOURCE_SWEEP_STEP = 8
-AGGRESS_RESOURCE_SWEEP_MAX_RADIUS = 28
-# Beacon-mode Workers stay with the migrating Core, but a fixed 5/8/11-cell
-# patrol is too small once nearby nodes are exhausted. Expand gradually without
-# turning the economy into another cross-map Beacon expedition.
-BEACON_RESOURCE_SWEEP_INITIAL_RADIUS = 12
-BEACON_RESOURCE_SWEEP_STEP = 6
-BEACON_RESOURCE_SWEEP_MAX_RADIUS = 36
-# A Worker on the outer ring can reveal a node a few cells beyond its patrol.
-# Accept that local discovery, but ignore resource vision supplied by the
-# distant combat expedition.
-BEACON_RESOURCE_TARGET_CORE_LEASH_DISTANCE = (
-    BEACON_RESOURCE_SWEEP_MAX_RADIUS + 4
-)
-# Once an outer Beacon sweep finds a productive chunk, revisit it after refill
-# instead of discarding the memory and paying the full blind-search cost again.
-BEACON_REFILL_PROBE_CORE_LEASH_DISTANCE = BEACON_RESOURCE_SWEEP_MAX_RADIUS
 # 卡住判定：单位连续这么多 tick 位置未变化且仍有移动目标 → 视为迷路
 STUCK_TICKS = 16
 # 打转判定：最近 STUCK_TICKS 个 tick 内，单位经过的不同位置 ≤ 此阈值 → 震荡打转
 SPIN_POSITION_BUDGET = 6
 # 单位满血值
 MAX_HP = {UnitType.WORKER: 2, UnitType.VANGUARD: 4, UnitType.RANGER: 2}
-AGGRESS_DEFENDER_VANGUARDS = 3
-AGGRESS_DEFENDER_RANGERS = 3
-AGGRESS_MIN_ASSAULT_VANGUARDS = 1
-AGGRESS_MIN_ASSAULT_RANGERS = 2
-# A known enemy Core is only breached by a separate force.  The fixed 3+3
-# home reserve never supplies these slots, even when the Core is nearby.
-CORE_ASSAULT_MIN_VANGUARDS = 1
-CORE_ASSAULT_MIN_RANGERS = 2
-CORE_ASSAULT_MAX_HOME_DISTANCE = 28
-CORE_ASSAULT_RALLY_RANGE = 6
-CORE_ASSAULT_RALLY_MIN_CORE_DISTANCE = 8
-CORE_ASSAULT_STAGING_RANGE = 6
-CORE_ASSAULT_SCREEN_RANGE = 4
-CORE_ASSAULT_RALLY_OFFSETS = (
-    (0, 0),
-    (1, 0),
-    (0, 1),
-    (-1, 0),
-    (0, -1),
-    (1, 1),
-    (-1, 1),
-    (-1, -1),
-    (1, -1),
-)
-AGGRESS_CORE_ALERT_RADIUS = 10
 CORE_EMERGENCY_THREAT_RADIUS = 6
-AGGRESS_CORE_REINFORCEMENT_ENEMY_COUNT = 4
-AGGRESS_CORE_REINFORCEMENT_HOLD_TICKS = 20
 CORE_DAMAGE_EMERGENCY_TICKS = 24
 CORE_RECOVERY_REBUILD_TICKS = 120
-AGGRESS_HEAL_ROTATION_MAX = 2
-AGGRESS_HEAL_ROTATION_MIN_HOME_DEFENDERS = 4
-AGGRESS_HEAL_ROTATION_MIN_DEFENDERS_PER_TYPE = 1
-AGGRESS_HEAL_ROTATION_HANDOFF_RADIUS = 2
-AGGRESS_HEAL_ROTATION_QUIET_TICKS = 8
-AGGRESS_VANGUARD_WATCH_OFFSETS = (
-    (0, -4), (3, 1), (-3, 1), (4, 0), (0, 4), (-4, 0), (2, -2), (-2, -2),
-)
-AGGRESS_RANGER_WATCH_OFFSETS = (
-    (3, -2), (0, 5), (-3, -2), (5, 0), (-5, 0), (2, 3), (-2, 3), (0, -5),
-)
-AGGRESS_VANGUARD_ALERT_OFFSETS = (
-    (0, -1), (1, 0), (-1, 0), (0, 1), (1, 1), (-1, 1), (1, -1), (-1, -1),
-)
-AGGRESS_RANGER_ALERT_OFFSETS = (
-    (0, 2), (2, 0), (-2, 0), (0, -2), (1, 1), (-1, 1), (1, -1), (-1, -1),
-)
-BEACON_GUARD_VANGUARDS = 2
-BEACON_GUARD_RANGERS = 3
-# After the 5V+8R combat baseline is ready, grow a local economy before buying
-# the expensive 9th-12th Rangers and 6th-8th Vanguards. Ten Workers improve
-# refill discovery after nearby chunks are depleted, while two spare resources
-# preserve immediate healing or shield-repair capacity in a quiet state.
-BEACON_ECONOMY_TARGET_WORKERS = 10
-BEACON_ECONOMY_RESERVE = 2
-# Once the Beacon home screen has five Vanguards, preserve the next affordable
-# resource window for the cheaper pre-population-20 Ranger instead of filling
-# a sixth/eighth Vanguard first.
-BEACON_RANGER_PRIORITY_MIN_VANGUARDS = 5
-BEACON_GUARD_READY_RADIUS = 4
-BEACON_GUARD_REASSIGN_RADIUS = 10
-BEACON_GUARD_THREAT_RADIUS = 8
-BEACON_CARRIER_DANGER_RADIUS = 5
-BEACON_CARRIER_SUPPORT_RADIUS = 5
-BEACON_CARRIER_CORE_AVOID_RADIUS = 8
-BEACON_GUARD_PATROL_TICKS = 4
-BEACON_EXPEDITION_COHESION_RADIUS = 6
-# Main-force advance resumes only after the formation is comfortably inside
-# the outer cohesion radius. This hysteresis prevents obstacle detours from
-# toggling spread 5 -> 6 -> 5 without any strategic progress.
-BEACON_EXPEDITION_ADVANCE_RELEASE_RADIUS = 4
-BEACON_EXPEDITION_CORE_GUARD_RADIUS = 8
-BEACON_EXPEDITION_WEAK_GUARD_MAX = 1
-BEACON_EXPEDITION_OPPORTUNISTIC_RADIUS = 10
-BEACON_EXPEDITION_LOCAL_THREAT_RADIUS = 6
-BEACON_EXPEDITION_MIN_ACTIVE_VANGUARDS = 1
-BEACON_EXPEDITION_MIN_ACTIVE_RANGERS = 2
-BEACON_EXPEDITION_ADVANCE_STRIDE = 3
-# A nearby, recently confirmed, undefended Core is worth a small sortie even
-# when the normal Beacon expedition is far away. Keep a 2V+1R screen at home
-# and persist the 1V+2R sortie through short visibility gaps.  Forty cells
-# covers exposed Cores found by the local Worker screen while the main
-# expedition is operating on the opposite frontier.
-BEACON_LOCAL_CORE_SORTIE_MAX_DISTANCE = 40
-BEACON_LOCAL_CORE_SORTIE_SIGHTING_MAX_AGE = 96
-BEACON_LOCAL_CORE_SORTIE_MAX_TICKS = 72
-BEACON_LOCAL_CORE_SORTIE_GUARD_RADIUS = 8
-BEACON_LOCAL_CORE_SORTIE_VANGUARDS = 1
-BEACON_LOCAL_CORE_SORTIE_RANGERS = 2
-BEACON_LOCAL_CORE_HOME_VANGUARDS = 2
-BEACON_LOCAL_CORE_HOME_RANGERS = 1
-BEACON_EXPEDITION_FORMATION_PRIORITY_PHASES = frozenset(
-    {"retreat", "regroup", "hold_reinforcements"}
-)
-# Once a visible Core has only a small combat screen left, keep the expedition
-# on low-threat firing lanes and focus the stationary Core instead of drifting
-# into a unit-clearing fight.  Larger screens still use the normal regroup/
-# retreat gate until enough of the screen is removed.
-BEACON_CORE_FOCUS_MAX_ENEMY_STRENGTH = 3
-BEACON_EXPEDITION_VANGUARD_OFFSETS = (
-    (0, 0), (1, 0), (0, 1), (-1, 0), (0, -1),
-    (1, 1), (-1, 1), (-1, -1), (1, -1),
-)
-BEACON_EXPEDITION_RANGER_OFFSETS = (
-    (0, -2), (2, 0), (0, 2), (-2, 0),
-    (1, -2), (2, 1), (-1, 2), (-2, -1),
-    (2, -1), (1, 2), (-2, 1), (-1, -2),
-)
-BEACON_VANGUARD_GUARD_OFFSETS = (
-    (1, 0),
-    (0, 1),
-    (-1, 0),
-    (0, -1),
-)
-BEACON_RANGER_GUARD_OFFSETS = (
-    (0, -2),
-    (1, -1),
-    (2, 0),
-    (1, 1),
-    (0, 2),
-    (-1, 1),
-    (-2, 0),
-    (-1, -1),
-)
-ASSAULT_SIGHTING_MAX_AGE = 20
-ASSAULT_SWEEP_PROFILE_VERSION = 3
-ASSAULT_SWEEP_MIN_RADIUS = 16
-ASSAULT_SWEEP_MAX_RADIUS = 50
-ASSAULT_SWEEP_RING_SPACING = 8
-ASSAULT_SWEEP_WAYPOINT_REACHED_RADIUS = 4
-ASSAULT_SWEEP_SECTOR_OFFSETS = (
-    (1, 0),
-    (1, 1),
-    (0, 1),
-    (-1, 1),
-    (-1, 0),
-    (-1, -1),
-    (0, -1),
-    (1, -1),
-)
 DEFAULT_RAID_VANGUARDS = 1
 DEFAULT_RAID_RANGERS = 2
-# 守家编制是所有外派任务的硬底线：3 先锋 + 3 游侠。
-RAID_HOME_RESERVE_VANGUARDS = AGGRESS_DEFENDER_VANGUARDS
-RAID_HOME_RESERVE_RANGERS = AGGRESS_DEFENDER_RANGERS
+# 守家编制是所有外派任务的硬底线：1 先锋 + 1 游侠（原 AGGRESS_DEFENDER 编制）。
+RAID_HOME_RESERVE_VANGUARDS = 1
+RAID_HOME_RESERVE_RANGERS = 1
 RAID_HOME_RESERVE_COMBAT = (
     RAID_HOME_RESERVE_VANGUARDS + RAID_HOME_RESERVE_RANGERS
 )
@@ -387,6 +205,7 @@ RAID_SWEEP_WAYPOINT_REACHED_RADIUS = 4
 RAID_CORE_GUARD_RADIUS = 8
 RAID_STATIONARY_OBSERVATIONS = 3
 RAID_ENEMY_MOTION_MAX_AGE = 16
+ASSAULT_SIGHTING_MAX_AGE = 20
 CORE_VISION_RADIUS = 5
 UNIT_VISION_RADIUS = {
     UnitType.WORKER: 3,
@@ -418,7 +237,6 @@ OPPOSITE_DIRECTION = {
     Direction.LEFT: Direction.RIGHT,
 }
 CORE_DIRECTION_COMMIT_TICKS = 8
-BEACON_PROGRESS_WEIGHT = 3.0
 RANGER_DEFENSE_LEASH_RADIUS = 8
 CORE_PATROL_RANGER_COUNT = 2
 CORE_PATROL_RADIUS = 2
@@ -429,15 +247,9 @@ DEFENSE_REPLACEMENT_RESERVE = 10
 CORE_AUTO_MOBILITY_MIN_VANGUARDS = 1
 CORE_AUTO_MOBILITY_MIN_RANGERS = 1
 CORE_AUTO_MOBILITY_MIN_COMBAT = 2
-FRONTIER_BEACON_BACKTRACK_TOLERANCE = 2
 REFILL_PROBE_MAX_DISTANCE = 40
 REFILL_PROBE_BACKTRACK_DISTANCE = 12
 REFILL_PROBE_CORE_LEASH_DISTANCE = 24
-# 侵略模式仍要维持资源线：当本地资源暂时都在迷雾中时，允许最多半数
-# 工人复查三个临近的已产出区块。这样不会把全部工人拖去远方，同时能赶上
-# 每四 Tick 的动态资源补充。
-AGGRESS_REFILL_PROBE_CORE_LEASH_DISTANCE = 48
-AGGRESS_REFILL_PROBE_RECHECK_TICKS = 4
 # 发育阶段的 refill 复查也必须服从本地经济半径。远程往返会让一个资源
 # 占用工人数十 Tick，并在单入口 Core 前形成持续回仓队列。
 DEVELOP_REFILL_PROBE_CORE_LEASH_DISTANCE = DEVELOP_WIDE_SEARCH_MAX_RADIUS
@@ -483,30 +295,6 @@ class RaidEnemyMotion:
     position: Position
     stationary_observations: int
     last_seen_tick: int
-
-
-@dataclass(frozen=True)
-class HealRotation:
-    relief_id: str
-    rendezvous: Position
-    phase: str
-    created_tick: int
-
-
-@dataclass(frozen=True)
-class HealRoleSwap:
-    patient_id: str
-    relief_id: str
-    created_tick: int
-
-
-@dataclass(frozen=True)
-class BeaconExpeditionOrder:
-    strategic_target: Position
-    formation_anchor: Position
-    phase: str
-    assault_ids: frozenset[UUID] = frozenset()
-    enemy_combat_units: int | None = None
 
 
 @dataclass(frozen=True)
@@ -580,6 +368,7 @@ class TacticMemory:
     last_core_respawn_tick: int = 0
     core_shelter_target: Position | None = None
     core_shelter_entrance: Position | None = None
+    recall: bool = False
     migration_candidate: Position | None = None
     migration_target: Position | None = None
     migration_site_checked: bool = False
@@ -589,12 +378,12 @@ class TacticMemory:
     last_events: list[dict] = field(default_factory=list)
     unit_positions_for_overlay: dict[str, Position] = field(default_factory=dict)
     last_tick: int = 0
-    mode: str = MODE_DEVELOP
-    recall: bool = False
+    beacon_target_distance: int = 0
+    rally_point: tuple[int, int] | None = None
     raid_enabled: bool = False
     raid_recall: bool = False
-    raid_vanguards: int = DEFAULT_RAID_VANGUARDS
-    raid_rangers: int = DEFAULT_RAID_RANGERS
+    raid_vanguards: int = 0
+    raid_rangers: int = 0
     raid_vanguard_ids: set[str] = field(default_factory=set)
     raid_ranger_ids: set[str] = field(default_factory=set)
     raid_sweep_origin: Position | None = None
@@ -603,21 +392,6 @@ class TacticMemory:
     raid_core_position: Position | None = None
     raid_core_acquired_tick: int = 0
     raid_enemy_motion: dict[str, RaidEnemyMotion] = field(default_factory=dict)
-    local_core_sortie_core_id: str | None = None
-    local_core_sortie_position: Position | None = None
-    local_core_sortie_started_tick: int = 0
-    local_core_sortie_vanguard_ids: set[str] = field(default_factory=set)
-    local_core_sortie_ranger_ids: set[str] = field(default_factory=set)
-    beacon_target_distance: int = 0
-    rally_point: tuple[int, int] | None = None
-    aggress_vanguards: int = 0
-    aggress_rangers: int = 0
-    aggress_sweep_profile_version: int = 0
-    aggress_sweep_started_tick: int = 0
-    aggress_sweep_step: int = 0
-    aggress_sweep_last_advance_tick: int = 0
-    core_reinforcement_until_tick: int = 0
-    last_enemy_visible_tick: int = 0
     # 闪电模式状态：方环 (inner_r, outer_r)、当前巡逻点、轮转相位、每单位 claim 的敌方 Core、扇区分配。
     lightning_ring: tuple = field(default_factory=lambda: tuple(LIGHTNING_DEFAULT_RING))
     lightning_patrol_waypoint: tuple[int, int] | None = None
@@ -647,11 +421,6 @@ class TacticMemory:
     # 鬼打墙逃生：UUID → 逃生模式截止 tick。逃生期间忽略巡逻目标，
     # 只往"开阔 + 低 visited 密度"方向走，强制脱出障碍死角。
     lightning_unit_escape_until: dict[str, int] = field(default_factory=dict)
-    aggress_heal_rotations: dict[str, HealRotation] = field(default_factory=dict)
-    aggress_heal_role_swaps: list[HealRoleSwap] = field(default_factory=list)
-    aggress_beacon_guard_carrier_id: str | None = None
-    aggress_beacon_vanguard_guards: set[str] = field(default_factory=set)
-    aggress_beacon_ranger_guards: set[str] = field(default_factory=set)
     attacked_units: dict[str, int] = field(default_factory=dict)
     replacement_queue: Counter[str] = field(default_factory=Counter)
     control_mtime: int = 0
@@ -833,9 +602,6 @@ class TacticMemory:
             )
             memory.auto_migrate = bool(data.get("auto_migrate", False))
             memory.last_tick = int(data.get("last_tick", 0))
-            memory.mode = data.get("mode", MODE_DEVELOP)
-            if memory.mode not in MODE_VALUES:
-                memory.mode = MODE_DEVELOP
             memory.recall = bool(data.get("recall", False))
             memory.raid_enabled = bool(data.get("raid_enabled", False))
             memory.raid_recall = bool(data.get("raid_recall", False))
@@ -887,97 +653,6 @@ class TacticMemory:
                 )
                 for enemy_id, value in data.get("raid_enemy_motion", {}).items()
                 if isinstance(value, list) and len(value) == 4
-            }
-            sortie_core_id = data.get("local_core_sortie_core_id")
-            memory.local_core_sortie_core_id = (
-                str(sortie_core_id) if sortie_core_id else None
-            )
-            sortie_position = data.get("local_core_sortie_position")
-            if isinstance(sortie_position, list) and len(sortie_position) == 2:
-                memory.local_core_sortie_position = (
-                    int(sortie_position[0]),
-                    int(sortie_position[1]),
-                )
-            memory.local_core_sortie_started_tick = max(
-                0,
-                int(data.get("local_core_sortie_started_tick", 0)),
-            )
-            memory.local_core_sortie_vanguard_ids = {
-                str(unit_id)
-                for unit_id in data.get("local_core_sortie_vanguard_ids", ())
-                if unit_id
-            }
-            memory.local_core_sortie_ranger_ids = {
-                str(unit_id)
-                for unit_id in data.get("local_core_sortie_ranger_ids", ())
-                if unit_id
-            }
-            memory.aggress_sweep_profile_version = max(
-                0,
-                int(data.get("aggress_sweep_profile_version", 0)),
-            )
-            memory.aggress_sweep_started_tick = max(
-                0,
-                int(data.get("aggress_sweep_started_tick", 0)),
-            )
-            memory.aggress_sweep_step = max(
-                0,
-                int(data.get("aggress_sweep_step", 0)),
-            )
-            memory.aggress_sweep_last_advance_tick = max(
-                0,
-                int(data.get("aggress_sweep_last_advance_tick", 0)),
-            )
-            memory.core_reinforcement_until_tick = max(
-                0,
-                int(data.get("core_reinforcement_until_tick", 0)),
-            )
-            memory.last_enemy_visible_tick = max(
-                0,
-                int(
-                    data.get(
-                        "last_enemy_visible_tick",
-                        data.get("last_tick", 0),
-                    )
-                ),
-            )
-            memory.aggress_heal_rotations = {
-                str(patient_id): HealRotation(
-                    relief_id=str(value[0]),
-                    rendezvous=(int(value[1]), int(value[2])),
-                    phase=str(value[3]),
-                    created_tick=max(0, int(value[4])),
-                )
-                for patient_id, value in data.get(
-                    "aggress_heal_rotations",
-                    {},
-                ).items()
-                if isinstance(value, list)
-                and len(value) == 5
-                and value[3] in {"relief", "return"}
-            }
-            memory.aggress_heal_role_swaps = [
-                HealRoleSwap(
-                    patient_id=str(value[0]),
-                    relief_id=str(value[1]),
-                    created_tick=max(0, int(value[2])),
-                )
-                for value in data.get("aggress_heal_role_swaps", ())
-                if isinstance(value, list) and len(value) == 3
-            ]
-            carrier_id = data.get("aggress_beacon_guard_carrier_id")
-            memory.aggress_beacon_guard_carrier_id = (
-                str(carrier_id) if carrier_id else None
-            )
-            memory.aggress_beacon_vanguard_guards = {
-                str(unit_id)
-                for unit_id in data.get("aggress_beacon_vanguard_guards", ())
-                if unit_id
-            }
-            memory.aggress_beacon_ranger_guards = {
-                str(unit_id)
-                for unit_id in data.get("aggress_beacon_ranger_guards", ())
-                if unit_id
             }
             memory.replacement_queue = Counter(
                 {
@@ -1181,7 +856,6 @@ class TacticMemory:
             "migration_site_score": self.migration_site_score,
             "auto_migrate": self.auto_migrate,
             "last_tick": self.last_tick,
-            "mode": self.mode,
             "recall": self.recall,
             "raid_enabled": self.raid_enabled,
             "raid_recall": self.raid_recall,
@@ -1211,50 +885,6 @@ class TacticMemory:
                 ]
                 for enemy_id, motion in sorted(self.raid_enemy_motion.items())
             },
-            "local_core_sortie_core_id": self.local_core_sortie_core_id,
-            "local_core_sortie_position": (
-                list(self.local_core_sortie_position)
-                if self.local_core_sortie_position is not None
-                else None
-            ),
-            "local_core_sortie_started_tick": self.local_core_sortie_started_tick,
-            "local_core_sortie_vanguard_ids": sorted(
-                self.local_core_sortie_vanguard_ids
-            ),
-            "local_core_sortie_ranger_ids": sorted(
-                self.local_core_sortie_ranger_ids
-            ),
-            "aggress_sweep_profile_version": self.aggress_sweep_profile_version,
-            "aggress_sweep_started_tick": self.aggress_sweep_started_tick,
-            "aggress_sweep_step": self.aggress_sweep_step,
-            "aggress_sweep_last_advance_tick": (
-                self.aggress_sweep_last_advance_tick
-            ),
-            "core_reinforcement_until_tick": self.core_reinforcement_until_tick,
-            "last_enemy_visible_tick": self.last_enemy_visible_tick,
-            "aggress_heal_rotations": {
-                patient_id: [
-                    rotation.relief_id,
-                    rotation.rendezvous[0],
-                    rotation.rendezvous[1],
-                    rotation.phase,
-                    rotation.created_tick,
-                ]
-                for patient_id, rotation in sorted(
-                    self.aggress_heal_rotations.items()
-                )
-            },
-            "aggress_heal_role_swaps": [
-                [swap.patient_id, swap.relief_id, swap.created_tick]
-                for swap in self.aggress_heal_role_swaps
-            ],
-            "aggress_beacon_guard_carrier_id": self.aggress_beacon_guard_carrier_id,
-            "aggress_beacon_vanguard_guards": sorted(
-                self.aggress_beacon_vanguard_guards
-            ),
-            "aggress_beacon_ranger_guards": sorted(
-                self.aggress_beacon_ranger_guards
-            ),
             "replacement_queue": dict(sorted(self.replacement_queue.items())),
             "total_resources_harvested": self.total_resources_harvested,
             "total_resources_deposited": self.total_resources_deposited,
@@ -1411,21 +1041,7 @@ class TacticMemory:
         live_unit_ids = {str(unit.id) for unit in turn.units}
         lost_unit_ids = previous_unit_ids - live_unit_ids
         self.units_lost += len(lost_unit_ids)
-        if self.mode == MODE_AGGRESS:
-            self.replacement_queue.update(
-                previous_labels[unit_id].object_type
-                for unit_id in lost_unit_ids
-            )
-            for unit in turn.units:
-                if str(unit.id) in previous_unit_ids:
-                    continue
-                object_type = unit.unit_type.value
-                if self.replacement_queue[object_type] > 0:
-                    self.replacement_queue[object_type] -= 1
-                    if self.replacement_queue[object_type] <= 0:
-                        del self.replacement_queue[object_type]
-        else:
-            self.replacement_queue.clear()
+        self.replacement_queue.clear()
         self.unit_labels = {
             unit_id: label
             for unit_id, label in self.unit_labels.items()
@@ -1605,23 +1221,6 @@ class TacticMemory:
                 and event.reason_code == "CORE"
             ):
                 self.enemy_cores_destroyed += 1
-
-        if self.mode == MODE_AGGRESS and turn.core is not None:
-            nearby_combat_enemies = sum(
-                1
-                for enemy in turn.visible_enemies
-                if isinstance(enemy, UnitView)
-                and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
-                and _distance(enemy.position, turn.core.position)
-                <= AGGRESS_CORE_ALERT_RADIUS
-            )
-            if nearby_combat_enemies >= AGGRESS_CORE_REINFORCEMENT_ENEMY_COUNT:
-                self.core_reinforcement_until_tick = max(
-                    self.core_reinforcement_until_tick,
-                    turn.tick + AGGRESS_CORE_REINFORCEMENT_HOLD_TICKS,
-                )
-        elif self.mode != MODE_AGGRESS:
-            self.core_reinforcement_until_tick = 0
 
         self.known_obstacles.update(turn.obstacle_cells)
         for shot_key, last_tick in tuple(self.shot_miss_ticks.items()):
@@ -1875,13 +1474,6 @@ class TacticMemory:
             data = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 return
-            mode = data.get("mode", self.mode)
-            if mode in MODE_VALUES:
-                if mode == MODE_AGGRESS and self.mode != MODE_AGGRESS:
-                    self.aggress_sweep_started_tick = 0
-                    self.aggress_sweep_step = 0
-                    self.aggress_sweep_last_advance_tick = 0
-                self.mode = mode
             self.recall = bool(data.get("recall", self.recall))
             previous_raid_enabled = self.raid_enabled
             self.raid_enabled = bool(data.get("raid_enabled", self.raid_enabled))
@@ -1947,8 +1539,7 @@ class TacticMemory:
                         self.recovery_targets.append(self.migration_candidate)
                 self.migration_site_checked = False
                 self.migration_site_score = 0
-                if self.mode != MODE_MIGRATE:
-                    self.migration_target = None
+                self.migration_target = None
             raw_distance = data.get("beacon_target_distance")
             if isinstance(raw_distance, (int, float)) and not isinstance(
                 raw_distance, bool
@@ -2112,7 +1703,6 @@ class TacticMemory:
             )
             payload = {
                 "tick": turn.tick,
-                "mode": self.mode,
                 "recall": self.recall,
                 "raid_enabled": self.raid_enabled,
                 "raid_recall": self.raid_recall,
@@ -2174,10 +1764,7 @@ class TacticMemory:
                     and _distance(enemy.position, turn.core.position)
                     <= AGGRESS_CORE_ALERT_RADIUS
                 ),
-                "core_reinforcement_active": (
-                    self.mode == MODE_AGGRESS
-                    and turn.tick <= self.core_reinforcement_until_tick
-                ),
+                "core_reinforcement_active": False,
                 "core_recovery_active": (
                     turn.core is not None
                     and (
@@ -2206,26 +1793,6 @@ class TacticMemory:
                 "last_core_damaged_tick": self.last_core_damaged_tick,
                 "last_core_destroyed_tick": self.last_core_destroyed_tick,
                 "last_core_respawn_tick": self.last_core_respawn_tick,
-                "last_enemy_visible_tick": self.last_enemy_visible_tick,
-                "heal_rotations": [
-                    {
-                        "patient_id": patient_id[:8],
-                        "relief_id": rotation.relief_id[:8],
-                        "rendezvous": list(rotation.rendezvous),
-                        "phase": rotation.phase,
-                    }
-                    for patient_id, rotation in sorted(
-                        self.aggress_heal_rotations.items()
-                    )
-                ],
-                "heal_role_swaps": [
-                    {
-                        "patient_id": swap.patient_id[:8],
-                        "relief_id": swap.relief_id[:8],
-                        "created_tick": swap.created_tick,
-                    }
-                    for swap in self.aggress_heal_role_swaps
-                ],
                 "owns_beacon": _owns_beacon(turn),
                 "visible_resource_cells": len(turn.resource_cells),
                 "known_resource_cells": len(self.resource_last_seen),
@@ -2970,10 +2537,8 @@ class SmartTactic:
         self.memory.refresh_recovery_target_hints()
         self.memory.refresh_browser_intel()
         self.memory.observe(turn)
-        self._maybe_activate_beacon_expedition(turn)
         # 只在本 Tick 内协调多名游侠的覆盖格，不把未来 Tick 的动作带入。
         self.memory.current_shot_cells.clear()
-        self._maybe_activate_migration(turn)
         previous_events = Counter(event.event_type for event in turn.events)
         decisions = list(self.memory.observations)
 
@@ -2982,46 +2547,13 @@ class SmartTactic:
 
         planner = MovementPlanner(turn, self.memory, decisions)
         acted_units: set[UUID] = set()
-        reinforcement_active, reinforcement_threats = (
-            self._aggress_core_reinforcement_state(turn)
-        )
-        if reinforcement_active:
-            decisions.append(
-                "core_reinforcement_alert "
-                f"combat_enemies={len(reinforcement_threats)} "
-                f"radius={AGGRESS_CORE_ALERT_RADIUS} "
-                f"until={self.memory.core_reinforcement_until_tick}"
-            )
-            self.memory.decision_totals["core_reinforcement:alert"] += 1
-        core_acted = self._choose_beacon(turn, planner, acted_units, decisions)
-        self._vacate_core_for_logistics(
-            turn,
-            planner,
-            acted_units,
-            decisions,
-        )
+
+        # 闪电模式：工人采集 → 治疗 → 战斗单位移动/攻击 → Core 巡逻
         incoming_deposit = self._choose_workers(turn, planner, acted_units, decisions)
-        self._choose_aggress_heal_rotations(
-            turn,
-            planner,
-            acted_units,
-            decisions,
-        )
         self._choose_healing(turn, planner, acted_units, decisions)
-        raid_vanguard_ids, raid_ranger_ids = self._raid_assignments(turn)
-        raid_ids = raid_vanguard_ids | raid_ranger_ids
-        self._update_raid_target(turn, raid_ids, decisions)
-        self._choose_raid(
-            turn,
-            planner,
-            acted_units,
-            decisions,
-            raid_vanguard_ids,
-            raid_ranger_ids,
-        )
         self._choose_vanguards(turn, planner, acted_units, decisions)
         self._choose_rangers(turn, planner, acted_units, decisions)
-        self._choose_core(turn, planner, core_acted, incoming_deposit, decisions)
+        self._choose_core(turn, planner, False, incoming_deposit, decisions)
         return self._summary(turn, previous_events, decisions)
 
     def _worker_requires_core_exit(
@@ -3076,8 +2608,8 @@ class SmartTactic:
             candidate is None
             or not self.memory.auto_migrate
             or self.memory.migration_site_checked
-            or self.memory.mode == MODE_MIGRATE
-            or self.memory.mode == MODE_LIGHTNING
+            or False
+            or True
             or not any(unit.position == candidate for unit in turn.units)
         ):
             return
@@ -3109,7 +2641,7 @@ class SmartTactic:
             self.memory.decision_totals["migration:site_rejected"] += 1
             return
 
-        self.memory.mode = MODE_MIGRATE
+        # mode assignment removed (Lightning only)
         self.memory.recall = False
         self.memory.migration_target = candidate
         self.memory.complete_recovery_target(candidate, "migration_site_confirmed")
@@ -3159,366 +2691,6 @@ class SmartTactic:
             visible_enemies=len(turn.visible_enemies),
             decisions=tuple(decisions),
         )
-
-    def _raid_assignments(
-        self,
-        turn: Turn,
-    ) -> tuple[set[UUID], set[UUID]]:
-        if not self.memory.raid_enabled:
-            self.memory.clear_raid_state()
-            return set(), set()
-
-        if self._home_recovery_active(turn):
-            self.memory.clear_raid_state()
-            self.memory.observations.append("raid_suppressed reason=home_recovery")
-            return set(), set()
-
-        carrier, beacon_vanguard_guards, beacon_ranger_guards = (
-            self._aggress_beacon_guard_assignments(turn)
-        )
-        if self.memory.mode == MODE_AGGRESS:
-            defender_vanguards, defender_rangers = self._aggress_core_defender_ids(turn)
-        else:
-            defender_vanguards, defender_rangers = self._minimum_home_reserve_ids(
-                turn,
-                excluded_vanguards=set(beacon_vanguard_guards)
-                | ({carrier.id} if carrier is not None else set()),
-                excluded_rangers=beacon_ranger_guards,
-            )
-        reserved_vanguards = set(beacon_vanguard_guards) | set(defender_vanguards)
-        reserved_rangers = set(beacon_ranger_guards) | set(defender_rangers)
-        if carrier is not None:
-            reserved_vanguards.add(carrier.id)
-
-        old_vanguard_ids = set(self.memory.raid_vanguard_ids)
-        old_ranger_ids = set(self.memory.raid_ranger_ids)
-
-        def choose(
-            units: tuple[Unit, ...],
-            count: int,
-            reserved: set[UUID],
-            old_ids: set[str],
-        ) -> set[UUID]:
-            eligible = [unit for unit in units if unit.id not in reserved]
-            eligible.sort(
-                key=lambda unit: (
-                    0 if str(unit.id) in old_ids else 1,
-                    -(_distance(unit.position, turn.core.position) if turn.core else 0),
-                    unit.id.bytes,
-                )
-            )
-            return {unit.id for unit in eligible[: max(0, count)]}
-
-        vanguard_ids = choose(
-            turn.vanguards,
-            self.memory.raid_vanguards,
-            reserved_vanguards,
-            old_vanguard_ids,
-        )
-        ranger_ids = choose(
-            turn.rangers,
-            self.memory.raid_rangers,
-            reserved_rangers,
-            old_ranger_ids,
-        )
-        self.memory.raid_vanguard_ids = {str(unit_id) for unit_id in vanguard_ids}
-        self.memory.raid_ranger_ids = {str(unit_id) for unit_id in ranger_ids}
-        live_raid_ids = self.memory.raid_vanguard_ids | self.memory.raid_ranger_ids
-        self.memory.raid_sweep_steps = {
-            unit_id: step
-            for unit_id, step in self.memory.raid_sweep_steps.items()
-            if unit_id in live_raid_ids
-        }
-        ordered_ids = sorted(live_raid_ids)
-        for index, unit_id in enumerate(ordered_ids):
-            self.memory.raid_sweep_steps.setdefault(unit_id, index)
-        if self.memory.raid_sweep_origin is None and turn.core is not None:
-            self.memory.raid_sweep_origin = turn.core.position
-        return vanguard_ids, ranger_ids
-
-    def _raid_core_is_unattended(
-        self,
-        turn: Turn,
-        core: CoreView,
-    ) -> tuple[bool, str]:
-        nearby_enemies = [
-            enemy
-            for enemy in turn.visible_enemies
-            if isinstance(enemy, UnitView)
-            and _distance(enemy.position, core.position) <= RAID_CORE_GUARD_RADIUS
-        ]
-        if not nearby_enemies:
-            return True, "core_alone"
-        all_stationary = all(
-            self.memory.raid_enemy_motion.get(str(enemy.id), RaidEnemyMotion(
-                position=enemy.position,
-                stationary_observations=1,
-                last_seen_tick=turn.tick,
-            )).stationary_observations >= RAID_STATIONARY_OBSERVATIONS
-            for enemy in nearby_enemies
-        )
-        return all_stationary, "nearby_stationary" if all_stationary else "nearby_active"
-
-    def _update_raid_target(
-        self,
-        turn: Turn,
-        raid_ids: set[UUID],
-        decisions: list[str],
-    ) -> None:
-        if (
-            not self.memory.raid_enabled
-            or self.memory.raid_recall
-            or not raid_ids
-        ):
-            self.memory.raid_core_id = None
-            self.memory.raid_core_position = None
-            self.memory.raid_core_acquired_tick = 0
-            return
-
-        obstacles = set(self.memory.known_obstacles) | set(turn.obstacle_cells)
-        visible_by_id = {
-            str(enemy.id): enemy
-            for enemy in turn.visible_enemies
-            if isinstance(enemy, CoreView)
-        }
-        if self.memory.raid_core_id is not None:
-            current = visible_by_id.get(self.memory.raid_core_id)
-            if current is not None:
-                self.memory.raid_core_position = current.position
-                unattended, reason = self._raid_core_is_unattended(turn, current)
-                if not unattended:
-                    decisions.append(
-                        f"raid target_cleared core={_short_id(current.id)} "
-                        f"reason={reason}"
-                    )
-                    self.memory.decision_totals["raid:target_cleared_active_guard"] += 1
-                    self.memory.raid_core_id = None
-                    self.memory.raid_core_position = None
-                    self.memory.raid_core_acquired_tick = 0
-            elif (
-                self.memory.raid_core_position is not None
-                and _currently_visible(
-                    turn,
-                    self.memory.raid_core_position,
-                    obstacles,
-                )
-            ):
-                decisions.append(
-                    f"raid target_cleared core={self.memory.raid_core_id[:8]} "
-                    "reason=cell_rechecked_empty"
-                )
-                self.memory.decision_totals["raid:target_cleared_missing"] += 1
-                self.memory.raid_core_id = None
-                self.memory.raid_core_position = None
-                self.memory.raid_core_acquired_tick = 0
-
-        if self.memory.raid_core_id is not None:
-            return
-
-        raid_units = [
-            unit
-            for unit in turn.units
-            if unit.id in raid_ids
-        ]
-        candidates: list[tuple[int, bytes, CoreView, str]] = []
-        for enemy in visible_by_id.values():
-            if not any(
-                _unit_can_see_position(unit, enemy.position, obstacles)
-                for unit in raid_units
-            ):
-                continue
-            unattended, reason = self._raid_core_is_unattended(turn, enemy)
-            if unattended:
-                candidates.append(
-                    (
-                        min(_distance(unit.position, enemy.position) for unit in raid_units),
-                        enemy.id.bytes,
-                        enemy,
-                        reason,
-                    )
-                )
-        if not candidates:
-            return
-        _, _, target, reason = min(candidates, key=lambda item: (item[0], item[1]))
-        self.memory.raid_core_id = str(target.id)
-        self.memory.raid_core_position = target.position
-        self.memory.raid_core_acquired_tick = turn.tick
-        decisions.append(
-            f"raid target_acquired core={_short_id(target.id)} "
-            f"position={target.position} reason={reason}"
-        )
-        self.memory.decision_totals["raid:target_acquired"] += 1
-
-    def _raid_sweep_target(
-        self,
-        unit: Unit,
-        member_index: int,
-        member_count: int,
-    ) -> Position:
-        origin = self.memory.raid_sweep_origin or unit.position
-        unit_id = str(unit.id)
-        step = self.memory.raid_sweep_steps.get(unit_id, member_index)
-        sector = ASSAULT_SWEEP_SECTOR_OFFSETS[step % len(ASSAULT_SWEEP_SECTOR_OFFSETS)]
-        radius = RAID_SWEEP_INITIAL_RADIUS + (
-            step // len(ASSAULT_SWEEP_SECTOR_OFFSETS)
-        ) * RAID_SWEEP_RING_SPACING
-        if sector[0] and sector[1]:
-            x_distance = radius // 2
-            y_distance = radius - x_distance
-        else:
-            x_distance = radius if sector[0] else 0
-            y_distance = radius if sector[1] else 0
-        return (
-            origin[0] + sector[0] * x_distance,
-            origin[1] + sector[1] * y_distance,
-        )
-
-    def _choose_raid(
-        self,
-        turn: Turn,
-        planner: MovementPlanner,
-        acted_units: set[UUID],
-        decisions: list[str],
-        vanguard_ids: set[UUID],
-        ranger_ids: set[UUID],
-    ) -> None:
-        if not self.memory.raid_enabled:
-            return
-        selected = [
-            unit
-            for unit in (*turn.vanguards, *turn.rangers)
-            if unit.id in vanguard_ids or unit.id in ranger_ids
-        ]
-        selected.sort(key=_uuid_key)
-        if not selected:
-            return
-        if self.memory.raid_recall:
-            offsets = VANGUARD_RECALL_OFFSETS + RANGER_RECALL_OFFSETS
-            for index, unit in enumerate(selected):
-                if unit.id in acted_units:
-                    continue
-                target = (
-                    turn.core.position[0] + offsets[index % len(offsets)][0],
-                    turn.core.position[1] + offsets[index % len(offsets)][1],
-                )
-                if unit.position == target:
-                    unit.wait()
-                    decisions.append(
-                        f"raid:{_short_id(unit.id)} wait reason=raid_recall target={target}"
-                    )
-                elif not planner.toward(unit, target, "raid_recall"):
-                    unit.wait()
-                acted_units.add(unit.id)
-            return
-
-        target_position = self.memory.raid_core_position
-        if target_position is not None:
-            visible_core = next(
-                (
-                    enemy
-                    for enemy in turn.visible_enemies
-                    if isinstance(enemy, CoreView)
-                    and str(enemy.id) == self.memory.raid_core_id
-                ),
-                None,
-            )
-            for unit in selected:
-                if unit.id in acted_units:
-                    continue
-                if isinstance(unit, Vanguard):
-                    direction = next(
-                        (
-                            candidate
-                            for candidate in DIRECTION_ORDER
-                            if _destination(unit.position, candidate) == target_position
-                        ),
-                        None,
-                    )
-                    if visible_core is not None and direction is not None:
-                        unit.sweep(direction)
-                        decisions.append(
-                            f"raid:{_short_id(unit.id)} sweep {direction.value} "
-                            f"reason=raid_core_assault target={target_position}"
-                        )
-                    elif not planner.toward(unit, target_position, "raid_core_assault"):
-                        unit.wait()
-                else:
-                    shots = [
-                        (enemy, cell)
-                        for enemy, cell in self._ranger_shot_candidates(
-                            turn,
-                            unit,
-                            planner,
-                        )
-                        if isinstance(enemy, CoreView)
-                        and str(enemy.id) == self.memory.raid_core_id
-                    ]
-                    if shots:
-                        enemy, cell = min(shots, key=lambda pair: pair[1])
-                        unit.shoot(enemy, expected_cell=cell)
-                        self._mark_ranger_shot(enemy, cell)
-                        decisions.append(
-                            f"raid:{_short_id(unit.id)} shoot "
-                            f"target={target_position} reason=raid_core_assault"
-                        )
-                    else:
-                        firing_cells = self._firing_cells(
-                            target_position,
-                            planner.obstacles,
-                        )
-                        firing_target = (
-                            min(
-                                firing_cells,
-                                key=lambda cell: (
-                                    planner.final_occupancy(cell),
-                                    planner.threat.get(cell, 0),
-                                    _distance(unit.position, cell),
-                                    cell,
-                                ),
-                            )
-                            if firing_cells
-                            else target_position
-                        )
-                        if not planner.toward(
-                            unit,
-                            firing_target,
-                            "raid_core_seek_firing",
-                        ):
-                            unit.wait()
-                acted_units.add(unit.id)
-            return
-
-        active_enemies = [
-            enemy.position
-            for enemy in turn.visible_enemies
-            if isinstance(enemy, UnitView)
-            and _distance(enemy.position, turn.core.position) > 5
-            and _distance(enemy.position, min(selected, key=lambda unit: _distance(unit.position, enemy.position)).position) <= 6
-            and self.memory.raid_enemy_motion.get(str(enemy.id), RaidEnemyMotion(
-                position=enemy.position,
-                stationary_observations=1,
-                last_seen_tick=turn.tick,
-            )).stationary_observations < RAID_STATIONARY_OBSERVATIONS
-        ]
-        member_count = len(selected)
-        for index, unit in enumerate(selected):
-            if active_enemies and planner.flee_open(
-                unit,
-                active_enemies,
-                turn.core.position,
-                "raid_evade_active_enemy",
-            ):
-                acted_units.add(unit.id)
-                continue
-            target = self._raid_sweep_target(unit, index, member_count)
-            step = self.memory.raid_sweep_steps.get(str(unit.id), index)
-            if _distance(unit.position, target) <= RAID_SWEEP_WAYPOINT_REACHED_RADIUS:
-                step += max(1, member_count)
-                self.memory.raid_sweep_steps[str(unit.id)] = step
-                target = self._raid_sweep_target(unit, index, member_count)
-            if not planner.toward(unit, target, "raid_sweep"):
-                unit.wait()
-            acted_units.add(unit.id)
 
     def _core_logistics_parking_target(
         self,
@@ -3656,7 +2828,7 @@ class SmartTactic:
         )
         vanguard_defenders: set[UUID] = set()
         ranger_defenders: set[UUID] = set()
-        if self.memory.mode == MODE_AGGRESS:
+        if False:
             vanguard_defenders, ranger_defenders = self._aggress_core_defender_ids(
                 turn
             )
@@ -3899,7 +3071,7 @@ class SmartTactic:
                 unit for unit in turn.rangers if unit.id not in home_rangers
             )
         develop_needs_resource_search = (
-            self.memory.mode == MODE_DEVELOP
+            False
             and (
                 bool(self.memory.browser_resource_hints)
                 or (
@@ -3933,11 +3105,11 @@ class SmartTactic:
         owns_beacon = _owns_beacon(turn)
         resource_target_core_leash = None
         if not owns_beacon:
-            if self.memory.mode == MODE_DEVELOP:
+            if False:
                 resource_target_core_leash = (
                     DEVELOP_RESOURCE_TARGET_CORE_LEASH_DISTANCE
                 )
-            elif self.memory.mode == MODE_BEACON:
+            elif False:
                 resource_target_core_leash = (
                     BEACON_RESOURCE_TARGET_CORE_LEASH_DISTANCE
                 )
@@ -3998,7 +3170,7 @@ class SmartTactic:
                 ]
                 if threats and planner.flee(worker, threats, "worker_flee"):
                     if (
-                        self.memory.mode == MODE_DEVELOP
+                        False
                         and not owns_beacon
                         and _distance(worker.position, turn.core.position)
                         > DEVELOP_WIDE_SEARCH_MAX_RADIUS
@@ -4028,7 +3200,7 @@ class SmartTactic:
             empty_workers.append(worker)
 
         unassigned = {worker.id: worker for worker in empty_workers}
-        if self.memory.mode == MODE_BEACON:
+        if False:
             # Beacon expeditions are combat-only.  Retire legacy Worker beacon
             # goals so the economy stays around the Core while the escort leaves.
             for worker in unassigned.values():
@@ -4083,7 +3255,7 @@ class SmartTactic:
                 stuck_cleared += 1
         if stuck_cleared:
             decisions.append(f"worker_stuck_cleared count={stuck_cleared}")
-        if self.memory.mode == MODE_DEVELOP and not owns_beacon:
+        if False and not owns_beacon:
             resource_signals = set(turn.resource_cells) | set(
                 self.memory.resource_last_seen
             )
@@ -4265,18 +3437,18 @@ class SmartTactic:
         )
         reserved_scout_tasks = int(bool(self.memory.recovery_targets))
         if (
-            self.memory.mode == MODE_AGGRESS
+            False
             and self.memory.browser_resource_hints
         ):
             reserved_scout_tasks += BROWSER_RESOURCE_SCOUT_LIMIT
         productive_worker_slots = exact_resource_tasks + reserved_scout_tasks
         resource_sweep_active = (
-            self.memory.mode in {MODE_AGGRESS, MODE_BEACON}
+            False
             and not full_capacity
             and productive_worker_slots < len(unassigned)
         )
         develop_wide_search = (
-            self.memory.mode == MODE_DEVELOP
+            False
             and not full_capacity
             and not resource_signal_available
             and not actionable_resource_memory
@@ -4335,6 +3507,32 @@ class SmartTactic:
                 or goal.position in reserved_targets
             ):
                 continue
+
+            # === 动态切换到更近资源：途中发现近 2 格以上的资源立即切换 ===
+            # 避免"路过近资源走向远资源"，提升采集效率。
+            current_distance = _distance(worker.position, goal.position)
+            switch_threshold = 2  # 至少近 2 格才切换，避免频繁摇摆
+            closer_resources = [
+                pos for pos in available_resources
+                if pos != goal.position
+                and _distance(worker.position, pos) < current_distance - switch_threshold
+            ]
+
+            if closer_resources:
+                # 找出最近的资源
+                new_target = min(closer_resources, key=lambda pos: _distance(worker.position, pos))
+                new_distance = _distance(worker.position, new_target)
+                # 释放旧目标，切换到新目标
+                available_resources.add(goal.position)  # 旧目标重新可用
+                available_resources.discard(new_target)
+                self.memory.set_worker_goal(worker, "visible_resource", new_target, turn.tick)
+                decisions.append(
+                    f"worker:{_short_id(worker.id)} switch_to_closer_resource "
+                    f"old={goal.position}(d={current_distance}) new={new_target}(d={new_distance})"
+                )
+                self.memory.decision_totals["worker:switch_to_closer"] += 1
+                goal = self.memory.worker_goals.get(str(worker.id))  # 更新 goal 引用
+
             self.memory.set_worker_goal(worker, "visible_resource", goal.position, goal.created_tick)
             if self._worker_toward(
                 turn,
@@ -4457,7 +3655,7 @@ class SmartTactic:
             if goal.kind == "resource_sweep":
                 search_leash = (
                     BEACON_RESOURCE_SWEEP_MAX_RADIUS
-                    if self.memory.mode == MODE_BEACON
+                    if False
                     else AGGRESS_RESOURCE_SWEEP_MAX_RADIUS
                 )
             else:
@@ -4501,7 +3699,7 @@ class SmartTactic:
             and position not in reserved_targets
             and turn.tick - seen_tick <= 12
             and (
-                self.memory.mode != MODE_DEVELOP
+                True
                 or owns_beacon
                 or position in actionable_resource_memory
             )
@@ -4523,7 +3721,7 @@ class SmartTactic:
             kind="last_seen_resource",
         )
 
-        if self.memory.mode in {MODE_DEVELOP, MODE_AGGRESS} and not full_capacity:
+        if False and not full_capacity:
             browser_targets = {
                 position
                 for position in self.memory.browser_resource_hints
@@ -4577,7 +3775,7 @@ class SmartTactic:
                 reserved_targets,
             )
 
-        if self.memory.mode == MODE_MIGRATE:
+        if False:
             for worker_id, worker in list(unassigned.items()):
                 self.memory.clear_worker_goal(worker)
                 if (
@@ -4593,7 +3791,7 @@ class SmartTactic:
                     unassigned.pop(worker_id, None)
             return incoming_deposit
 
-        if self.memory.mode == MODE_LIGHTNING:
+        if True:
             # 工人中行星轨道：发现资源 → 现有经济逻辑(上方已处理采集/回仓)；
             # 空闲(无货、无资源目标) → 上中行星轨道绕 Core 转圈巡逻。
             # NEAR 勤王 → 工人回 Core 卡位肉盾(游侠躲工人后面狙击)。
@@ -4821,11 +4019,11 @@ class SmartTactic:
             unassigned.pop(worker_id, None)
 
     def _refill_probe_limit(self, turn: Turn) -> int:
-        if self.memory.mode == MODE_DEVELOP:
+        if False:
             # A seven-Worker economy can afford three concurrent probes of
             # known productive chunks while four Workers retain local coverage.
             return min(3, max(1, (len(turn.workers) + 1) // 2))
-        if self.memory.mode == MODE_AGGRESS:
+        if False:
             # Keep at least half the Workers on local sweep/deposit duty while
             # up to three revisit productive chunks after their refill Tick.
             return min(3, max(1, (len(turn.workers) + 1) // 2))
@@ -4834,11 +4032,11 @@ class SmartTactic:
     def _refill_probe_core_leash_distance(self, owns_beacon: bool) -> int:
         if owns_beacon:
             return REFILL_PROBE_CORE_LEASH_DISTANCE
-        if self.memory.mode == MODE_DEVELOP:
+        if False:
             return DEVELOP_REFILL_PROBE_CORE_LEASH_DISTANCE
-        if self.memory.mode == MODE_AGGRESS:
+        if False:
             return AGGRESS_REFILL_PROBE_CORE_LEASH_DISTANCE
-        if self.memory.mode == MODE_BEACON:
+        if False:
             return BEACON_REFILL_PROBE_CORE_LEASH_DISTANCE
         return REFILL_PROBE_CORE_LEASH_DISTANCE
 
@@ -4925,7 +4123,7 @@ class SmartTactic:
         strategic_beacon = None if owns_beacon else turn.beacon.position
         strategic_core = (
             turn.core.position
-            if owns_beacon or self.memory.mode == MODE_BEACON
+            if owns_beacon or False
             else None
         )
         core_leash_distance = self._refill_probe_core_leash_distance(owns_beacon)
@@ -4945,7 +4143,7 @@ class SmartTactic:
                 and turn.tick - self.memory.chunk_last_probe.get(chunk, -1000)
                 >= (
                     AGGRESS_REFILL_PROBE_RECHECK_TICKS
-                    if self.memory.mode == MODE_AGGRESS
+                    if False
                     else 8
                 )
                 and chunk not in active_chunks
@@ -5072,7 +4270,7 @@ class SmartTactic:
         preferred_vector = preferred_vectors[(worker_number - 1) % 8]
         candidates: set[Position] = set()
         if wide_search:
-            if self.memory.mode == MODE_AGGRESS:
+            if False:
                 # Resource recovery uses its own bounded local sweep state.
                 # Do not reuse the Develop-mode radius, which may have grown
                 # to 48 before the mode changed.
@@ -5101,7 +4299,7 @@ class SmartTactic:
                     if AGGRESS_RESOURCE_SWEEP_INITIAL_RADIUS <= radius
                     <= AGGRESS_RESOURCE_SWEEP_MAX_RADIUS
                 )
-            elif self.memory.mode == MODE_BEACON:
+            elif False:
                 completed_radius = min(
                     self.memory.worker_search_radius.get(str(worker.id), 0),
                     BEACON_RESOURCE_SWEEP_MAX_RADIUS,
@@ -5323,7 +4521,7 @@ class SmartTactic:
             sighting.is_core for sighting in self.memory.enemy_sightings.values()
         )
         safe = (
-            self.memory.mode == MODE_AGGRESS
+            False
             and turn.core is not None
             and turn.core.view.state is CoreState.NORMAL
             and not turn.visible_enemies
@@ -5492,7 +4690,7 @@ class SmartTactic:
             return
         healing_candidates: list[Unit]
         healing_reason = "heal_return"
-        if self.memory.mode == MODE_AGGRESS:
+        if False:
             if core.view.state is not CoreState.NORMAL:
                 return
             vanguard_defenders, ranger_defenders = (
@@ -5691,7 +4889,7 @@ class SmartTactic:
             turn.vanguards,
             vanguard_excluded,
             self.memory.aggress_vanguards,
-            AGGRESS_DEFENDER_VANGUARDS,
+            1,  # 原 AGGRESS_DEFENDER_VANGUARDS
             self.memory.raid_vanguards if self.memory.raid_enabled else 0,
             AGGRESS_MIN_ASSAULT_VANGUARDS,
             UnitType.VANGUARD,
@@ -5700,7 +4898,7 @@ class SmartTactic:
             turn.rangers,
             set(beacon_ranger_guards),
             self.memory.aggress_rangers,
-            AGGRESS_DEFENDER_RANGERS,
+            1,  # 原 AGGRESS_DEFENDER_RANGERS
             self.memory.raid_rangers if self.memory.raid_enabled else 0,
             AGGRESS_MIN_ASSAULT_RANGERS,
             UnitType.RANGER,
@@ -5763,7 +4961,7 @@ class SmartTactic:
         the 1 Vanguard + 2 Ranger breach minimum is actually together.
         """
         if (
-            self.memory.mode != MODE_AGGRESS
+            True
             or turn.core is None
             or core_target is None
             # A known Core must never redefine the last surviving defenders as
@@ -5931,7 +5129,7 @@ class SmartTactic:
     def _maybe_activate_beacon_expedition(self, turn: Turn) -> None:
         """Send only surplus combat units after the fixed home reserve is safe."""
         if (
-            self.memory.mode != MODE_DEVELOP
+            True
             or self.memory.recall
             or _owns_beacon(turn)
             or self._home_recovery_active(turn)
@@ -5954,7 +5152,7 @@ class SmartTactic:
             or len(turn.rangers) < required_rangers
         ):
             return
-        self.memory.mode = MODE_BEACON
+        # mode assignment removed (Lightning only)
         self.memory.observations.append(
             "beacon_expedition_activated "
             f"vanguards={len(turn.vanguards)} rangers={len(turn.rangers)}"
@@ -5985,7 +5183,7 @@ class SmartTactic:
     ) -> tuple[set[UUID], set[UUID]]:
         """Release a stable 1+1 head-start pair without switching workers to Beacon mode."""
         if (
-            self.memory.mode != MODE_DEVELOP
+            True
             or self.memory.recall
             or _owns_beacon(turn)
             or turn.core is None
@@ -6098,7 +5296,7 @@ class SmartTactic:
             and len(emergency_threats) < home_defender_count
         )
         if (
-            self.memory.mode != MODE_BEACON
+            True
             or turn.core is None
             or self._core_recently_damaged(turn)
             or (
@@ -6141,7 +5339,7 @@ class SmartTactic:
             self.memory.clear_local_core_sortie()
 
         unsafe_home = (
-            self.memory.mode != MODE_BEACON
+            True
             or self.memory.recall
             or turn.core is None
             or self._home_recovery_active(turn)
@@ -7613,7 +6811,7 @@ class SmartTactic:
         self,
         turn: Turn,
     ) -> tuple[bool, tuple[UnitView, ...]]:
-        if self.memory.mode != MODE_AGGRESS or turn.core is None:
+        if True or turn.core is None:
             return False, ()
         threats = tuple(
             enemy
@@ -7645,15 +6843,15 @@ class SmartTactic:
             self._choose_vanguards_recall(turn, planner, acted_units, decisions)
         elif self.memory.rally_point is not None:
             self._choose_vanguards_rally(turn, planner, acted_units, decisions)
-        elif self.memory.mode == MODE_AGGRESS:
+        elif False:
             self._choose_vanguards_aggress(turn, planner, acted_units, decisions)
-        elif self.memory.mode == MODE_BEACON:
+        elif False:
             self._choose_vanguards_beacon(turn, planner, acted_units, decisions)
-        elif self.memory.mode == MODE_MIGRATE:
+        elif False:
             self._choose_vanguards_migrate(turn, planner, acted_units, decisions)
-        elif self.memory.mode == MODE_DEVELOP:
+        elif False:
             self._choose_vanguards_develop(turn, planner, acted_units, decisions)
-        elif self.memory.mode == MODE_LIGHTNING:
+        elif True:
             self._choose_vanguards_lightning(turn, planner, acted_units, decisions)
         else:
             self._choose_vanguards_defend(turn, planner, acted_units, decisions)
@@ -7776,7 +6974,7 @@ class SmartTactic:
         apply_rotations: bool = True,
     ) -> tuple[Vanguard | None, set[UUID], set[UUID]]:
         if (
-            self.memory.mode not in {MODE_AGGRESS, MODE_MIGRATE}
+            True
             or turn.beacon.status is not BeaconStatus.CARRIED
             or turn.beacon.carrier_id is None
         ):
@@ -9335,15 +8533,15 @@ class SmartTactic:
             self._choose_rangers_recall(turn, planner, acted_units, decisions)
         elif self.memory.rally_point is not None:
             self._choose_rangers_rally(turn, planner, acted_units, decisions)
-        elif self.memory.mode == MODE_AGGRESS:
+        elif False:
             self._choose_rangers_aggress(turn, planner, acted_units, decisions)
-        elif self.memory.mode == MODE_BEACON:
+        elif False:
             self._choose_rangers_beacon(turn, planner, acted_units, decisions)
-        elif self.memory.mode == MODE_MIGRATE:
+        elif False:
             self._choose_rangers_migrate(turn, planner, acted_units, decisions)
-        elif self.memory.mode == MODE_DEVELOP:
+        elif False:
             self._choose_rangers_develop(turn, planner, acted_units, decisions)
-        elif self.memory.mode == MODE_LIGHTNING:
+        elif True:
             self._choose_rangers_lightning(turn, planner, acted_units, decisions)
         else:
             self._choose_rangers_defend(turn, planner, acted_units, decisions)
@@ -10861,34 +10059,32 @@ class SmartTactic:
     ) -> UnitType | None:
         """Return the Unit this Core would produce if its cell had capacity."""
         core = turn.core
-        if core is None or self.memory.mode == MODE_MIGRATE:
+        if core is None:
             return None
+
+        current_population = len(turn.units)
+        worker_cost = unit_cost(UnitType.WORKER, current_population)
+        vanguard_cost = unit_cost(UnitType.VANGUARD, current_population)
+        ranger_cost = unit_cost(UnitType.RANGER, current_population)
+
+        # === 资源容量紧急管理：资源达到容量 80% 时优先造工人消耗资源 ===
+        # 触发条件：未达 100 人总上限 + 资源≥容量*0.8 + 买得起工人
+        # 优先级高于固定产兵阶梯，避免资源溢出浪费。20-100 人区间纯工人，
+        # 不影响 20 人内战斗配置（游侠/先锋比例照旧）。
+        capacity = turn.resource_capacity
+        urgency_threshold = int(capacity * 0.8)
+        if (
+            current_population < ABSOLUTE_MAX_POPULATION
+            and projected_resources >= urgency_threshold
+            and projected_resources >= worker_cost
+            and current_population >= LIGHTNING_MAX_POPULATION  # 只在超过 20 人后才触发紧急工人
+        ):
+            return UnitType.WORKER
 
         near_threat = any(
             _distance(core.position, enemy.position) <= 5
             for enemy in turn.visible_enemies
         )
-        recovery_active = self._home_recovery_active(turn)
-        home_vanguard_shortfall, home_ranger_shortfall, combat_shortfall = (
-            self._home_guard_shortfall(turn)
-        )
-        workers = len(turn.workers)
-        rangers = len(turn.rangers)
-        vanguards = len(turn.vanguards)
-        current_population = len(turn.units)
-        worker_cost = unit_cost(UnitType.WORKER, current_population)
-        vanguard_cost = unit_cost(UnitType.VANGUARD, current_population)
-        ranger_cost = unit_cost(UnitType.RANGER, current_population)
-        guard_gap_costs = [
-            cost
-            for shortfall, cost in (
-                (home_vanguard_shortfall, vanguard_cost),
-                (home_ranger_shortfall, ranger_cost),
-            )
-            if shortfall > 0
-        ]
-        if combat_shortfall > 0 and not guard_gap_costs:
-            guard_gap_costs.append(ranger_cost)
         owned_ids = {unit.id for unit in turn.units} | {core.id}
         owns_beacon = (
             turn.beacon.status is BeaconStatus.CARRIED
@@ -10897,251 +10093,29 @@ class SmartTactic:
         shield_cap = 10 if owns_beacon else 5
         reserve = 2 if near_threat or core.shield < shield_cap else 0
         budget = projected_resources - reserve
-        mode = self.memory.mode
-        recall = self.memory.recall
-        known_core_target = (
-            self._pick_enemy_core_target(turn)
-            if mode == MODE_AGGRESS
-            else None
+
+        # 闪电模式固定产兵阶梯（用户指定，攒钱优先不 fallthrough）：
+        #   pop1→先锋, 2→工人, 3→游侠, 4→工人, 5→游侠, 6→工人,
+        #   7→游侠, 8→工人, 9+→游侠, 满 20 停。
+        # 只造 1 先锋(先锋不强,前期一个够;肉盾由工人充当,勤王时游侠躲工人
+        # 后面狙击)。pop≥9 起只造游侠。容量 max(10,pop*5) 自然走通:
+        # pop1 cap10≥先锋10; pop2 cap10≥工人5; pop3 cap15≥游侠12。
+        # 阵亡补回：current_population 回落即按该 pop 槽位补(尾段全是游侠,
+        # 撤一个补一个游侠);先锋阵亡不强制重建(符合"先锋弱、工人当肉盾")。
+        if current_population >= LIGHTNING_MAX_POPULATION:
+            return None
+        target_type = self._lightning_build_slot(current_population)
+        if target_type is None:
+            return None
+        cost = (
+            worker_cost
+            if target_type is UnitType.WORKER
+            else vanguard_cost
+            if target_type is UnitType.VANGUARD
+            else ranger_cost
         )
-        core_assault_production = (
-            mode == MODE_AGGRESS
-            and not recall
-            and known_core_target is not None
-            and _distance(core.position, known_core_target)
-            <= CORE_ASSAULT_MAX_HOME_DISTANCE
-            and home_vanguard_shortfall == 0
-            and home_ranger_shortfall == 0
-            and combat_shortfall == 0
-            and not any(
-                isinstance(enemy, UnitView)
-                and _distance(core.position, enemy.position)
-                <= AGGRESS_CORE_ALERT_RADIUS
-                for enemy in turn.visible_enemies
-            )
-        )
-
-        if recovery_active and mode != MODE_LIGHTNING:
-            combat_units = vanguards + rangers
-            worker_floor = 3 if mode == MODE_BEACON else AGGRESS_BASE_WORKERS
-            if workers < worker_floor and budget >= worker_cost:
-                return UnitType.WORKER
-            if (
-                combat_units == 0
-                and home_vanguard_shortfall > 0
-                and budget >= vanguard_cost
-            ):
-                return UnitType.VANGUARD
-            if home_ranger_shortfall > 0 and budget >= ranger_cost:
-                return UnitType.RANGER
-            if home_vanguard_shortfall > 0 and budget >= vanguard_cost:
-                return UnitType.VANGUARD
-            if (
-                combat_shortfall > 0
-                and workers < RECOVERY_BRIDGE_MAX_WORKERS
-                and budget >= worker_cost
-                and projected_resources - worker_cost >= 1
-                and budget < min(guard_gap_costs)
-            ):
-                return UnitType.WORKER
-            if (
-                workers < 6
-                and budget >= worker_cost
-                and not turn.resource_cells
-                and not self.memory.browser_resource_hints
-            ):
-                return UnitType.WORKER
-            return None
-
-        if recall:
-            if vanguards < AGGRESS_DEFENDER_VANGUARDS and budget >= vanguard_cost:
-                return UnitType.VANGUARD
-            if rangers < AGGRESS_DEFENDER_RANGERS and budget >= ranger_cost:
-                return UnitType.RANGER
-            if workers < AGGRESS_BASE_WORKERS and budget >= worker_cost:
-                return UnitType.WORKER
-            return None
-
-        if mode == MODE_DEVELOP:
-            if workers < 4 and budget >= worker_cost:
-                return UnitType.WORKER
-            if vanguards < 1 and budget >= vanguard_cost:
-                return UnitType.VANGUARD
-            if rangers < 1 and budget >= ranger_cost:
-                return UnitType.RANGER
-            if (
-                near_threat
-                and rangers < 4
-                and budget >= ranger_cost
-                and projected_resources - ranger_cost >= DEFENSE_REPLACEMENT_RESERVE
-            ):
-                return UnitType.RANGER
-            if (
-                near_threat
-                and vanguards < 4
-                and budget >= vanguard_cost
-                and projected_resources - vanguard_cost
-                >= DEFENSE_REPLACEMENT_RESERVE
-            ):
-                return UnitType.VANGUARD
-            if near_threat:
-                return None
-            if (
-                vanguards
-                < RAID_HOME_RESERVE_VANGUARDS
-                + DEVELOP_BEACON_EXPEDITION_VANGUARDS
-                and budget >= vanguard_cost
-            ):
-                return UnitType.VANGUARD
-            if (
-                rangers
-                < RAID_HOME_RESERVE_RANGERS
-                + DEVELOP_BEACON_EXPEDITION_RANGERS
-                and budget >= ranger_cost
-            ):
-                return UnitType.RANGER
-            if (
-                workers < DEVELOP_TARGET_WORKERS
-                and budget >= worker_cost
-                and projected_resources - worker_cost
-                >= DEFENSE_REPLACEMENT_RESERVE
-            ):
-                return UnitType.WORKER
-            if rangers < DEVELOP_TARGET_RANGERS and budget >= ranger_cost:
-                return UnitType.RANGER
-            if vanguards < DEVELOP_TARGET_VANGUARDS and budget >= vanguard_cost:
-                return UnitType.VANGUARD
-            return None
-
-        if mode == MODE_AGGRESS:
-            replacement_costs = (
-                (UnitType.RANGER, ranger_cost),
-                (UnitType.VANGUARD, vanguard_cost),
-                (UnitType.WORKER, worker_cost),
-            )
-            replacement_pending = any(
-                self.memory.replacement_queue[unit_type.value] > 0
-                for unit_type, _ in replacement_costs
-            )
-            if (
-                workers < AGGRESS_BASE_WORKERS
-                and not near_threat
-                and budget >= worker_cost
-            ):
-                return UnitType.WORKER
-            for unit_type, cost in replacement_costs:
-                if (
-                    self.memory.replacement_queue[unit_type.value] > 0
-                    and budget >= cost
-                ):
-                    return unit_type
-            if replacement_pending:
-                return None
-            if workers < AGGRESS_BASE_WORKERS and budget >= worker_cost:
-                return UnitType.WORKER
-            if (
-                core_assault_production
-                and vanguards
-                < RAID_HOME_RESERVE_VANGUARDS + CORE_ASSAULT_MIN_VANGUARDS
-                and budget >= vanguard_cost
-            ):
-                return UnitType.VANGUARD
-            if (
-                core_assault_production
-                and rangers
-                < RAID_HOME_RESERVE_RANGERS + CORE_ASSAULT_MIN_RANGERS
-                and budget >= ranger_cost
-            ):
-                return UnitType.RANGER
-            if near_threat and vanguards < 1 and budget >= vanguard_cost:
-                return UnitType.VANGUARD
-            if (
-                rangers < AGGRESS_DEFENDER_RANGERS
-                and vanguards < AGGRESS_DEFENDER_VANGUARDS
-                and budget >= ranger_cost
-            ):
-                return UnitType.RANGER
-            if vanguards < AGGRESS_DEFENDER_VANGUARDS and budget >= vanguard_cost:
-                return UnitType.VANGUARD
-            if rangers < AGGRESS_DEFENDER_RANGERS and budget >= ranger_cost:
-                return UnitType.RANGER
-            if rangers < AGGRESS_TARGET_RANGERS and budget >= ranger_cost:
-                return UnitType.RANGER
-            if vanguards < AGGRESS_TARGET_VANGUARDS and budget >= vanguard_cost:
-                return UnitType.VANGUARD
-            if (
-                workers < 6
-                and not near_threat
-                and budget >= worker_cost
-                and projected_resources - worker_cost
-                >= DEFENSE_REPLACEMENT_RESERVE
-            ):
-                return UnitType.WORKER
-            return None
-
-        if mode == MODE_LIGHTNING:
-            # 固定产兵阶梯（用户指定，攒钱优先不 fallthrough）：
-            #   pop1→先锋, 2→工人, 3→游侠, 4→工人, 5→游侠, 6→工人,
-            #   7→游侠, 8→工人, 9+→游侠, 满 20 停。
-            # 只造 1 先锋(先锋不强,前期一个够;肉盾由工人充当,勤王时游侠躲工人
-            # 后面狙击)。pop≥9 起只造游侠。容量 max(10,pop*5) 自然走通:
-            # pop1 cap10≥先锋10; pop2 cap10≥工人5; pop3 cap15≥游侠12。
-            # 阵亡补回：current_population 回落即按该 pop 槽位补(尾段全是游侠,
-            # 撤一个补一个游侠);先锋阵亡不强制重建(符合"先锋弱、工人当肉盾")。
-            if current_population >= LIGHTNING_MAX_POPULATION:
-                return None
-            target_type = self._lightning_build_slot(current_population)
-            if target_type is None:
-                return None
-            cost = (
-                worker_cost
-                if target_type is UnitType.WORKER
-                else vanguard_cost
-                if target_type is UnitType.VANGUARD
-                else ranger_cost
-            )
-            if budget >= cost:
-                return target_type
-            return None
-
-        if mode == MODE_BEACON:
-            if workers < 3 and budget >= worker_cost:
-                return UnitType.WORKER
-            if near_threat and rangers < 2 and budget >= ranger_cost:
-                return UnitType.RANGER
-            if near_threat and vanguards < 2 and budget >= vanguard_cost:
-                return UnitType.VANGUARD
-            if rangers < 8 and budget >= ranger_cost:
-                return UnitType.RANGER
-            if (
-                rangers < 8
-                and vanguards >= BEACON_RANGER_PRIORITY_MIN_VANGUARDS
-            ):
-                # Do not spend 10 resources on a Vanguard at population 19;
-                # waiting for the 12-resource Ranger avoids the 20+ price tier.
-                return None
-            if vanguards < 5 and budget >= vanguard_cost:
-                return UnitType.VANGUARD
-            if (
-                workers < BEACON_ECONOMY_TARGET_WORKERS
-                and not near_threat
-                and budget >= worker_cost
-                and projected_resources - worker_cost
-                >= BEACON_ECONOMY_RESERVE
-            ):
-                return UnitType.WORKER
-            if rangers < 12 and budget >= ranger_cost:
-                return UnitType.RANGER
-            if vanguards < 8 and budget >= vanguard_cost:
-                return UnitType.VANGUARD
-            if (
-                workers < 6
-                and not near_threat
-                and budget >= worker_cost
-                and projected_resources - worker_cost
-                >= DEFENSE_REPLACEMENT_RESERVE
-            ):
-                return UnitType.WORKER
+        if budget >= cost:
+            return target_type
         return None
 
     def _choose_core(
@@ -11196,7 +10170,7 @@ class SmartTactic:
 
         can_spawn = (
             planner.final_occupancy(core.position) < 2
-            and self.memory.mode != MODE_MIGRATE
+            and True
         )
         spawn = (
             self._select_spawn(turn, projected_resources)
@@ -11217,164 +10191,25 @@ class SmartTactic:
             decisions.append(f"core repair_shield reason=spare_resources shield={core.shield}")
             self.memory.decision_totals["core:repair"] += 1
         else:
-            if self.memory.mode == MODE_MIGRATE and self.memory.migration_target is not None:
-                target = self.memory.migration_target
-                if core.position == target:
-                    decisions.append(f"migration_arrived target={target}")
-                    self.memory.decision_totals["migration:arrived_hold"] += 1
-                    return
-                nearby_escorts = sum(
-                    1
-                    for unit in (*turn.vanguards, *turn.rangers)
-                    if _distance(unit.position, core.position) <= MIGRATION_ESCORT_RADIUS
-                )
-                required_escorts = min(
-                    MIGRATION_MIN_ESCORTS,
-                    len(turn.vanguards) + len(turn.rangers),
-                )
-                if required_escorts == 0:
-                    required_escorts = 1
-                migration_threat = any(
-                    _distance(enemy.position, core.position) <= 10
-                    for enemy in turn.visible_enemies
-                )
-                if migration_threat or nearby_escorts < required_escorts:
-                    decisions.append(
-                        "migration_hold "
-                        f"target={target} escorts={nearby_escorts}/{required_escorts} "
-                        f"threat={migration_threat}"
-                    )
-                    self.memory.decision_totals["migration:escort_hold"] += 1
-                    return
-                self._choose_core_migration(
-                    turn,
-                    planner,
-                    incoming_deposit,
-                    decisions,
-                    migration_target=target,
-                )
-                return
-            if (
-                self.memory.mode == MODE_AGGRESS
-                and AGGRESS_CORE_SHELTER_ENABLED
-                and self.memory.beacon_target_distance <= 0
-                and not turn.visible_enemies
-                and auto_mobility_ready
-            ):
-                shelter = self._find_core_shelter(turn, planner)
-                if shelter is not None:
-                    shelter_target, shelter_entrance = shelter
-                    if shelter_target == core.position:
-                        decisions.append(
-                            f"core shelter_hold position={core.position} "
-                            f"entrance={shelter_entrance}"
-                        )
-                        self.memory.decision_totals["core:shelter_hold"] += 1
-                        return
-                    decisions.append(
-                        f"core shelter_seek target={shelter_target} "
-                        f"entrance={shelter_entrance}"
-                    )
-                    self.memory.decision_totals["core:shelter_seek"] += 1
-                    self._choose_core_migration(
-                        turn,
-                        planner,
-                        incoming_deposit,
-                        decisions,
-                        shelter_target=(
-                            shelter_target
-                            if core.position == shelter_entrance
-                            else shelter_entrance
-                        ),
-                    )
-                    return
-            # 信标目标距离控制：设置了 beacon_target_distance 时按距离推进/远离
-            beacon_ctrl = self.memory.beacon_target_distance
-            beacon_dist = _distance(core.position, turn.beacon.position)
-            if beacon_ctrl > 0:
-                if not auto_mobility_ready:
-                    decisions.append("core auto_mobility_hold reason=low_defense_beacon_ctrl")
-                    self.memory.decision_totals["core:auto_mobility_hold"] += 1
-                elif beacon_dist > beacon_ctrl + CORE_BEACON_HYSTERESIS:
-                    decisions.append(
-                        f"core migrate reason=beacon_distance_ctrl "
-                        f"dist={beacon_dist} target={beacon_ctrl} toward=beacon"
-                    )
-                    self.memory.decision_totals["core:migrate_beacon_ctrl"] += 1
-                    self._choose_core_migration(
-                        turn,
-                        planner,
-                        incoming_deposit,
-                        decisions,
-                        beacon_target=turn.beacon.position,
-                    )
-                elif beacon_dist < beacon_ctrl - CORE_BEACON_HYSTERESIS:
-                    # 太近 → 远离信标（向反方向延伸点）
-                    retreat = (
-                        core.position[0] * 2 - turn.beacon.position[0],
-                        core.position[1] * 2 - turn.beacon.position[1],
-                    )
-                    decisions.append(
-                        f"core migrate reason=beacon_distance_ctrl "
-                        f"dist={beacon_dist} target={beacon_ctrl} away=beacon"
-                    )
-                    self.memory.decision_totals["core:migrate_beacon_ctrl"] += 1
-                    self._choose_core_migration(
-                        turn,
-                        planner,
-                        incoming_deposit,
-                        decisions,
-                        beacon_target=retreat,
-                    )
-                return
-            if self.memory.mode == MODE_LIGHTNING:
-                # 闪电模式：Core 在方环内绕半径 pr 的周界转圈巡逻。安全方环里
-                # 不需要战斗护卫才动——巡逻本身帮工人找资源、帮猎手发现 Core。
-                # _choose_core_migration 内部已有 8 格内有敌中止 + hp/盾低中止，
-                # 上游 _choose_core 已先处理治疗/修盾/产兵，故不设 auto_mobility 门槛。
-                waypoint = self._lightning_patrol_waypoint(turn)
-                decisions.append(
-                    f"lightning patrol waypoint={waypoint} "
-                    f"phase={self.memory.lightning_patrol_phase}"
-                )
-                self.memory.decision_totals["lightning:patrol"] += 1
-                self._choose_core_migration(
-                    turn,
-                    planner,
-                    incoming_deposit,
-                    decisions,
-                    beacon_target=waypoint,
-                    noncombat_enemies_safe=True,
-                    ignore_beacon_progress=True,
-                )
-                return
-            # cargo 工人被障碍挡回不来（长时间打转且离 core 远）→ 允许 core 自愈迁移靠拢
-            cargo_blocked = False
-            for worker in turn.workers:
-                if not worker.cargo:
-                    continue
-                recent = self.memory.recent_positions.get(str(worker.id), [])
-                if (
-                    len(recent) >= STUCK_TICKS
-                    and len(set(recent)) <= SPIN_POSITION_BUDGET
-                    and _distance(core.position, worker.position) > 6
-                ):
-                    cargo_blocked = True
-                    break
-            if CORE_MIGRATION_ENABLED or cargo_blocked:
-                if not auto_mobility_ready:
-                    decisions.append("core auto_mobility_hold reason=low_defense")
-                    self.memory.decision_totals["core:auto_mobility_hold"] += 1
-                    return
-                if cargo_blocked:
-                    decisions.append("core migrate reason=cargo_blocked_self_heal")
-                    self.memory.decision_totals["core:migrate_cargo_blocked"] += 1
-                self._choose_core_migration(
-                    turn,
-                    planner,
-                    incoming_deposit,
-                    decisions,
-                )
+            # 闪电模式：Core 在方环内绕半径 pr 的周界转圈巡逻。安全方环里
+            # 不需要战斗护卫才动——巡逻本身帮工人找资源、帮猎手发现 Core。
+            # _choose_core_migration 内部已有 8 格内有敌中止 + hp/盾低中止，
+            # 上游 _choose_core 已先处理治疗/修盾/产兵，故不设 auto_mobility 门槛。
+            waypoint = self._lightning_patrol_waypoint(turn)
+            decisions.append(
+                f"lightning patrol waypoint={waypoint} "
+                f"phase={self.memory.lightning_patrol_phase}"
+            )
+            self.memory.decision_totals["lightning:patrol"] += 1
+            self._choose_core_migration(
+                turn,
+                planner,
+                incoming_deposit,
+                decisions,
+                beacon_target=waypoint,
+                noncombat_enemies_safe=True,
+                ignore_beacon_progress=True,
+            )
 
     def _choose_core_migration(
         self,
