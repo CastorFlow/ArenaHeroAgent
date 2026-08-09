@@ -7551,28 +7551,68 @@ class LightningModeTests(unittest.TestCase):
             self.assertGreaterEqual(max(abs(s[0]), abs(s[1])), 500)
             self.assertLessEqual(max(abs(s[0]), abs(s[1])), 700)
 
-    def test_ranger_scout_skips_corner_when_oscillating(self) -> None:
-        # 游侠在两格间横跳(乱石堆死角)→ 跳过当前角推进下一角,换目标绕开。
-        from arena_hero_strategy import LIGHTNING_SCOUT_OSCILLATION_WINDOW
+    def test_ranger_scout_escape_when_oscillating(self) -> None:
+        # 游侠横跳(乱石堆死角)→ _lightning_escape_direction 选开阔方向。
+        # 空旷地形(无障碍)时八方位扇区障碍数全 0,同分按 fwd 分量 → 朝 Core 行进方向。
         memory = TacticMemory(mode=MODE_LIGHTNING)
-        memory.lightning_patrol_phase = 0  # 第一象限角
+        memory.lightning_patrol_phase = 0  # Core 朝第一象限角 → fwd=(+,+)
         tactic = SmartTactic(memory)
         turn, _ = make_turn(
             own_core=core((600, 600)),
             units=(ranger((645, 646), UUID(int=0xB005)),),
         )
-        uid = str(turn.rangers[0].id)
-        # 模拟横跳:recent_positions 在 (645,646)/(646,646) 间反复。
-        memory.recent_positions[uid] = [
-            (645, 646), (646, 646), (645, 646), (646, 646),
-            (645, 646), (646, 646),
-        ][:LIGHTNING_SCOUT_OSCILLATION_WINDOW]
-        self.assertGreaterEqual(
-            len(memory.recent_positions[uid]), LIGHTNING_SCOUT_OSCILLATION_WINDOW
+        esc_dir = tactic._lightning_escape_direction(turn, turn.rangers[0])
+        self.assertIsNotNone(esc_dir)
+        # 逃生方向朝 Core 行进方向(+x, +y)。
+        self.assertGreaterEqual(esc_dir[0], 0, f"escape {esc_dir} should lean +x")
+        self.assertGreaterEqual(esc_dir[1], 0, f"escape {esc_dir} should lean +y")
+        self.assertTrue(esc_dir[0] > 0 or esc_dir[1] > 0)
+
+    def test_ranger_scout_escape_out_of_obstacle_pocket(self) -> None:
+        # 游侠被障碍墙半围、周界角在墙对侧 → A* 死磕墙抖动;横跳后逃生方向应朝
+        # 开阔侧(右侧),通过 _lightning_escape_direction 选出。
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        memory.lightning_patrol_phase = 2  # Core 朝第三象限角 → fwd=(-,-),左下
+        tactic = SmartTactic(memory)
+        # 游侠在 (650, -653),左/下/上是障碍墙(真口袋),右侧 x+ 开阔。
+        walls = tuple((x, -653) for x in range(645, 650))  # 左侧墙
+        walls += tuple((650, y) for y in range(-656, -653))  # 下方墙
+        walls += tuple((650, y) for y in range(-653, -650))  # 上方墙
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(ranger((650, -653), UUID(int=0xB006)),),
+            obstacle_cells=walls,
         )
-        tactic._lightning_ranger_scout_target(turn, turn.rangers[0])
-        # 横跳检测触发 → phase 推进(从 0 到 1),换角。
-        self.assertEqual(memory.lightning_scout_phase[uid], 1)
+        # 把障碍记入 known_obstacles(扇区评估用它 + turn.obstacle_cells)。
+        memory.known_obstacles = set(walls)
+        esc_dir = tactic._lightning_escape_direction(turn, turn.rangers[0])
+        self.assertIsNotNone(esc_dir)
+        # 逃生应朝开阔的右侧(+x),而非朝墙的左侧/上下。
+        self.assertGreater(esc_dir[0], 0, f"escape dir {esc_dir} should head +x (open side)")
+
+    def test_ranger_escape_moves_when_oscillating(self) -> None:
+        # 端到端:游侠横跳 + 被墙半围 → dispatcher 应直接单步逃生(不走 A*),
+        # 产生 lightning_ranger_escape 决策,而非 fallback 抖动。
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        memory.lightning_patrol_phase = 2
+        tactic = SmartTactic(memory)
+        walls = tuple((x, -653) for x in range(645, 650))
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(ranger((650, -653), UUID(int=0xB006)),),
+            obstacle_cells=walls,
+        )
+        memory.known_obstacles = set(walls)
+        uid = str(turn.rangers[0].id)
+        memory.recent_positions[uid] = [(650, -653), (649, -653)] * 3
+        decisions: list[str] = []
+        from arena_hero_strategy import MovementPlanner
+        planner = MovementPlanner(turn, memory, decisions)
+        tactic._choose_rangers_lightning(turn, planner, set(), decisions)
+        self.assertTrue(
+            any("lightning_ranger_escape" in d for d in decisions),
+            f"expected escape decision, got {decisions}",
+        )
 
     def test_ranger_scout_aligns_to_core_patrol_phase(self) -> None:
         # 游侠首次探路的角应跟 Core 巡逻 phase 对齐(朝 Core 前方),而非最近角。
