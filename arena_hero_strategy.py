@@ -74,10 +74,8 @@ LIGHTNING_CROWD_SIGHTING_MAX_AGE = 40
 LIGHTNING_SECTOR_STEP = 6
 # 闪电模式常驻兵力上限（不触 20 人口涨价档）。
 LIGHTNING_MAX_POPULATION = 10
-# 游侠并排探路：在 Core 前方领先格数（刚好出 Core 视野 5 之外铺新视野）。
-LIGHTNING_SCOUT_LEAD = 8
-# 游侠相邻侦察 lane 间距：游侠视野 5，两 lane 中心错开 6 格则相邻视野留 1 格缝
-# 不重叠（中心距 6 > 直径 10/2=5 → 各自视野边缘留 1 格缝）。奇数游侠以中轴对称展开。
+# 游侠同心周界 lane 间距：相邻游侠的方环半径错开 6 格（游侠视野 5，6>直径 10/2
+# 不重叠），径向铺开多条同心周界，N 游侠沿各自周界同向绕圈共同覆盖 Core 轨道。
 LIGHTNING_SCOUT_LANE_GAP = 6
 # 先锋 V 字纵深出探的深度（一来回 ~64 tick，Core 1格/4tick 前进 ~16 格，
 # 下一轮覆盖全新带；内陆最远 32 格，危险时 ~16 tick 回防）。
@@ -572,8 +570,11 @@ class TacticMemory:
     # 送来新的无护卫 Core，没必要死磕被围住的。acquire 永久跳过这些 ID。
     lightning_blacklist: set[str] = field(default_factory=set)
     lightning_sectors: dict[str, tuple[int, int]] = field(default_factory=dict)
-    # 游侠并排探路：UUID → 固定 lane index（单条数轴上奇数位对称展开，防相位抖动）。
+    # 游侠并排探路：UUID → 固定 lane index（径向周界半径的偏移档位）。
     lightning_scout_lanes: dict[str, int] = field(default_factory=dict)
+    # 游侠独立绕圈游标：UUID → 当前周界角序号(0..3)，到达角死区后推进。
+    # 与 Core 位置解耦——游侠沿自己 lane 的周界独立绕圈，不等 Core。
+    lightning_scout_phase: dict[str, int] = field(default_factory=dict)
     # 先锋 V 字纵深状态机：UUID → {phase: "OUT"/"IN", leg: 0/1, origin: (x,y), target: (x,y)}。
     lightning_vee_state: dict[str, dict] = field(default_factory=dict)
     aggress_heal_rotations: dict[str, HealRotation] = field(default_factory=dict)
@@ -960,6 +961,10 @@ class TacticMemory:
                 str(unit_id): int(lane)
                 for unit_id, lane in data.get("lightning_scout_lanes", {}).items()
             }
+            memory.lightning_scout_phase = {
+                str(unit_id): int(phase) % 4
+                for unit_id, phase in data.get("lightning_scout_phase", {}).items()
+            }
             memory.lightning_vee_state = {}
             for unit_id, state in data.get("lightning_vee_state", {}).items():
                 if not isinstance(state, dict):
@@ -1177,6 +1182,7 @@ class TacticMemory:
                 for unit_id, sector in sorted(self.lightning_sectors.items())
             },
             "lightning_scout_lanes": dict(sorted(self.lightning_scout_lanes.items())),
+            "lightning_scout_phase": dict(sorted(self.lightning_scout_phase.items())),
             "lightning_vee_state": {
                 unit_id: {
                     "phase": state["phase"],
@@ -6916,45 +6922,60 @@ class SmartTactic:
         turn: Turn,
         ranger: Unit,
     ) -> Position | None:
-        """游侠并排探路点:沿 Core 行进方向领先 LEAD 格,横向按 lane 错开铺视野。
+        """游侠独立绕圈探路:每游侠一条同心方环 lane,沿周界四角同向转圈。
 
-        相邻 lane 间距 = LIGHTNING_SCOUT_LANE_GAP(> 游侠视野直径,视野不重叠)。
-        lane 横向偏移相对 Core 对称分布:奇数单位以中轴为锚、偶数向两边展开,
-        让 N 个游侠在 Core 前方排成一条与行进方向垂直的横线,把视野铺开。
-        钳到方环内(_lightning_clamp_to_donut)防越框。
+        关键:游侠绕圈**与 Core 位置解耦**,沿自己的 lane 独立推进——Core 1格/4tick
+        太慢,游侠 1格/tick,若锚在 Core 前 LEAD 格会被迫等 Core。这里改为每个游侠
+        认领一条同心方环(lane 决定径向半径偏移),沿周界四角同向转圈,到达角死区后
+        推进下一角。多游侠沿各自 lane 同向绕圈,共同覆盖 Core 轨道所在的环面。
+
+        lane 间距 = LIGHTNING_SCOUT_LANE_GAP,径向铺开多条同心周界(视野不重叠);
+        所有游侠与 Core 同方向(都用周界顺时针角序),故游侠轨道必覆盖 Core 轨道。
+        钳到方环内防越框。
         """
         core = turn.core
         if core is None:
             return None
-        fwd = self._lightning_core_heading_vector(turn)
-        # 正交向量(行进方向逆时针 90°):用作横向 lane 铺开方向。
-        perp = (-fwd[1], fwd[0])
-        # 按 UUID 序给固定 lane index(认领一次后持久,防每 tick 重排抖动)。
+        # 按 UUID 序给固定 lane index(径向同心周界的偏移档位)。
         ordered = sorted(turn.rangers, key=_uuid_key)
         uid = str(ranger.id)
         if uid not in self.memory.lightning_scout_lanes:
             self.memory.lightning_scout_lanes[uid] = len(ordered)
-        # 清理已不在场的游侠 lane 槽。
         live = {str(r.id) for r in turn.rangers}
         for dead in [k for k in self.memory.lightning_scout_lanes if k not in live]:
             self.memory.lightning_scout_lanes.pop(dead, None)
-        # 重排 lane index 为 0..N-1 紧凑序。
+            self.memory.lightning_scout_phase.pop(dead, None)
         live_lanes = sorted(
             self.memory.lightning_scout_lanes.items(), key=lambda kv: kv[1]
         )
-        compact = {
-            uid_: i for i, (uid_, _) in enumerate(live_lanes)
-        }
+        compact = {uid_: i for i, (uid_, _) in enumerate(live_lanes)}
         self.memory.lightning_scout_lanes = compact
         lane = compact.get(uid, 0)
         n = max(1, len(compact))
-        # 对称展开:lane 0..N-1 映射到 [-半, +半] 范围内的整数偏移。
+        # 同心周界半径:以 pr 为中轴,llane 对称偏移,每档 LANE_GAP 格径向距离。
+        pr = self._lightning_patrol_radius()
         half = (n - 1) / 2
-        offset = int(round((lane - half) * LIGHTNING_SCOUT_LANE_GAP))
-        target = (
-            core.position[0] + fwd[0] * LIGHTNING_SCOUT_LEAD + perp[0] * offset,
-            core.position[1] + fwd[1] * LIGHTNING_SCOUT_LEAD + perp[1] * offset,
+        radius = pr + int(round((lane - half) * LIGHTNING_SCOUT_LANE_GAP))
+        inner_r, outer_r = self.memory.lightning_ring
+        radius = max(inner_r + 2, min(outer_r - 2, radius))  # 钳在环内留余量
+        # 该游侠的方环四角(顺时针,与 Core 巡逻同序)。
+        corners = (
+            (radius, radius),
+            (radius, -radius),
+            (-radius, -radius),
+            (-radius, radius),
         )
+        phase = self.memory.lightning_scout_phase.get(uid, 0) % 4
+        # 游侠象限决定起点角(首次按最近角),之后按 phase。
+        if uid not in self.memory.lightning_scout_phase:
+            phase = min(range(4), key=lambda i: _distance(ranger.position, corners[i]))
+            self.memory.lightning_scout_phase[uid] = phase
+        target = corners[phase]
+        # 到达当前角死区 → 推进下一角(独立绕圈,不等 Core)。
+        if _distance(ranger.position, target) <= CORE_BEACON_HYSTERESIS:
+            phase = (phase + 1) % 4
+            self.memory.lightning_scout_phase[uid] = phase
+            target = corners[phase]
         target = self._lightning_clamp_to_donut(target)
         if target == ranger.position:
             return None

@@ -7524,13 +7524,10 @@ class LightningModeTests(unittest.TestCase):
 
     # ---- 侦察改造:并排游侠探路 + 先锋 V 字纵深 + 集火 ----
 
-    def test_ranger_scout_points_lead_core_along_heading(self) -> None:
-        # 2 游侠、Core 在 (600,600),巡逻点 (650,650) → 行进方向 (+x,+y)。
-        # 两个侦察点都应在 Core 北东方向(fwd*LEAD),横向对称偏移、视野不重叠。
-        from arena_hero_strategy import (
-            LIGHTNING_SCOUT_LEAD,
-            LIGHTNING_SCOUT_LANE_GAP,
-        )
+    def test_ranger_scout_each_on_own_concentric_ring(self) -> None:
+        # 2 游侠沿各自的同心方环绕圈(独立于 Core 位置)。各 lane 径向半径不同,
+        # 目标点应在各自周界角上(方环上 max-norm 半径 = 该 lane 的半径)。
+        from arena_hero_strategy import LIGHTNING_SCOUT_LANE_GAP
         memory = TacticMemory(mode=MODE_LIGHTNING)
         tactic = SmartTactic(memory)
         turn, _ = make_turn(
@@ -7545,16 +7542,42 @@ class LightningModeTests(unittest.TestCase):
         s2 = tactic._lightning_ranger_scout_target(turn, turn.rangers[1])
         self.assertIsNotNone(s1)
         self.assertIsNotNone(s2)
-        # 两个点都在 Core 北东半侧(行进方向)。
+        # 两条 lane 半径错开 LANE_GAP,目标点 max-norm 半径应不同(各自同心周界)。
+        r1 = max(abs(s1[0]), abs(s1[1]))
+        r2 = max(abs(s2[0]), abs(s2[1]))
+        self.assertGreaterEqual(abs(r1 - r2), LIGHTNING_SCOUT_LANE_GAP - 1)
+        # 都在方环内。
         for s in (s1, s2):
-            self.assertGreaterEqual(s[0], 600, f"scout {s} should lead +x")
-            self.assertGreaterEqual(s[1], 600, f"scout {s} should lead +y")
-        # 横向 lane 对称:两点的横向间距 ≈ LANE_GAP(视野不重叠)。
-        perp_dist = abs(s1[0] - s2[0]) + abs(s1[1] - s2[1])
-        self.assertGreaterEqual(perp_dist, LIGHTNING_SCOUT_LANE_GAP)
+            self.assertGreaterEqual(max(abs(s[0]), abs(s[1])), 500)
+            self.assertLessEqual(max(abs(s[0]), abs(s[1])), 700)
+
+    def test_ranger_scout_advances_corner_independently_of_core(self) -> None:
+        # 游侠已到达当前角(周界角)→ 推进下一角,不等 Core。Core 留在原地不动,
+        # 游侠靠自己在周界上转圈。
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        tactic = SmartTactic(memory)
+        # Core 在 (600,600) 不靠近任何角;游侠放在 (650,650) 附近(第一象限角)。
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(ranger((648, 649), UUID(int=0xB003)),),
+        )
+        # 首次调用:认领 lane、选最近角为目标(应是第一象限角附近)。
+        first = tactic._lightning_ranger_scout_target(turn, turn.rangers[0])
+        uid = str(turn.rangers[0].id)
+        phase0 = memory.lightning_scout_phase.get(uid, 0)
+        # 把游侠移到该角死区内,再调一次 → phase 应推进(独立绕圈)。
+        memory.lightning_scout_phase[uid] = phase0
+        turn2, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(ranger(first, UUID(int=0xB003)),),
+        )
+        tactic._lightning_ranger_scout_target(turn2, turn2.rangers[0])
+        self.assertEqual(
+            memory.lightning_scout_phase[uid], (phase0 + 1) % 4
+        )
 
     def test_ranger_scout_lanes_do_not_overlap_vision(self) -> None:
-        # 3 游侠并排:相邻 lane 中心距 ≥ LANE_GAP > 2*RANGER_VISION(=10)不重叠。
+        # 3 游侠各占一条同心周界(lane 半径错开 LANE_GAP),视野不重叠。
         from arena_hero_strategy import LIGHTNING_SCOUT_LANE_GAP
         rangers = tuple(
             ranger((605, 600 + i), UUID(int=0xC000 + i)) for i in range(3)
@@ -7568,13 +7591,14 @@ class LightningModeTests(unittest.TestCase):
         ]
         pts = [p for p in pts if p is not None]
         self.assertEqual(len(pts), 3)
-        # 沿横向(perp 方向)排开,任意两点的曼哈顿距离 ≥ LANE_GAP。
-        for i in range(len(pts)):
-            for j in range(i + 1, len(pts)):
-                d = _distance(pts[i], pts[j])
-                self.assertGreaterEqual(
-                    d, LIGHTNING_SCOUT_LANE_GAP, f"lanes {pts[i]} {pts[j]} overlap"
-                )
+        # 各自周界半径(max-norm)应单调错开,相邻差 ≈ LANE_GAP。
+        radii = sorted(max(abs(p[0]), abs(p[1])) for p in pts)
+        for i in range(len(radii) - 1):
+            self.assertGreaterEqual(
+                radii[i + 1] - radii[i],
+                LIGHTNING_SCOUT_LANE_GAP - 1,
+                f"lanes radii {radii} too close",
+            )
 
     def test_vanguard_vee_outbound_target_orthogonal_to_heading(self) -> None:
         # Core 在 (600,600),最近巡逻角 (650,650) → 行进方向 (+x,+y)。
