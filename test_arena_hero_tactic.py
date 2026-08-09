@@ -7475,20 +7475,6 @@ class LightningModeTests(unittest.TestCase):
         )
 
 
-    def test_banks_toward_vanguard_not_spends_on_worker(self) -> None:
-        # 2 工人 0 先锋、资源 5（买不起先锋 10）→ 应攒钱，不 fallthrough 造第 3 工人。
-        turn, _ = make_turn(
-            own_core=self._box_core(),
-            units=(
-                worker(WORKER_LOW, (601, 600)),
-                worker(WORKER_HIGH, (602, 600)),
-            ),
-            resources=5,
-        )
-        SmartTactic(TacticMemory(mode=MODE_LIGHTNING)).choose_actions(turn)
-        # 不产兵（攒钱等先锋），Core 转去巡逻；绝不在买不起先锋时 fallthrough 造工人。
-        self.assertNotIsInstance(turn.plan.core_action, SpawnAction)
-
     def test_sector_target_stays_near_units_quadrant(self) -> None:
         # 回归：单位在第四象限 (y<0)，扇区目标不该在第一象限 (y>0)。
         # 旧 bug 用固定四角把单位派去 (644,644)，要穿越原点。
@@ -7524,33 +7510,6 @@ class LightningModeTests(unittest.TestCase):
 
     # ---- 侦察改造:并排游侠探路 + 先锋 V 字纵深 + 集火 ----
 
-    def test_ranger_scout_each_on_own_concentric_ring(self) -> None:
-        # 2 游侠沿各自的同心方环绕圈(独立于 Core 位置)。各 lane 径向半径不同,
-        # 目标点应在各自周界角上(方环上 max-norm 半径 = 该 lane 的半径)。
-        from arena_hero_strategy import LIGHTNING_SCOUT_LANE_GAP
-        memory = TacticMemory(mode=MODE_LIGHTNING)
-        tactic = SmartTactic(memory)
-        turn, _ = make_turn(
-            own_core=core((600, 600)),
-            units=(
-                ranger((605, 605), UUID(int=0xB001)),
-                ranger((605, 606), UUID(int=0xB002)),
-            ),
-        )
-        tactic.choose_actions(turn)
-        s1 = tactic._lightning_ranger_scout_target(turn, turn.rangers[0])
-        s2 = tactic._lightning_ranger_scout_target(turn, turn.rangers[1])
-        self.assertIsNotNone(s1)
-        self.assertIsNotNone(s2)
-        # 两条 lane 半径错开 LANE_GAP,目标点 max-norm 半径应不同(各自同心周界)。
-        r1 = max(abs(s1[0]), abs(s1[1]))
-        r2 = max(abs(s2[0]), abs(s2[1]))
-        self.assertGreaterEqual(abs(r1 - r2), LIGHTNING_SCOUT_LANE_GAP - 1)
-        # 都在方环内。
-        for s in (s1, s2):
-            self.assertGreaterEqual(max(abs(s[0]), abs(s[1])), 500)
-            self.assertLessEqual(max(abs(s[0]), abs(s[1])), 700)
-
     def test_ranger_step_does_not_use_astar(self) -> None:
         # 游侠绕圈走 Core 风格四邻打分(_lightning_step_toward),不走 A*。
         # 空旷地形朝目标角单调推进,产生 lightning_ranger_scout 决策(非 fallback)。
@@ -7565,10 +7524,15 @@ class LightningModeTests(unittest.TestCase):
         decisions: list[str] = []
         planner = MovementPlanner(turn, memory, decisions)
         tactic._choose_rangers_lightning(turn, planner, set(), decisions)
-        # 产生了 scout 决策,且不是 fallback(A* 抖动的标志)。
+        # 产生了轨道单步决策(前 4 游侠走开路 lightning_breakthrough,第 5 起走
+        # 远行星 lightning_ranger_far_orbit),且不是 A* fallback。
         self.assertTrue(
-            any("reason=lightning_ranger_scout" in d for d in decisions),
-            f"expected scout step decision, got {decisions}",
+            any(
+                "reason=lightning_breakthrough" in d
+                or "reason=lightning_ranger_far_orbit" in d
+                for d in decisions
+            ),
+            f"expected orbit step decision, got {decisions}",
         )
         self.assertFalse(
             any(":fallback" in d for d in decisions),
@@ -7666,30 +7630,6 @@ class LightningModeTests(unittest.TestCase):
         self.assertEqual(
             memory.lightning_scout_phase[uid], (phase0 + 1) % 4
         )
-
-    def test_ranger_scout_lanes_do_not_overlap_vision(self) -> None:
-        # 3 游侠各占一条同心周界(lane 半径错开 LANE_GAP),视野不重叠。
-        from arena_hero_strategy import LIGHTNING_SCOUT_LANE_GAP
-        rangers = tuple(
-            ranger((605, 600 + i), UUID(int=0xC000 + i)) for i in range(3)
-        )
-        memory = TacticMemory(mode=MODE_LIGHTNING)
-        tactic = SmartTactic(memory)
-        turn, _ = make_turn(own_core=core((600, 600)), units=rangers)
-        tactic.choose_actions(turn)
-        pts = [
-            tactic._lightning_ranger_scout_target(turn, r) for r in turn.rangers
-        ]
-        pts = [p for p in pts if p is not None]
-        self.assertEqual(len(pts), 3)
-        # 各自周界半径(max-norm)应单调错开,相邻差 ≈ LANE_GAP。
-        radii = sorted(max(abs(p[0]), abs(p[1])) for p in pts)
-        for i in range(len(radii) - 1):
-            self.assertGreaterEqual(
-                radii[i + 1] - radii[i],
-                LIGHTNING_SCOUT_LANE_GAP - 1,
-                f"lanes radii {radii} too close",
-            )
 
     def test_vanguard_vee_outbound_target_orthogonal_to_heading(self) -> None:
         # Core 在 (600,600),最近巡逻角 (650,650) → 行进方向 (+x,+y)。
@@ -7834,6 +7774,306 @@ class LightningModeTests(unittest.TestCase):
         )
         tactic._lightning_acquire_target(turn, turn.vanguards[0])
         self.assertNotIn("bl", memory.enemy_sightings)
+
+    # ---- 绕银河多层轨道体系 ----
+
+    def test_lightning_banks_when_slot0_vanguard_unaffordable(self) -> None:
+        # 新固定阶梯槽 0=先锋(10)。pop1(1 免费工人 0 先锋)、资源 5 买不起先锋
+        # → 应攒钱,不 fallthrough 造工人。绝不在买不起槽 0 先锋时向下造便宜兵种。
+        turn, _ = make_turn(
+            own_core=self._box_core(),
+            units=(worker(WORKER_LOW, (601, 600)),),
+            resources=5,
+        )
+        SmartTactic(TacticMemory(mode=MODE_LIGHTNING)).choose_actions(turn)
+        self.assertNotIsInstance(turn.plan.core_action, SpawnAction)
+
+    def test_lightning_build_order_first_three_slots(self) -> None:
+        # 槽 0=先锋, 1=工人, 2=游侠。逐 pop 检查 _lightning_build_slot。
+        from arena_hero_strategy import SmartTactic
+        tactic = SmartTactic(TacticMemory(mode=MODE_LIGHTNING))
+        self.assertIs(tactic._lightning_build_slot(1), UnitType.VANGUARD)
+        self.assertIs(tactic._lightning_build_slot(2), UnitType.WORKER)
+        self.assertIs(tactic._lightning_build_slot(3), UnitType.RANGER)
+        # pop≥9 起全游侠
+        self.assertIs(tactic._lightning_build_slot(9), UnitType.RANGER)
+        self.assertIs(tactic._lightning_build_slot(15), UnitType.RANGER)
+        # 满 20 停
+        self.assertIsNone(tactic._lightning_build_slot(20))
+
+    def test_breakthrough_rings_spaced_by_ranger_vision(self) -> None:
+        # 前 4 游侠走开路轨道(绕原点同心大环),半径 = pr + OFFSET + lane*GAP[R],
+        # 相邻差 = 游侠视野半径(GAP[R]=5),覆盖连续不重叠。
+        from arena_hero_strategy import LIGHTNING_ORBIT_LANE_GAP_RADIUS
+
+        rangers = tuple(
+            ranger((605, 600 + i), UUID(int=0xC000 + i)) for i in range(4)
+        )
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        tactic = SmartTactic(memory)
+        turn, _ = make_turn(own_core=core((600, 600)), units=rangers)
+        tactic.choose_actions(turn)
+        pts = [
+            tactic._lightning_breakthrough_target(turn, r, i)
+            for i, r in enumerate(turn.rangers)
+        ]
+        pts = [p for p in pts if p is not None]
+        self.assertGreaterEqual(len(pts), 2)
+        gap_r = LIGHTNING_ORBIT_LANE_GAP_RADIUS[UnitType.RANGER]
+        radii = sorted(max(abs(p[0]), abs(p[1])) for p in pts)
+        for i in range(len(radii) - 1):
+            self.assertGreaterEqual(
+                radii[i + 1] - radii[i],
+                gap_r - 1,
+                f"breakthrough rings {radii} too close",
+            )
+        # 都在方环安全区内。
+        for s in pts:
+            self.assertGreaterEqual(max(abs(s[0]), abs(s[1])), 500)
+            self.assertLessEqual(max(abs(s[0]), abs(s[1])), 700)
+
+    def test_engage_assessment_skips_ranger_guards(self) -> None:
+        # 敌方 Core 周围有游侠守卫(远程) → SKIP(我 2HP 游侠易亏,回避)。
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        tactic = SmartTactic(memory)
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(vanguard((620, 600)),),
+            enemies=(
+                enemy_core((640, 600)),
+                enemy_ranger((635, 600)),
+            ),
+        )
+        self.assertEqual(tactic._lightning_engage_assessment(turn, (640, 600)), "SKIP")
+
+    def test_engage_assessment_press_for_lone_vanguard_guard(self) -> None:
+        # 敌方 Core 周围只有先锋守卫(近战),无游侠 → PRESS(我游侠手长,游击取胜)。
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        tactic = SmartTactic(memory)
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(ranger((620, 600), UUID(int=0xB010)),),
+            enemies=(
+                enemy_core((640, 600)),
+                enemy_vanguard((635, 600)),
+            ),
+        )
+        self.assertEqual(tactic._lightning_engage_assessment(turn, (640, 600)), "PRESS")
+
+    def test_defense_tier_near_mid_far_none(self) -> None:
+        # 按敌方与我 Core 距离分三档。
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        tactic = SmartTactic(memory)
+        # NEAR:敌方先锋 4 格(≤6) → 全员含工人回防
+        turn_near, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(vanguard((601, 600)),),
+            enemies=(enemy_vanguard((604, 600)),),
+        )
+        self.assertEqual(tactic._lightning_defense_tier(turn_near), "NEAR")
+        # MID:敌方游侠 15 格(6<d≤20) → 全体游侠回防
+        turn_mid, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(vanguard((601, 600)),),
+            enemies=(enemy_ranger((615, 600)),),
+        )
+        self.assertEqual(tactic._lightning_defense_tier(turn_mid), "MID")
+        # FAR:敌方游侠 30 格(20<d≤40) → 局部游击,不全撤
+        turn_far, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(vanguard((601, 600)),),
+            enemies=(enemy_ranger((630, 600)),),
+        )
+        self.assertEqual(tactic._lightning_defense_tier(turn_far), "FAR")
+        # NONE:无战斗单位 → 正常绕轨道
+        turn_none, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(vanguard((601, 600)),),
+        )
+        self.assertEqual(tactic._lightning_defense_tier(turn_none), "NONE")
+
+    # ---- 鬼打墙修复:visited 重罚 + 卡住检测/逃生 + 障碍角动态跳过 ----
+
+    def test_step_toward_visited_penalty_forces_detour(self) -> None:
+        # 死角横跳的根因:距离项(±1)盖过 visited 轻罚(0.05/次)。提权后
+        # (0.5/次)在反复蹭过的格上惩罚快速累积,单位被迫选没走过的绕路方向。
+        from arena_hero_strategy import MovementPlanner
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        tactic = SmartTactic(memory)
+        r_unit = ranger((650, 600), UUID(int=0xB020))
+        turn, _ = make_turn(own_core=core((600, 600)), units=(r_unit,))
+        # 左边格 (649,600) 朝目标最近,但已反复走过 6 次(visited 惩罚 3.0 >
+        # 绕路的距离差 2.0);上下格没走过 → 应选上/下绕行。
+        memory.visited[(649, 600)] = 6
+        decisions: list[str] = []
+        planner = MovementPlanner(turn, memory, decisions)
+        moved = tactic._lightning_step_toward(
+            turn, planner, turn.rangers[0], (620, 600), "test_detour"
+        )
+        self.assertTrue(moved)
+        move_line = next(d for d in decisions if "move" in d)
+        self.assertNotIn("to=(649, 600)", move_line)
+
+    def test_step_toward_triggers_escape_after_repeated_oscillation(self) -> None:
+        # 连续 3 次检出"8 tick 窗口内活动范围 ≤2 格"→ 触发逃生模式,
+        # 决策 reason 带 :escape 后缀,escape_until 写入 memory。
+        from arena_hero_strategy import (
+            LIGHTNING_ESCAPE_DURATION_TICKS,
+            MovementPlanner,
+        )
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        tactic = SmartTactic(memory)
+        uid = str(UUID(int=0xB021))
+        # 伪造小范围震荡历史:8 个位置都在 (650,600)/(651,600) 两格间。
+        memory.recent_positions[uid] = [
+            (650 + (i % 2), 600) for i in range(8)
+        ]
+        decisions: list[str] = []
+        # 每 tick 重建 turn/planner(单位每 tick 只下一次动作)。
+        for tick in (100, 101, 102):
+            turn, _ = make_turn(
+                tick=tick,
+                own_core=core((600, 600)),
+                units=(ranger((650, 600), UUID(int=0xB021)),),
+            )
+            decisions = []
+            planner = MovementPlanner(turn, memory, decisions)
+            tactic._lightning_step_toward(
+                turn, planner, turn.rangers[0], (620, 600), "test_escape"
+            )
+        self.assertGreaterEqual(
+            memory.lightning_unit_escape_until.get(uid, 0),
+            100 + LIGHTNING_ESCAPE_DURATION_TICKS,
+        )
+        # 逃生期间的移动决策带 :escape 标记。
+        self.assertTrue(
+            any(":escape" in d for d in decisions),
+            f"expected escape-mode decision, got {decisions}",
+        )
+
+    def test_escape_mode_prefers_open_direction_over_goal(self) -> None:
+        # 逃生模式忽略目标方向:目标在左、左邻格虽可走但是口袋更深处(出口 1),
+        # 右邻格开阔(出口 2) → 逃生应向右出口袋,而非贪距离往左钻。
+        from arena_hero_strategy import MovementPlanner
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        tactic = SmartTactic(memory)
+        r_unit = ranger((650, 600), UUID(int=0xB022))
+        uid = str(r_unit.id)
+        memory.lightning_unit_escape_until[uid] = 200  # 已在逃生期
+        # 口袋:上下两排墙 + 左端封底,开口朝右。
+        walls = (
+            (648, 600),
+            (649, 599), (650, 599), (651, 599),
+            (649, 601), (650, 601), (651, 601),
+        )
+        memory.known_obstacles = set(walls)
+        turn, _ = make_turn(
+            tick=100,
+            own_core=core((600, 600)),
+            units=(r_unit,),
+            obstacle_cells=walls,
+        )
+        decisions: list[str] = []
+        planner = MovementPlanner(turn, memory, decisions)
+        moved = tactic._lightning_step_toward(
+            turn, planner, turn.rangers[0], (620, 600), "test_open"
+        )
+        self.assertTrue(moved)
+        move_line = next(d for d in decisions if "move" in d)
+        self.assertIn("to=(651, 600)", move_line)
+        self.assertIn(":escape", move_line)
+
+    def test_escape_ends_early_after_leaving_pocket(self) -> None:
+        # 逃生中若已远离震荡区域(> 检测窗口格数),提前退出逃生恢复正常寻路。
+        from arena_hero_strategy import MovementPlanner
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        tactic = SmartTactic(memory)
+        r_unit = ranger((670, 600), UUID(int=0xB023))
+        uid = str(r_unit.id)
+        memory.lightning_unit_escape_until[uid] = 200
+        # recent_positions[0] 在 (650,600),当前 (670,600) 距离 20 > 窗口 8。
+        memory.recent_positions[uid] = [(650, 600), (670, 600)]
+        turn, _ = make_turn(tick=100, own_core=core((600, 600)), units=(r_unit,))
+        decisions: list[str] = []
+        planner = MovementPlanner(turn, memory, decisions)
+        tactic._lightning_step_toward(
+            turn, planner, turn.rangers[0], (620, 600), "test_exit_escape"
+        )
+        self.assertNotIn(uid, memory.lightning_unit_escape_until)
+        # 恢复正常打分:朝目标(左)走。
+        move_line = next(d for d in decisions if "move" in d)
+        self.assertIn("to=(669, 600)", move_line)
+
+    def test_orbit_waypoint_skips_obstructed_corner(self) -> None:
+        # 目标角周围 5x5 已知障碍 >10 → 距角尚远时提前推进下一角绕行。
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        tactic = SmartTactic(memory)
+        v_unit = vanguard((600, 590))
+        turn, _ = make_turn(own_core=core((600, 600)), units=(v_unit,))
+        uid = str(v_unit.id)
+        memory.lightning_orbit_phase[uid] = 0
+        # 先取一次目标角(不埋障碍),记录其坐标。
+        clean_target = tactic._lightning_orbit_waypoint(
+            turn, turn.vanguards[0], UnitType.VANGUARD
+        )
+        self.assertIsNotNone(clean_target)
+        # 角埋进乱石堆:5x5 里放 12 个障碍(>LIMIT 10)。
+        memory.lightning_orbit_phase[uid] = 0  # 重置相位再取一次
+        memory.known_obstacles = {
+            (clean_target[0] + dx, clean_target[1] + dy)
+            for dx in range(-2, 3)
+            for dy in range(-2, 3)
+        } - {clean_target}  # 24 个,足够超限
+        blocked_target = tactic._lightning_orbit_waypoint(
+            turn, turn.vanguards[0], UnitType.VANGUARD
+        )
+        self.assertIsNotNone(blocked_target)
+        self.assertNotEqual(blocked_target, clean_target)
+        # 相位已推进。
+        self.assertEqual(memory.lightning_orbit_phase[uid], 1)
+
+    def test_core_patrol_waypoint_skips_obstructed_corner(self) -> None:
+        # Core 巡逻角埋在乱石堆里 → 距角尚远时提前跳下一角。
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        tactic = SmartTactic(memory)
+        turn, _ = make_turn(own_core=core((600, 600)), units=())
+        first = tactic._lightning_patrol_waypoint(turn)
+        phase_before = memory.lightning_patrol_phase
+        # 把当前角埋进障碍。
+        memory.known_obstacles = {
+            (first[0] + dx, first[1] + dy)
+            for dx in range(-2, 3)
+            for dy in range(-2, 3)
+        }
+        second = tactic._lightning_patrol_waypoint(turn)
+        self.assertNotEqual(second, first)
+        self.assertEqual(
+            memory.lightning_patrol_phase, (phase_before + 1) % 4
+        )
+
+    def test_escape_state_pruned_for_dead_units(self) -> None:
+        # 单位死亡后 stuck/escape 状态随 last_position_tick 清理。
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        dead_uid = str(UUID(int=0xDEAD))
+        memory.last_position_tick[dead_uid] = 50
+        memory.lightning_unit_stuck_counters[dead_uid] = 2
+        memory.lightning_unit_escape_until[dead_uid] = 120
+        turn, _ = make_turn(tick=100, own_core=core((600, 600)), units=())
+        memory.observe(turn)
+        self.assertNotIn(dead_uid, memory.lightning_unit_stuck_counters)
+        self.assertNotIn(dead_uid, memory.lightning_unit_escape_until)
+
+    def test_escape_state_survives_save_load_roundtrip(self) -> None:
+        # 逃生状态字段随 memory 落盘/恢复(进程重启不丢失逃生冷却)。
+        memory = TacticMemory(mode=MODE_LIGHTNING)
+        memory.lightning_unit_stuck_counters["u-1"] = 2
+        memory.lightning_unit_escape_until["u-2"] = 345
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "memory.json"
+            memory.save(path)
+            restored = TacticMemory.load(path)
+        self.assertEqual(restored.lightning_unit_stuck_counters, {"u-1": 2})
+        self.assertEqual(restored.lightning_unit_escape_until, {"u-2": 345})
 
 
 if __name__ == "__main__":

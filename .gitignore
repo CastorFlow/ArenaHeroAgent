@@ -5,6 +5,7 @@
 # Python environments and caches
 .venv/
 .venv-linux/
+.venv-wsl/
 __pycache__/
 *.py[cod]
 .pytest_cache/

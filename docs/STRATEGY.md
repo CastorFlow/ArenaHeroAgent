@@ -219,17 +219,21 @@ Arena Hero 服务器按对象合并计划：Manual 显式动作 > Agent 显式�
 是纯靠慢速采集。适用于当前发育太慢、且偏远区已观察到大量离线/挂机复活 Core
 的场景。方环中心（半径 <500）挖空——那里离原点近、对手密集火力猛，Core 不深入。
 
-### 12.1 资源容量锁死的建造顺序
+### 12.1 固定产兵阶梯（绕银河体系配套）
 
-资源容量为 `max(10, population×5)`：pop 1–2 时容量只有 10，**第一个战斗
-单位只能是先锋（10 资源）**，造游侠（12）必须先把容量提到 15（pop≥3）。
-因此顺序固定：
+资源容量为 `max(10, population×5)`，`_select_spawn` 的 lightning 分支按固定 pop 槽位阶梯造兵（攒钱优先不 fallthrough），由 `LIGHTNING_BUILD_ORDER` + `_lightning_build_slot` 实现：
 
-1. 起手 1 免费工人（pop1, cap10）→ 攒 10 出**先锋**（首战力，去打野）。
-2. 攒 5 出**工人 #2**（pop3, cap15，抬容量到 15）。
-3. 攒 12 出**游侠**（pop4, cap20，第二路独立猎手）。
-4. 攒 5 出**工人 #3**（补到 3 工人经济）。
-5. 之后按战损补先锋/游侠，常驻 ≤10 单位（不触 20 人口涨价档）。
+| pop 槽 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9… |
+|---|---|---|---|---|---|---|---|---|---|
+| 兵种 | 先锋 | 工人 | 游侠 | 工人 | 游侠 | 工人 | 游侠 | 工人 | 游侠…… |
+
+要点：
+
+- **只造 1 先锋**——先锋不强，前期一个够；肉盾由工人充当（勤王时工人挤 Core 旁格，游侠躲后面狙击，§12.3）。
+- **pop≥9 起只造游侠**，直到满 `LIGHTNING_MAX_POPULATION=20` 才停。
+- 容量自然门槛走通：pop1 cap10≥先锋10 → pop2 cap10≥工人5 → pop3 cap15≥游侠12。
+- 20+ 触发官方涨价档（+30%/5 人口），后期长期造游侠会多吃涨价——这是"非必要不进攻、发育为主、要更多角色铺子轨道"路线接受的取舍。
+- 阵亡补回：`current_population` 回落即按该 pop 槽位补（尾段全是游侠，撤一个补一个游侠）；先锋阵亡不强制重建。
 
 ### 12.2 Core 方环巡逻
 
@@ -250,18 +254,43 @@ Arena Hero 服务器按对象合并计划：Manual 显式动作 > Agent 显式�
   8 格内有敌中止 + hp/盾低中止**。产兵格满时优先产兵；迁移中不产兵（已有守卫）。
 - Core 受威胁（`_core_emergency_threats`）或刚受伤时全体战斗单位召回护核。
 
-### 12.3 游侠并排探路 + 先锋 V 字纵深 + 集火
+### 12.3 绕银河多层轨道体系（开路 + 近/中/远行星 + 兵种细分进攻 + 三档回防）
 
-初版"分布式扇区扫"实战暴露根因:猎手沿 650 周界单条线慢爬,视野(先锋 4 /游侠 5 曼哈顿)覆盖面对方环周长太小,一整夜 0 首杀、`enemy_sightings` 不增长。改造为分工铺视野:
+整套系统以星系隐喻组织轨迹。Core 是绕原点转的"恒星"，四种轨道各有职责：
 
-- **游侠 = 并排探路前锋**(`_lightning_ranger_scout_target`):沿 Core 预定行进方向(`_lightning_core_heading_vector`,从 `_lightning_patrol_waypoint` 推出)领先 `LIGHTNING_SCOUT_LEAD=8` 格,横向按 lane 错开铺开。相邻 lane 间距 `LIGHTNING_SCOUT_LANE_GAP=6`(> 游侠视野直径,视野不重叠),奇数游侠以中轴对称展开,在 Core 前方排成一条与行进方向垂直的横线。游侠视野扫过的资源格自动进 `turn.resource_cells`,Core 赶到时工人直接采(无需重探)。
-- **先锋 = V 字纵深猎杀**(`_lightning_vanguard_vee_target`,出探机状态机 `lightning_vee_state`):OUTBOUND 从 origin 沿 Core 行进方向的**正交方向**深入 `LIGHTNING_VEE_DEPTH=32` 格(leg 0 正向、leg 1 反向,两腿成 V);到达(距目标 ≤ `LIGHTNING_VEE_REACH_TOLERANCE=3`)或 Core 受威胁(`_core_emergency_threats`/`_core_recently_damaged`)→ 翻 INBOUND;INBOUND 朝当前 Core 位置走,到达 ≤ `LIGHTNING_VEE_HOME_TOLERANCE=5` → 翻 OUTBOUND、leg 翻转、origin 重设为当前 Core 位置(Core 已前移,下一轮扫新地带)。D=32 兼顾探索面积与回防效率:一来回 ~64 tick,Core 1格/4tick 前进 ~16 格,下一轮覆盖全新带;危险时 ~16 tick 内回防。
-- **集火**(`_lightning_acquire_target` 改):取消"已被他人 claim"排除,同一敌方 Core 允许多 unit 同时 claim(`LIGHTNING_FOCUS_MAX_ATTACKERS=3` 上限防全员扑一个致 Core 失防)。多单位自然汇聚到同一目标形成编队集火:先锋贴脸 `sweep`、游侠射程 1–3 `shoot_cell`。
-- **释放与黑名单**(`_lightning_blacklist_core`):判为重兵把守(贴脸有守卫 `_lightning_target_attended` 或雾里围满 `_lightning_target_crowded`)→ **释放所有 claim 该 Core 的单位**(集火编队同步撤退)、永久黑名单、从 `enemy_sightings` 清脏(防已拉黑 Core 残留污染 acquire 判断)。
-- **击杀后**:sighting 自然失效(格确认空),回探路/V 字继续扫。
+- **Core 轨道（恒星绕银心）**：绕原点 (0,0) 转方环 `pr≈650`，1格/4tick，慢（沿用 §12.2，不动）。安全路径，沿外半不深入火力密集的内圈。
+- **开路轨道（恒星维度，绕原点大环）**：固定前 4 个游侠（`LIGHTNING_BREAKTHROUGH_SLOT_COUNT=4`）走在比 Core 轨道更外的同心方环（半径 `pr + LIGHTNING_BREAKTHROUGH_RING_OFFSET + lane*视野半径`，越外钳到 `outer_r` 不深入内圈）上自己转圈，**不等 Core**（游侠 1格/tick，转得比 Core 快得多，可能已绕几圈 Core 才一圈）。职责：提前点亮覆盖 Core 轨道的资源、摧毁低守卫敌方 Core。仅勤王（NEAR/MID）时回援，其余持续绕圈开路。
+- **近行星轨道（绕 Core 转圈）**：先锋是 Core 的"近行星"，全部共享一条近轨绕 `core.position` 转方环，**不承担探测只保安全**。多先锋按 UUID 序错开 phase 实现第一/第三象限对位（2 先锋→对角，4 先锋→四等分）。
+- **中行星轨道（绕 Core 转圈）**：工人每条子轨道一个绕 Core 转圈巡逻。发现可见资源 → 立即走现有采集逻辑（§2）采、回仓；空闲（无货、无资源目标）→ 上轨道。子轨道数 = 工人数（每单位一条），子轨道间距起步 = 工人视野半径。
+- **远行星轨道（绕 Core 转圈）**：排满 4 开路游侠后**剩余游侠**每条子轨道一个绕 Core 外圈转，发现安全/清除。子轨道间距起步 = 游侠视野半径。
+- **子轨道数量随产能自动伸缩**：剩余角色数 = 子轨道数，不写死。近→中→远半径依次外括（先锋内缘 = 近环 + 先锋视野，工人内缘 = 先锋外缘 + GAP，游侠内缘 = 工人外缘 + GAP）。
 
-### 12.4 记忆与失效
+几何目标生成器：`_lightning_orbit_waypoint`（绕 Core，近/中/远，复用 Core 方环四角顺时针 + 到角死区推进 phase，圆心换成 `core.position`）、`_lightning_breakthrough_target`（绕原点开路大环）、`_lightning_orbit_lane_radius`（分层半径）。全部走 `_lightning_step_toward`（Core 风格四邻打分，不走 A*，防乱石堆横跳）。
 
-复用 `enemy_sightings`:敌方 Core 坐标长期保留,只在格被重新观察且确认无人时丢弃。`lightning_claims`/`lightning_blacklist`/`lightning_sectors`/`lightning_scout_lanes`/`lightning_vee_state`/`lightning_patrol_*` 持久化到 `.arena_hero_memory.json`。控制字段 `lightning_ring` 每回合按 mtime 热读取,同 `beacon_target_distance`。
+**进攻原则（非必要不进攻，发育为主）**：`_lightning_engage_assessment` 按敌方 Core 周围护卫兵种细分三档：
+- `CHICKEN`——无任何战斗单位护卫 → 直接打（先锋贴脸 `sweep`、游侠 1–3 `shoot`）。
+- `PRESS`——只有先锋守卫（近战贴脸 1 格），我游侠手长 1–3 射程优势 → 主动游击：游侠走勾引+狙击位（`_firing_cells` 取远离守卫但仍可命中 Core 的射程格）无伤取胜。
+- `SKIP`——有游侠守卫（远程），我 2HP 游侠易亏 → 回避：不 claim、对该 Core 永久拉黑。
+集火上限 `LIGHTNING_FOCUS_MAX_ATTACKERS=3` 防全员扑一个致 Core 失防。重兵把守（贴脸 `_lightning_target_attended` 或雾里围满 `_lightning_target_crowded`）→ `_lightning_blacklist_core` 永久放弃、释放所有 claim、清脏 sightings。
+
+**回防三档（反应强度按敌方深入系统深度而定）**：`_lightning_defense_tier` 按 visible 敌方战斗单位到我 Core 最近距离 `d_min` 分档：
+- `NEAR`（`d_min≤6`）→ 全员含工人回防线卡位肉盾（工人挤 Core 旁格当肉盾，游侠躲工人后面狙击）。
+- `MID`（`6<d_min≤20`）→ 全体游侠回防，工人继续经济或就地卡位。
+- `FAR`（`20<d_min≤40`）→ 仅那个方位附近游侠游击警告，不全撤；余者照常绕轨道。
+- `NONE` → 无人侵，正常绕轨道。
+`_core_recently_damaged` 兜底强制 NEAR。`NEAR`/`MID` 档覆盖先锋/游侠的 `recall` 分支；`FAR` 不触发召回。`MID`/`FAR` 距离起步值待子轨道实际铺开后按近/中/远总展宽调。
+
+### 12.4 防鬼打墙（卡住检测 + 逃生 + visited 重罚 + 障碍角跳过）
+
+四邻打分只看一步，在 U 型/口袋障碍死角天然存在局部最优陷阱：朝目标最近的方向是死胡同深处，其余方向"距离都更远"，评分接近导致反复横跳。四层机制协同破解（`_lightning_step_toward` + 各 waypoint 生成器）：
+
+- **visited 重罚**：巡逻单步的 visited 惩罚系数 0.5/次（封顶 10），与距离/惯性同量级——死角里反复蹭 2 次即 +1.0，很快盖过"离目标近 1 格"的诱惑，被迫绕新路。Core 迁移打分同理 0.3/次（封顶 8），并修正了旧版"visited 当加成"的 ping-pong 隐患（Core 一步站 4 tick，刚离开的格 visited 高，加成会把 Core 拉回去）。
+- **强化方向惯性**：单位掉头罚 12.0（旧 6.0）、转弯罚 2.0（旧 1.0）。单位 1格/tick 比 Core 快 4 倍，掉头罚须比 Core（8.0）更重才压得住死角横跳。
+- **卡住检测 + 逃生模式**（治本）：距目标尚远（>死区 8）却连续 3 次检出"最近 8 个位置活动范围 ≤2 格"→ 触发逃生 `LIGHTNING_ESCAPE_DURATION_TICKS=12` tick。逃生期间**完全忽略目标方向**，只往"开阔（邻格出口多 ×3.0）+ 低 visited 密度（3×3 和 ×0.1）"方向走，强制脱出障碍口袋；已远离震荡区域（>8 格）提前结束。状态存 `lightning_unit_stuck_counters` / `lightning_unit_escape_until`，随单位死亡剪枝、随 memory 落盘。触发计数见 `decision_totals["lightning:escape_triggered"]`，决策 reason 带 `:escape` 后缀。
+- **障碍角动态跳过**：所有巡逻角生成器（Core `_lightning_patrol_waypoint`、行星 `_lightning_orbit_waypoint`、开路 `_lightning_breakthrough_target`、旧同心环 `_lightning_ranger_scout_target`）在距角尚远（>死区×2）而目标角 5×5 内已知障碍 >`LIGHTNING_CORNER_OBSTACLE_LIMIT=10`（40%）时提前推进下一角——不朝乱石堆里的角硬冲。`known_obstacles` 只含看过的格，首圈未知区域按正常巡逻推进，撞了记下来下一圈生效。
+
+### 12.5 记忆与失效
+
+复用 `enemy_sightings`:敌方 Core 坐标长期保留,只在格被重新观察且确认无人时丢弃。`lightning_claims`/`lightning_blacklist`/`lightning_sectors`/`lightning_scout_lanes`/`lightning_vee_state`/`lightning_patrol_*`/`lightning_orbit_*`/`lightning_breakthrough_phase`/`lightning_unit_stuck_counters`/`lightning_unit_escape_until` 持久化到 `.arena_hero_memory.json`。控制字段 `lightning_ring` 每回合按 mtime 热读取,同 `beacon_target_distance`。
 
 
