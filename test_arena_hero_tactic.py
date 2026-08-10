@@ -581,11 +581,11 @@ class LightningModeTests(unittest.TestCase):
         planner = MovementPlanner(turn, memory, decisions)
         tactic._choose_rangers_lightning(turn, planner, set(), decisions)
         # 产生了轨道单步决策(前 4 游侠走开路 lightning_breakthrough,第 5 起走
-        # 远行星 lightning_ranger_far_orbit),且不是 A* fallback。
+        # 中行星 lightning_ranger_mid_orbit),且不是 A* fallback。
         self.assertTrue(
             any(
                 "reason=lightning_breakthrough" in d
-                or "reason=lightning_ranger_far_orbit" in d
+                or "reason=lightning_ranger_mid_orbit" in d
                 for d in decisions
             ),
             f"expected orbit step decision, got {decisions}",

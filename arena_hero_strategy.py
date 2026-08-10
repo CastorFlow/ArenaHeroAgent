@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import heapq
 import json
+import math
 import os
 import time
 from collections import Counter
@@ -88,8 +89,11 @@ LIGHTNING_FOCUS_MAX_ATTACKERS = 3
 #   开路轨道（恒星维度，绕原点外更大同心方环）、近/中/远行星轨道（绕 Core 转圈）。
 # 开路轨道半径比 Core 轨道 pr 更外的同心跳数；起步用一个游侠视野直径量级，
 # 待运行后视覆盖深度再调。
+# 行星轨道层序(内→外):先锋(近行星,半径 LIGHTNING_NEAR_ORBIT_RADIUS=5，
+#   贴 Core 视野边缘) → 游侠(中行星) → 工人(远行星,仅闲时上轨)。见
+#   _lightning_orbit_lane_radius。游侠中轨护 Core 中层、工人远轨点亮外围迷雾。
 LIGHTNING_BREAKTHROUGH_RING_OFFSET = 12
-# 固定 4 个开路游侠，最先排满；产出第 5 个游侠起进远行星轨道。
+# 固定 4 个开路游侠，最先排满；产出第 5 个游侠起进中行星轨道（绕 Core 中层）。
 LIGHTNING_BREAKTHROUGH_SLOT_COUNT = 4
 # 固定产兵阶梯（用户指定，严格按 pop 槽位填，攒钱优先不 fallthrough）：
 #   pop0→先锋, 1→工人, 2→游侠, 3→工人, 4→游侠, 5→工人, 6→游侠, 7→工人,
@@ -118,22 +122,31 @@ LIGHTNING_ORBIT_LANE_GAP_RADIUS: dict[UnitType, int] = {
 # ESCAPE_DETECT_SPAN 视为一次"小范围震荡"命中；连续命中 ESCAPE_TRIGGER_HITS
 # 次触发逃生模式。
 LIGHTNING_ESCAPE_DETECT_WINDOW = 8
-LIGHTNING_ESCAPE_DETECT_SPAN = 2
+LIGHTNING_ESCAPE_DETECT_SPAN = 6  # 放宽到 6 格，覆盖大环震荡（不只是 2 格 ping-pong）
 LIGHTNING_ESCAPE_TRIGGER_HITS = 3
 # 卡住命中还须"当前格在窗口内重复出现 ≥ 此值"——真震荡必反复回访同一格;
 # 长期停驻后刚恢复移动的单位每步都在新格(count=1),不会被停驻历史误伤。
-LIGHTNING_ESCAPE_REVISIT_MIN = 3
+# 降到 2：4 格环形震荡时每格在 8 位置窗口内出现 2 次，3 会漏检。
+LIGHTNING_ESCAPE_REVISIT_MIN = 2
 # 逃生模式持续 tick 数：期间忽略巡逻目标，只往开阔/低 visited 密度方向走。
-LIGHTNING_ESCAPE_DURATION_TICKS = 12
+LIGHTNING_ESCAPE_DURATION_TICKS = 20  # 延长到 20，给足时间走出复杂地形
 # 逃生打分权重：开阔度（邻格出口数）优先，visited 密度次之。
-LIGHTNING_ESCAPE_EXIT_WEIGHT = 3.0
-LIGHTNING_ESCAPE_DENSITY_WEIGHT = 0.1
+# exits 权重大：优先往通道多的方向走（逃出死胡同的核心）。
+# density 用对数曲线：visited 饱和后仍保持区分度，不会被巨大数值淹没。
+LIGHTNING_ESCAPE_EXIT_WEIGHT = 5.0  # 从 3.0 提到 5.0，强化开阔度引导
+LIGHTNING_ESCAPE_VISITED_WEIGHT = 3.0  # 逃生期单格 visited 直接惩罚，替代原 3×3 求和
 # 巡逻角障碍密度跳角：目标角周围 5x5（25 格）内已知障碍 > 此值（40%）时，
 # 且单位距角尚远（> 死区*2），视为"角在乱石堆里"，提前推进下一角绕行。
 LIGHTNING_CORNER_OBSTACLE_LIMIT = 10
 # 回防分级——按 visible 敌方战斗单位到我 Core 最近距离 d_min 分档触发反应强度：
 LIGHTNING_DEFENSE_RING_NEAR = 6   # 近环/Core 贴身：全体含工人回防线卡位肉盾
-                                  # （沿用 _core_emergency 6 格阈值）。
+                                  # （沿用 _core_emergency 6 格阈值；仅用于回防分档，
+                                  #  不是先锋轨道半径——先锋轨道半径用下方
+                                  #  LIGHTNING_NEAR_ORBIT_RADIUS，两者解耦）。
+# 先锋（近行星）轨道半径：贴 Core 视野边缘转。Core 视野=5 是 Manhattan 半径；
+# 轨道是 max-norm 方环，半径 5 的方环对角格 max-norm=5、恰在 Core 视野对角边缘，
+# 正方向格在视野内、对角格贴视野外沿——"贴着 core 视野边缘转、增加保护力"。
+LIGHTNING_NEAR_ORBIT_RADIUS = 5
 # MID/FAR 起步值待覆盖铺开后按实际近/中/远总展宽调（见 STRATEGY.md §12 验证段）。
 LIGHTNING_DEFENSE_RING_MID = 20   # 中环：全体游侠回防（工人继续经济或就地卡位）。
 LIGHTNING_DEFENSE_RING_FAR = 40   # 外环：仅那个方位附近游侠游击警告，不全撤。
@@ -1414,6 +1427,13 @@ class TacticMemory:
                 self.recent_positions.pop(uid, None)
                 self.lightning_unit_stuck_counters.pop(uid, None)
                 self.lightning_unit_escape_until.pop(uid, None)
+        # visited 时间衰减：每 100 tick 对所有 visited 乘以 0.95（指数衰减）
+        # 老路径 visited 会缓慢衰减（50 → 1000 tick 后 → 25），相对区分度恢复
+        if turn.tick % 100 == 0:
+            for pos in list(self.visited.keys()):
+                self.visited[pos] = int(self.visited[pos] * 0.95)
+                if self.visited[pos] == 0:
+                    del self.visited[pos]
         self.last_tick = turn.tick
 
     def remember_move(self, unit: Unit, destination: Position, tick: int) -> None:
@@ -3792,8 +3812,9 @@ class SmartTactic:
             return incoming_deposit
 
         if True:
-            # 工人中行星轨道：发现资源 → 现有经济逻辑(上方已处理采集/回仓)；
-            # 空闲(无货、无资源目标) → 上中行星轨道绕 Core 转圈巡逻。
+            # 工人远行星轨道：发现资源 → 现有经济逻辑(上方已处理采集/回仓)；
+            # 空闲(无货、无资源目标) → 上远行星轨道绕 Core 外圈转圈巡逻(工人距
+            # Core 最外层),点亮外围迷雾防敌方钻空子。分层见 _lightning_orbit_lane_radius。
             # NEAR 勤王 → 工人回 Core 卡位肉盾(游侠躲工人后面狙击)。
             tier = self._lightning_defense_tier(turn)
             if tier == "NEAR":
@@ -6484,6 +6505,15 @@ class SmartTactic:
             phase = (phase + 1) % 4
             self.memory.lightning_breakthrough_phase[uid] = phase
             target = corners[phase]
+        # 新增：目标区域访问饱和时强制跳角（提前放弃不可达目标）
+        elif (
+            _distance(ranger.position, target) < CORE_BEACON_HYSTERESIS * 2
+            and self.memory.visited.get(target, 0) > 10
+            and self._lightning_corner_obstructed(target)
+        ):
+            phase = (phase + 1) % 4
+            self.memory.lightning_breakthrough_phase[uid] = phase
+            target = corners[phase]
         target = self._lightning_clamp_to_donut(target)
         if target == ranger.position:
             return None
@@ -6529,27 +6559,30 @@ class SmartTactic:
     ) -> int:
         """role 第 lane 条行星子轨道的半径(相对 Core,近→中→远依次外括)。
 
-        先锋内缘 = 近环(NEAR) + 先锋视野;先锋外缘 = 内缘 + (先锋数-1)*GAP[V]。
-        工人内缘 = 先锋外缘 + GAP[W];工人外缘 = 内缘 + (工人数-1)*GAP[W]。
-        游侠(远行星)内缘 = 工人外缘 + GAP[R];第 lane 条 = 内缘 + lane*GAP[R]。
-        先锋全部共享 lane 0 一条近轨(_lightning_orbit_waypoint 内处理),故先锋
-        的 lane 参数忽略。
+        层序(内→外):先锋(近行星) → 游侠(中行星) → 工人(远行星,闲时)。
+          先锋近轨内缘 = LIGHTNING_NEAR_ORBIT_RADIUS=5;先锋全部共享 lane 0 一条
+            近轨(_lightning_orbit_waypoint 内处理),故先锋的 lane 参数忽略。
+          游侠中轨内缘 = 先锋外缘 + GAP[R];游侠每 lane 一条子轨道,间距 GAP[R]=5。
+          工人远轨内缘 = 游侠中轨外缘 + GAP[W];闲时工人每 lane 一条子轨道,间距
+            GAP[W]=3。工人有资源目标时走经济逻辑(上方 _choose_workers 采集/回仓),
+            仅空闲(无货、无资源目标)才上此远轨巡逻,故远轨不会因工人忙采集而空缺
+            太久——工人在远轨点亮外围迷雾、防敌方钻空子。
         """
         gap_v = LIGHTNING_ORBIT_LANE_GAP_RADIUS[UnitType.VANGUARD]
         gap_w = LIGHTNING_ORBIT_LANE_GAP_RADIUS[UnitType.WORKER]
         gap_r = LIGHTNING_ORBIT_LANE_GAP_RADIUS[UnitType.RANGER]
         vg_count = len(turn.vanguards)
-        wk_count = len(turn.workers)
-        vg_inner = LIGHTNING_DEFENSE_RING_NEAR + UNIT_VISION_RADIUS[UnitType.VANGUARD]
+        rk_count = len(turn.rangers)
+        vg_inner = LIGHTNING_NEAR_ORBIT_RADIUS
         vg_outer = vg_inner + max(0, vg_count - 1) * gap_v
-        wk_inner = vg_outer + gap_w
-        wk_outer = wk_inner + max(0, wk_count - 1) * gap_w
-        rk_inner = wk_outer + gap_r
+        rk_inner = vg_outer + gap_r
+        rk_outer = rk_inner + max(0, rk_count - 1) * gap_r
+        wk_inner = rk_outer + gap_w
         if role is UnitType.VANGUARD:
             return vg_inner  # 全先锋共享一条近轨
-        if role is UnitType.WORKER:
-            return wk_inner + lane * gap_w
-        return rk_inner + lane * gap_r
+        if role is UnitType.RANGER:
+            return rk_inner + lane * gap_r   # 中行星轨道
+        return wk_inner + lane * gap_w        # 远行星轨道(闲时工人)
 
     def _lightning_orbit_waypoint(
         self,
@@ -6614,6 +6647,15 @@ class SmartTactic:
             base_phase = (base_phase + 1) % 4
             self.memory.lightning_orbit_phase[uid] = base_phase
             target = corners[(base_phase + phase_offset) % 4]
+        # 新增：目标区域访问饱和时强制跳角（提前放弃不可达目标）
+        elif (
+            _distance(unit.position, target) < CORE_BEACON_HYSTERESIS * 2
+            and self.memory.visited.get(target, 0) > 10
+            and self._lightning_corner_obstructed(target)
+        ):
+            base_phase = (base_phase + 1) % 4
+            self.memory.lightning_orbit_phase[uid] = base_phase
+            target = corners[(base_phase + phase_offset) % 4]
         target = self._lightning_clamp_to_donut(target)
         if target == unit.position:
             return None
@@ -6649,20 +6691,17 @@ class SmartTactic:
             if escape_until:
                 self.memory.lightning_unit_escape_until.pop(uid, None)
             # 卡住检测：距目标尚远（>死区,排除在角附近正常待命）却小范围震荡。
-            # 双条件：窗口活动范围小 + 当前格在窗口内反复出现——真震荡必反复
-            # 回访同一格;停驻(采集/召回)后刚恢复移动的单位每步都在新格,不误伤。
+            # 主判据：窗口内任意格重访次数 ≥ 3（覆盖大环震荡，不只是 2 格 ping-pong）。
+            # 停驻(采集/召回)后刚恢复移动的单位每步都在新格(count=1),不误伤。
             window = recent[-LIGHTNING_ESCAPE_DETECT_WINDOW:]
             if (
                 len(window) >= LIGHTNING_ESCAPE_DETECT_WINDOW
                 and _distance(unit.position, goal) > CORE_BEACON_HYSTERESIS
             ):
-                xs = [position[0] for position in window]
-                ys = [position[1] for position in window]
-                span = max(max(xs) - min(xs), max(ys) - min(ys))
-                if (
-                    span <= LIGHTNING_ESCAPE_DETECT_SPAN
-                    and window.count(unit.position) >= LIGHTNING_ESCAPE_REVISIT_MIN
-                ):
+                revisit_counts = Counter(window)
+                max_revisits = revisit_counts.most_common(1)[0][1] if revisit_counts else 0
+                # 8 位置窗口内，某格出现 3+ 次 = 震荡（可能是 2 格横跳、4 格环、甚至 8 格大环）
+                if max_revisits >= 3:
                     hits = self.memory.lightning_unit_stuck_counters.get(uid, 0) + 1
                     if hits >= LIGHTNING_ESCAPE_TRIGGER_HITS:
                         escape_until = turn.tick + LIGHTNING_ESCAPE_DURATION_TICKS
@@ -6702,16 +6741,18 @@ class SmartTactic:
                     if _destination(destination, exit_direction)
                     not in planner.obstacles
                 )
-                density = sum(
-                    self.memory.visited.get(
-                        (destination[0] + dx, destination[1] + dy), 0
-                    )
-                    for dx in (-1, 0, 1)
-                    for dy in (-1, 0, 1)
+                # 逃生期 visited 惩罚：直接用目标格自身的 visited 重罚，不用 3×3 求和。
+                # 3×3 求和的致命缺陷：横跳的相邻几格互相落在对方窗口里，density 被抹平，
+                # 三格评分几乎相同 → 靠 DIRECTION_RANK 决胜 → 稳定横跳出不去。
+                # 单格 visited × 3.0 让"刚踩过 45 次的格"比"没踩过的格"贵得多，
+                # 足以压过 exits(5.0/出口) 的差异，强制单位走没走过的方向。
+                visited_penalty = (
+                    self.memory.visited.get(destination, 0)
+                    * LIGHTNING_ESCAPE_VISITED_WEIGHT
                 )
                 score = (
                     -exits * LIGHTNING_ESCAPE_EXIT_WEIGHT
-                    + density * LIGHTNING_ESCAPE_DENSITY_WEIGHT
+                    + visited_penalty
                     + planner.threat.get(destination, 0) * 4.0
                     + heading_penalty
                 )
@@ -6727,14 +6768,23 @@ class SmartTactic:
                 else:
                     heading_penalty = 2.0
                 target_distance = _distance(destination, goal)
+                # visited 惩罚：相对密度(当前格 vs 四邻平均)，防止整条轨道饱和后失去区分度。
+                # 整条巡逻轨道 visited 都是 50 时，局部死角被反复蹭到 55，相对密度 +5 仍会被惩罚。
+                # 系数 0.8：相对差值通常 < 5，让它与距离项 ±1 同量级。
+                # 钳制 [-4, +10]：防止全新区域(当前格 0、四邻 50)产生 -40 的大负数压过距离项。
+                visited_count = self.memory.visited.get(destination, 0)
+                neighbors_visited = [
+                    self.memory.visited.get(_destination(destination, d), 0)
+                    for d in DIRECTION_ORDER
+                ]
+                avg_visited = sum(neighbors_visited) / len(neighbors_visited) if neighbors_visited else 0
+                relative_density = visited_count - avg_visited
+                visited_penalty = max(-4.0, min(10.0, relative_density * 0.8))
                 score = (
                     target_distance
                     + planner.threat.get(destination, 0) * 4.0
                     + heading_penalty
-                    # visited 与距离/惯性同量级:死角里反复蹭 2 次即 +1.0,
-                    # 很快盖过"离目标近 1 格"的诱惑,被迫绕新路。封顶防止
-                    # 老巡逻环因历史访问过多而永久不可走。
-                    + min(10.0, self.memory.visited.get(destination, 0) * 0.5)
+                    + visited_penalty
                 )
             candidates.append((score, DIRECTION_RANK[direction], direction))
         if not candidates:
@@ -9644,7 +9694,8 @@ class SmartTactic:
         """闪电模式先锋：近行星轨道绕 Core 转圈护卫，猎杀无护卫敌方 Core。
 
         轨迹改造（绕银河体系）：先锋是 Core 的"近行星"——绕 core.position 转方环，
-        不再 V 字外插。无猎杀/无近中环警报时全体在近轨 patrol；多先锋按 UUID 序
+        不再 V 字外插。无猎杀/无近中环警报时全体在近轨 patrol（半径
+        LIGHTNING_NEAR_ORBIT_RADIUS=5，贴 Core 视野边缘转、增加保护力）；多先锋按 UUID 序
         错开 phase 实现第一/第三象限对位。仅 NEAR/MID 勤王或猎杀可打目标时离轨。
         """
         if turn.core is None:
@@ -9708,14 +9759,10 @@ class SmartTactic:
                     )
                     self.memory.decision_totals["lightning:vanguard_sweep"] += 1
                 else:
-                    # 朝目标走，但把守卫格+其邻格当障碍绕开（从侧面包抄），
-                    # 而不是正对守卫进退。toward 返回 False = 绕不开（被堵死）。
-                    guard_cells = self._lightning_guard_cells(turn, target_position)
-                    if not planner.toward(
-                        vanguard,
-                        target_position,
-                        "lightning_hunt",
-                        avoid=guard_cells,
+                    # 朝目标走。守卫格在威胁图里已标记，step_toward 会自然绕开。
+                    # 不再用 planner.toward(A*)，改用 _lightning_step_toward 防横跳。
+                    if not self._lightning_step_toward(
+                        turn, planner, vanguard, target_position, "lightning_hunt"
                     ):
                         vanguard.wait()
                 acted_units.add(vanguard.id)
@@ -9735,7 +9782,7 @@ class SmartTactic:
         acted_units: set[UUID],
         decisions: list[str],
     ) -> None:
-        """闪电模式游侠：前4 开路轨道（绕原点大环）+ 其余远行星轨道，猎杀可打敌方 Core。"""
+        """闪电模式游侠：前4 开路轨道（绕原点大环）+ 其余中行星轨道（绕 Core 中层），猎杀可打敌方 Core。"""
         if turn.core is None:
             return
         # 回防分级：NEAR/MID 全体游侠回防；FAR 仅局部(就地游击),不全撤;余者照常。
@@ -9798,6 +9845,7 @@ class SmartTactic:
                     )
                     self.memory.decision_totals["lightning:ranger_shoot"] += 1
                 else:
+                    # 找最佳射击位（远离守卫、低威胁、可射线命中目标）。
                     guard_cells = self._lightning_guard_cells(turn, target_position)
                     firing_cells = {
                         cell
@@ -9828,27 +9876,25 @@ class SmartTactic:
                         if firing_cells
                         else target_position
                     )
-                    if not planner.toward(
-                        ranger,
-                        firing_target,
-                        "lightning_hunt_seek_firing",
-                        avoid=guard_cells,
+                    # 朝射击位走。不再用 planner.toward(A*)，改用 _lightning_step_toward 防横跳。
+                    if not self._lightning_step_toward(
+                        turn, planner, ranger, firing_target, "lightning_hunt_seek_firing"
                     ):
                         ranger.wait()
                 acted_units.add(ranger.id)
                 continue
             # 无猎杀/不进猎杀 → 按职责绕圈：前 4 进开路轨道(绕原点大环),第 5 起进
-            # 远行星轨道(绕 Core)。开路游侠不等 Core、自己转自己的,提前点亮覆盖
+            # 中行星轨道(绕 Core 中层)。开路游侠不等 Core、自己转自己的,提前点亮覆盖
             # Core 轨道的资源。走 Core 风格四邻打分(不走 A*,防乱石堆横跳)。
             if index < LIGHTNING_BREAKTHROUGH_SLOT_COUNT:
                 scout = self._lightning_breakthrough_target(turn, ranger, index)
                 reason = "lightning_breakthrough"
             else:
-                far_lane = index - LIGHTNING_BREAKTHROUGH_SLOT_COUNT
+                mid_lane = index - LIGHTNING_BREAKTHROUGH_SLOT_COUNT
                 scout = self._lightning_orbit_waypoint(
-                    turn, ranger, UnitType.RANGER, lane=far_lane
+                    turn, ranger, UnitType.RANGER, lane=mid_lane
                 )
-                reason = "lightning_ranger_far_orbit"
+                reason = "lightning_ranger_mid_orbit"
             if scout is not None and not self._lightning_step_toward(
                 turn, planner, ranger, scout, reason
             ):

@@ -27,6 +27,7 @@ import arena_hero_strategy as strategy_module
 
 DecisionSummary = strategy_module.DecisionSummary
 TacticMemory = strategy_module.TacticMemory
+MODE_LIGHTNING = strategy_module.MODE_LIGHTNING
 
 
 def _load_strategy_candidate(path: Path, version: int) -> ModuleType:
@@ -204,7 +205,7 @@ def play(
                 accepted = turn.submit()
             except TurnClosedError as exc:
                 error = type(exc).__name__
-                event_logger.append_turn(turn, log_labels, mode=memory.mode)
+                event_logger.append_turn(turn, log_labels, mode=MODE_LIGHTNING)
                 _append_telemetry(
                     telemetry_path,
                     summary,
@@ -218,7 +219,7 @@ def play(
                 )
                 continue
             except APIError as exc:
-                event_logger.append_turn(turn, log_labels, mode=memory.mode)
+                event_logger.append_turn(turn, log_labels, mode=MODE_LIGHTNING)
                 event_logger.append_client_error(turn.tick, exc.error)
                 _append_telemetry(
                     telemetry_path,
@@ -233,7 +234,7 @@ def play(
                 continue
 
             completed_turns += 1
-            event_logger.append_turn(turn, log_labels, mode=memory.mode)
+            event_logger.append_turn(turn, log_labels, mode=MODE_LIGHTNING)
             memory.save(memory_path)
             memory.write_stats(stats_path, turn)
             _append_telemetry(telemetry_path, summary, accepted=True)
