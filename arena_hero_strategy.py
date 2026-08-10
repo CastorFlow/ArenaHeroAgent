@@ -83,6 +83,12 @@ LIGHTNING_VEE_HOME_TOLERANCE = 5
 # 同一敌方 Core 最多多少单位同时集火（防全员扑一个导致 Core 失防、或扑远目标
 # 时旁边敌方 Core 没人盯）。
 LIGHTNING_FOCUS_MAX_ATTACKERS = 3
+# 猎杀距离上限：只追击距离己方 Core 此距离内的敌方 Core，防全员被吸走太远。
+# 设为 outer_ring + 200，在方环外侧附近给一点追击空间，但不会追到几百格外。
+LIGHTNING_HUNT_MAX_DISTANCE = 900
+# 敌方 Core sighting 过期时间（ticks）：超过此时间未再见到的 sighting 视为陈旧，
+# 自动清理以防止单位永久 hunt 已不存在的目标。300 ticks ≈ 75秒。
+LIGHTNING_SIGHTING_MAX_AGE = 300
 
 # === 绕银河多层轨道体系 ===
 # Core 轨道（恒星绕银心）绕原点 (0,0) 转 pr≈650 方环，慢；其余四类轨道围绕它：
@@ -95,6 +101,12 @@ LIGHTNING_FOCUS_MAX_ATTACKERS = 3
 LIGHTNING_BREAKTHROUGH_RING_OFFSET = 12
 # 固定 4 个开路游侠，最先排满；产出第 5 个游侠起进中行星轨道（绕 Core 中层）。
 LIGHTNING_BREAKTHROUGH_SLOT_COUNT = 4
+# 开路轨道安全阈值：Core 距原点超过此值时禁用 breakthrough（防止游侠孤军深入被击杀）。
+# 当 Core 远离原点时，开路的"提前点亮原点资源"意义不大，所有游侠改围 Core 护卫。
+LIGHTNING_BREAKTHROUGH_MAX_CORE_DISTANCE = 400
+# 局部威胁感知半径：游侠/先锋执行轨道巡逻时，检测周围此半径内的敌方战斗单位。
+# 发现威胁时执行局部避战（暂停巡逻，撤向 Core 或绕开），防止孤军深入被围杀。
+LIGHTNING_LOCAL_THREAT_RADIUS = 8
 # 固定产兵阶梯（用户指定，严格按 pop 槽位填，攒钱优先不 fallthrough）：
 #   pop0→先锋, 1→工人, 2→游侠, 3→工人, 4→游侠, 5→工人, 6→游侠, 7→工人,
 #   8+→游侠(直到 LIGHTNING_MAX_POPULATION)。只造 1 先锋(先锋弱,工人当肉盾)。
@@ -202,6 +214,10 @@ SPIN_POSITION_BUDGET = 6
 # 单位满血值
 MAX_HP = {UnitType.WORKER: 2, UnitType.VANGUARD: 4, UnitType.RANGER: 2}
 CORE_EMERGENCY_THREAT_RADIUS = 6
+# AGGRESS_CORE_ALERT_RADIUS：虽然 Aggress 模式已禁用(elif False)，但其底层函数
+# _enemy_movement_anchor 仍被 Lightning 模式的游侠射击候选(via _ranger_shot_candidates)
+# 和 write_stats 遥测统计调用。保留此常量以维持代码完整性。
+AGGRESS_CORE_ALERT_RADIUS = 10
 CORE_DAMAGE_EMERGENCY_TICKS = 24
 CORE_RECOVERY_REBUILD_TICKS = 120
 DEFAULT_RAID_VANGUARDS = 1
@@ -1249,17 +1265,38 @@ class TacticMemory:
                 seen_tick=turn.tick,
                 is_core=isinstance(enemy, CoreView),
             )
+        # 清理 enemy_sightings：(1)非 Core 且超过 ASSAULT_SIGHTING_MAX_AGE，
+        # (2)当前可见位置但物体不在（确认消失），(3)Core sighting 超过
+        # LIGHTNING_SIGHTING_MAX_AGE（防止陈旧 Core 记录导致永久 hunt）。
         self.enemy_sightings = {
             object_id: sighting
             for object_id, sighting in self.enemy_sightings.items()
             if (
-                sighting.is_core
-                or turn.tick - sighting.seen_tick <= ASSAULT_SIGHTING_MAX_AGE
+                (
+                    sighting.is_core
+                    and turn.tick - sighting.seen_tick <= LIGHTNING_SIGHTING_MAX_AGE
+                )
+                or (
+                    not sighting.is_core
+                    and turn.tick - sighting.seen_tick <= ASSAULT_SIGHTING_MAX_AGE
+                )
             )
             and not (
                 object_id not in visible_enemy_ids
                 and _currently_visible(turn, sighting.position, self.known_obstacles)
             )
+        }
+        # 清理指向已过期 sighting 的 claims 和 blacklist
+        valid_core_ids = {
+            oid for oid, s in self.enemy_sightings.items() if s.is_core
+        }
+        self.lightning_claims = {
+            uid: core_id
+            for uid, core_id in self.lightning_claims.items()
+            if core_id in valid_core_ids
+        }
+        self.lightning_blacklist = {
+            core_id for core_id in self.lightning_blacklist if core_id in valid_core_ids
         }
         for position in turn.resource_cells:
             self.resource_last_seen[position] = turn.tick
@@ -3140,9 +3177,62 @@ class SmartTactic:
             else turn.core.position
         )
 
+        # Phase 2: 工人肉盾逻辑 - 检测MID/NEAR威胁
+        near_threat_radius = 6  # NEAR tier
+        mid_threat_radius = 20  # MID tier
+
+        # 统计Core附近的敌方战斗单位距离
+        combat_enemies = [
+            enemy for enemy in turn.visible_enemies
+            if isinstance(enemy, UnitView)
+            and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+        ]
+
+        nearest_enemy_dist = float('inf')
+        if combat_enemies:
+            nearest_enemy_dist = min(
+                _distance(turn.core.position, enemy.position)
+                for enemy in combat_enemies
+            )
+
+        # NEAR威胁：所有空闲工人立即回防近轨道当肉盾
+        workers_need_defend = (
+            nearest_enemy_dist <= near_threat_radius
+            or nearest_enemy_dist <= mid_threat_radius
+        )
+
         for worker in sorted(turn.workers, key=_uuid_key):
             if worker.id in acted_units:
                 continue
+
+            # Phase 2: 工人肉盾行为优先级最高
+            if workers_need_defend and not worker.cargo:
+                # 空手工人回到近轨道（r=5）当肉盾
+                near_orbit_radius = 5
+                core_pos = turn.core.position
+
+                # 计算最近的近轨道点
+                current_dist = _distance(worker.position, core_pos)
+                if current_dist > near_orbit_radius + 2:  # 距离近轨道较远
+                    # 向Core方向移动
+                    if planner.toward(worker, core_pos, "worker_meatshield_defend"):
+                        decisions.append(
+                            f"worker:{_short_id(worker.id)} meatshield_defend "
+                            f"enemy_dist={nearest_enemy_dist} moving_to_core"
+                        )
+                        self.memory.decision_totals["worker:meatshield_defend"] += 1
+                        acted_units.add(worker.id)
+                        continue
+                # 已在近轨道附近，保持位置或微调
+                elif current_dist <= near_orbit_radius + 2:
+                    decisions.append(
+                        f"worker:{_short_id(worker.id)} meatshield_hold "
+                        f"enemy_dist={nearest_enemy_dist} pos={worker.position}"
+                    )
+                    self.memory.decision_totals["worker:meatshield_hold"] += 1
+                    acted_units.add(worker.id)
+                    continue
+
             if worker.cargo:
                 self.memory.clear_worker_goal(worker)
                 if worker.position == turn.core.position:
@@ -3814,7 +3904,7 @@ class SmartTactic:
         if True:
             # 工人远行星轨道：发现资源 → 现有经济逻辑(上方已处理采集/回仓)；
             # 空闲(无货、无资源目标) → 上远行星轨道绕 Core 外圈转圈巡逻(工人距
-            # Core 最外层),点亮外围迷雾防敌方钻空子。分层见 _lightning_orbit_lane_radius。
+            # Core 最外层,游侠中轨内圈),点亮外围迷雾防敌方钻空子。分层见 _lightning_orbit_lane_radius。
             # NEAR 勤王 → 工人回 Core 卡位肉盾(游侠躲工人后面狙击)。
             tier = self._lightning_defense_tier(turn)
             if tier == "NEAR":
@@ -6040,10 +6130,11 @@ class SmartTactic:
         return False
 
     def _lightning_patrol_waypoint(self, turn: Turn) -> Position:
-        """Core 巡逻点：沿半径 pr 的方形周界四角轮转转圈。
+        """Core 巡逻点：沿半径 pr 的方形周界四角轮转，遇敌绕开。
 
         越界（环内或环外）时最近角即目标——走到环上的路本身就算正常巡逻。
         到达死区后推进到下一角，形成绕环转圈。
+        新增：检查目标象限是否有可见敌方战斗单位，有则跳过该角。
         """
         core = turn.core
         pr = self._lightning_patrol_radius()
@@ -6051,6 +6142,20 @@ class SmartTactic:
         corners = ((pr, pr), (pr, -pr), (-pr, -pr), (-pr, pr))
         waypoint = self.memory.lightning_patrol_waypoint
         phase = self.memory.lightning_patrol_phase % 4
+
+        def _in_quadrant(pos: Position, corner: Position) -> bool:
+            """判断pos是否在corner所在象限（以原点为中心）。"""
+            cx, cy = corner
+            px, py = pos
+            if cx > 0 and cy > 0:  # 第一象限
+                return px > 0 and py > 0
+            elif cx > 0 and cy < 0:  # 第四象限
+                return px > 0 and py < 0
+            elif cx < 0 and cy < 0:  # 第三象限
+                return px < 0 and py < 0
+            else:  # 第二象限
+                return px < 0 and py > 0
+
         if waypoint is None:
             # 首次：选最近的周界角作起点。
             phase = min(
@@ -6061,6 +6166,23 @@ class SmartTactic:
             waypoint = corners[phase]
             self.memory.lightning_patrol_waypoint = waypoint
             return waypoint
+
+        # 检查当前目标象限是否有敌方战斗单位
+        enemies_in_quadrant = any(
+            isinstance(enemy, UnitView)
+            and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+            and _in_quadrant(enemy.position, waypoint)
+            for enemy in turn.visible_enemies
+        )
+
+        if enemies_in_quadrant:
+            # 跳过这个角，进入下一角
+            phase = (phase + 1) % 4
+            self.memory.lightning_patrol_phase = phase
+            waypoint = corners[phase]
+            self.memory.lightning_patrol_waypoint = waypoint
+            return waypoint
+
         if _distance(core.position, waypoint) <= CORE_BEACON_HYSTERESIS:
             # 到达死区，推进到下一角。
             phase = (phase + 1) % 4
@@ -6216,6 +6338,11 @@ class SmartTactic:
                 # 永久放弃过的重兵 Core，不再回头;顺手从 sightings 清脏。
                 self.memory.enemy_sightings.pop(core_id, None)
                 continue
+            # 距离检查：只追击 LIGHTNING_HUNT_MAX_DISTANCE 内的目标，防全员被吸走太远。
+            if turn.core is not None:
+                dist = _distance(sighting.position, turn.core.position)
+                if dist > LIGHTNING_HUNT_MAX_DISTANCE:
+                    continue
             if claim_counts.get(core_id, 0) >= LIGHTNING_FOCUS_MAX_ATTACKERS:
                 # 已集火满员 → 跳过选下一个,防 Core 失防。
                 continue
@@ -6274,6 +6401,72 @@ class SmartTactic:
             return "FAR"
         return "NONE"
 
+    def _lightning_has_local_threat(self, turn: Turn, unit: Unit) -> bool:
+        """检测单位周围 LIGHTNING_LOCAL_THREAT_RADIUS 内是否有敌方战斗单位。
+
+        用于轨道巡逻时的局部威胁感知：即使敌方未深入我方 Core（defense_tier=NONE），
+        游侠/先锋在远处巡逻时遇到敌方单位也应避战，防止孤军深入被围杀。
+        """
+        for enemy in turn.visible_enemies:
+            if not (
+                isinstance(enemy, UnitView)
+                and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+            ):
+                continue
+            if _distance(enemy.position, unit.position) <= LIGHTNING_LOCAL_THREAT_RADIUS:
+                return True
+        return False
+
+    def _lightning_breakthrough_threat_check(
+        self,
+        turn: Turn,
+        ranger: Unit,
+    ) -> tuple[str, Position | None]:
+        """开路游侠威胁检测：返回 (action, target)。
+
+        用户战术要求（开路轨道职责）：
+        - 只有 1v1 先锋时游击（利用射程优势）
+        - 见游侠/多敌立即绕路（逃向 Core）
+
+        action:
+            "flee"   - 发现敌方游侠或多敌，逃向 Core
+            "kite"   - 发现单个敌方先锋，保持 2-3 格游击
+            "patrol" - 无威胁，继续巡逻
+
+        target: 逃跑/游击目标位置，None 表示继续巡逻
+        """
+        nearby_enemies = []
+        for enemy in turn.visible_enemies:
+            if not isinstance(enemy, UnitView):
+                continue
+            if enemy.unit_type not in {UnitType.VANGUARD, UnitType.RANGER}:
+                continue
+            dist = _distance(ranger.position, enemy.position)
+            if dist <= LIGHTNING_LOCAL_THREAT_RADIUS:
+                nearby_enemies.append((enemy, dist))
+
+        if not nearby_enemies:
+            return ("patrol", None)
+
+        # 发现敌方游侠 → 立即逃跑（我方 2HP 易亏，射程对等无优势）
+        if any(e.unit_type is UnitType.RANGER for e, _ in nearby_enemies):
+            return ("flee", turn.core.position if turn.core else None)
+
+        # 多个敌人 → 逃跑（敌众我寡）
+        if len(nearby_enemies) > 1:
+            return ("flee", turn.core.position if turn.core else None)
+
+        # 单个先锋 → 游击（射程 1-3 优势，先锋近战需贴脸）
+        enemy, dist = nearby_enemies[0]
+        if enemy.unit_type is UnitType.VANGUARD:
+            kite_pos = self._lightning_kiting_position(turn, ranger, enemy)
+            if kite_pos != ranger.position:
+                return ("kite", kite_pos)
+            # 距离已合适（2-3），原地不动让主逻辑处理射击
+            return ("patrol", None)
+
+        return ("patrol", None)
+
     def _lightning_engage_assessment(
         self,
         turn: Turn,
@@ -6310,6 +6503,204 @@ class SmartTactic:
         if has_vanguard:
             return "PRESS"
         return "CHICKEN"
+
+    def _lightning_find_nearby_unguarded_core(
+        self,
+        turn: Turn,
+        ranger: Unit,
+    ) -> CoreView | None:
+        """开路游侠巡逻途中搜索附近无守卫/弱守卫的敌方 Core（选择性交战用）。
+
+        仅搜索可见的 CoreView（不使用 enemy_sightings 历史记录），确保信息新鲜。
+        返回距离游侠最近的、满足"无守卫或仅1先锋"的敌方 Core。
+        """
+        candidates = []
+        for enemy in turn.visible_enemies:
+            if not isinstance(enemy, CoreView):
+                continue
+            # 跳过已拉黑的 Core
+            if str(enemy.id) in self.memory.lightning_blacklist:
+                continue
+            # 检测守卫情况
+            if self._lightning_target_attended(turn, enemy.position):
+                continue
+            if self._lightning_target_crowded(enemy.position):
+                continue
+            # 统计守卫兵种
+            guard_vanguards = 0
+            guard_rangers = 0
+            for other_enemy in turn.visible_enemies:
+                if not isinstance(other_enemy, UnitView):
+                    continue
+                dist = _distance(other_enemy.position, enemy.position)
+                if dist > LIGHTNING_HUNT_GUARD_RADIUS:
+                    continue
+                if other_enemy.unit_type is UnitType.VANGUARD:
+                    guard_vanguards += 1
+                elif other_enemy.unit_type is UnitType.RANGER:
+                    guard_rangers += 1
+            # 有游侠守卫 → 跳过（绕路）
+            if guard_rangers > 0:
+                continue
+            # 无守卫 or 仅先锋守卫 → 候选
+            dist_to_ranger = _distance(ranger.position, enemy.position)
+            candidates.append((dist_to_ranger, enemy))
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0])
+        return candidates[0][1]
+
+    def _lightning_should_breakthrough_engage(
+        self,
+        turn: Turn,
+        ranger: Unit,
+        target_core: CoreView,
+    ) -> bool:
+        """判定开路游侠是否应对该 Core 交战（选择性交战规则）。
+
+        交战条件：
+        1. 无守卫 → 打
+        2. 仅1先锋守卫 → 游击（利用射程优势）
+        3. 有游侠守卫 OR 敌方战斗单位数量 > 我方开路游侠数量 → 绕路
+
+        返回 True 表示应交战，False 表示绕路继续巡逻。
+        """
+        # 统计目标周围的敌方战斗单位
+        enemy_combat_units = []
+        for enemy in turn.visible_enemies:
+            if not isinstance(enemy, UnitView):
+                continue
+            if enemy.unit_type not in {UnitType.VANGUARD, UnitType.RANGER}:
+                continue
+            dist = _distance(enemy.position, target_core.position)
+            if dist <= LIGHTNING_HUNT_GUARD_RADIUS:
+                enemy_combat_units.append(enemy)
+
+        # 有游侠守卫 → 绕路（不打）
+        for enemy_unit in enemy_combat_units:
+            if enemy_unit.unit_type is UnitType.RANGER:
+                return False
+
+        # 统计我方开路游侠数量
+        my_breakthrough_rangers = 0
+        ordered_rangers = sorted(turn.rangers, key=_uuid_key)
+        for index, r in enumerate(ordered_rangers):
+            if index < LIGHTNING_BREAKTHROUGH_SLOT_COUNT:
+                my_breakthrough_rangers += 1
+
+        # 敌方战斗单位数量 > 我方开路游侠数量 → 绕路（敌众我寡）
+        if len(enemy_combat_units) > my_breakthrough_rangers:
+            return False
+
+        # 否则：无守卫 or 仅先锋守卫 → 可以打
+        return True
+
+    def _lightning_find_nearest_threat(
+        self,
+        turn: Turn,
+    ) -> UnitView | None:
+        """找距离己方 Core 最近的敌方战斗单位（VANGUARD/RANGER）。"""
+        nearest_threat = None
+        min_distance = float("inf")
+        for enemy in turn.visible_enemies:
+            if not isinstance(enemy, UnitView):
+                continue
+            if enemy.unit_type not in {UnitType.VANGUARD, UnitType.RANGER}:
+                continue
+            dist = _distance(enemy.position, turn.core.position)
+            if dist < min_distance:
+                min_distance = dist
+                nearest_threat = enemy
+        return nearest_threat
+
+    def _lightning_intercept_position(
+        self,
+        turn: Turn,
+        ranger: Unit,
+        threat: UnitView,
+    ) -> Position:
+        """计算拦截位置：在威胁与 Core 之间，保持射程内（1-3）。
+
+        优先选择：(1)射程内 (2)靠近威胁方向 (3)不贴脸（距离>=2）。
+        """
+        # 简单策略：朝威胁方向移动，保持距离2-3
+        dx = threat.position[0] - ranger.position[0]
+        dy = threat.position[1] - ranger.position[1]
+        dist = _distance(ranger.position, threat.position)
+
+        if dist <= 2:
+            # 太近了，后退一步
+            retreat_x = ranger.position[0] - (1 if dx > 0 else -1 if dx < 0 else 0)
+            retreat_y = ranger.position[1] - (1 if dy > 0 else -1 if dy < 0 else 0)
+            return (retreat_x, retreat_y)
+        elif dist >= 4:
+            # 太远了，靠近一步
+            approach_x = ranger.position[0] + (1 if dx > 0 else -1 if dx < 0 else 0)
+            approach_y = ranger.position[1] + (1 if dy > 0 else -1 if dy < 0 else 0)
+            return (approach_x, approach_y)
+        else:
+            # 距离合适（2-3），保持当前位置
+            return ranger.position
+
+    def _lightning_kiting_position(
+        self,
+        turn: Turn,
+        ranger: Unit,
+        threat: UnitView,
+    ) -> Position:
+        """计算游击位置：保持射程（2-3），不让敌人贴脸。
+
+        优先：(1)保持距离2-3 (2)避开障碍 (3)不超出追击边界（方环外缘700）。
+        """
+        dist = _distance(ranger.position, threat.position)
+        dx = threat.position[0] - ranger.position[0]
+        dy = threat.position[1] - ranger.position[1]
+
+        if dist <= 1:
+            # 敌人贴脸了，立即后退
+            retreat_x = ranger.position[0] - (1 if dx > 0 else -1 if dx < 0 else 0)
+            retreat_y = ranger.position[1] - (1 if dy > 0 else -1 if dy < 0 else 0)
+            return (retreat_x, retreat_y)
+        elif dist == 2:
+            # 距离正好，保持或侧移
+            return ranger.position
+        elif dist == 3:
+            # 距离正好，保持
+            return ranger.position
+        elif dist >= 4:
+            # 敌人撤了，追近一步（但不超过3）
+            approach_x = ranger.position[0] + (1 if dx > 0 else -1 if dx < 0 else 0)
+            approach_y = ranger.position[1] + (1 if dy > 0 else -1 if dy < 0 else 0)
+            # 检查是否超出追击边界（方环外缘700）
+            if max(abs(approach_x), abs(approach_y)) > 700:
+                # 超界了，停止追击，回轨道
+                return ranger.position
+            return (approach_x, approach_y)
+        else:
+            return ranger.position
+
+    def _lightning_vanguard_intercept(
+        self,
+        turn: Turn,
+        vanguard: Unit,
+        threat: UnitView,
+    ) -> Position:
+        """先锋拦截位置：朝威胁方向移动（近战），但不超出近轨道范围。"""
+        dx = threat.position[0] - vanguard.position[0]
+        dy = threat.position[1] - vanguard.position[1]
+
+        # 朝威胁方向移动一步
+        approach_x = vanguard.position[0] + (1 if dx > 0 else -1 if dx < 0 else 0)
+        approach_y = vanguard.position[1] + (1 if dy > 0 else -1 if dy < 0 else 0)
+
+        # 检查是否超出近轨道范围（距离 Core 不超过8）
+        dist_to_core = _distance((approach_x, approach_y), turn.core.position)
+        if dist_to_core > 8:
+            # 超出范围，停在原地
+            return vanguard.position
+
+        return (approach_x, approach_y)
 
     def _lightning_sector_target(
         self,
@@ -6519,16 +6910,88 @@ class SmartTactic:
             return None
         return target
 
+    def _lightning_calculate_outer_first_orbits(
+        self,
+        unit_count: int,
+        vision_radius: int,
+        gap: int,
+        inner_radius: int,
+        min_units_per_orbit: int = 2,
+    ) -> list[tuple[int, int]]:
+        """混合策略：先铺开领土（每轨道最少单位），再按周长比例加密。
+
+        返回 [(radius, unit_count), ...] 列表。
+
+        策略：
+        1. Phase 1: 每条轨道先分配 min_units_per_orbit，尽量铺开
+        2. Phase 2: 剩余单位按周长比例分配（外层轨道周长大，分配更多）
+        3. 单轨道上限8个单位（四角+四边中点）
+        """
+        if unit_count == 0:
+            return []
+
+        # 最多能铺几条轨道
+        max_orbits = unit_count // min_units_per_orbit
+
+        # 合理外边界：游侠≤80，工人≤60
+        max_radius_by_gap = {5: 80, 3: 60}
+        reasonable_limit = max_radius_by_gap.get(gap, 100)
+        max_radius = min(inner_radius + gap * max_orbits, reasonable_limit)
+
+        result = []
+        remaining = unit_count
+        radius = inner_radius
+
+        # Phase 1: 每条轨道先分配最少单位，铺开领土
+        while remaining >= min_units_per_orbit and radius <= max_radius:
+            result.append([radius, min_units_per_orbit])
+            remaining -= min_units_per_orbit
+            radius += gap
+
+        if remaining == 0:
+            return [(r, c) for r, c in result]
+
+        # Phase 2: 剩余单位按周长比例分配
+        # 计算各轨道周长
+        circumferences = [8 * r for r, c in result]
+        total_circumference = sum(circumferences)
+
+        if total_circumference > 0:
+            # 按周长比例分配剩余单位
+            for i, circ in enumerate(circumferences):
+                if remaining <= 0:
+                    break
+                r, count = result[i]
+                # 该轨道应分配的额外单位数 = 剩余单位 × (该轨道周长 / 总周长)
+                # 四舍五入，至少1个（如果总剩余>0）
+                extra = max(1, round(remaining * circ / total_circumference))
+                # 不超过单轨道上限
+                max_extra = min(extra, 8 - count, remaining)
+                result[i][1] = count + max_extra
+                remaining -= max_extra
+
+        # Phase 3: 如果Phase 2舍入导致还有剩余，从外向内依次加1
+        orbit_idx = len(result) - 1
+        while remaining > 0 and orbit_idx >= 0:
+            r, count = result[orbit_idx]
+            if count < 8:
+                result[orbit_idx][1] = count + 1
+                remaining -= 1
+            orbit_idx -= 1
+
+        return [(r, c) for r, c in result]
+
     def _lightning_assign_orbit_lanes(
         self,
         turn: Turn,
         role: UnitType,
-    ) -> dict[str, int]:
-        """给某 role 的所有存活单位分配紧凑 lane index(0..N-1),按 UUID 序。
+    ) -> dict[str, tuple[int, int]]:
+        """给某 role 的所有存活单位分配 (radius, group_index)。
 
-        死亡单位的 lane 剪枝后重排紧凑(抄 _lightning_ranger_scout_target 的 compaction
-        套路)。返回 {uid: lane}。同时缓存到 memory.lightning_orbit_lanes[role.value]。
-        lane 决定该单位行星子轨道的径向半径(工人/游侠每单位一条子轨道)。
+        外圈优先混合策略：先铺开外层轨道（最大化领土），再按周长比例加密。
+        同一半径的单位通过 group_index 错开 phase（phase_offset = group_index * 4 // group_size）。
+
+        返回 {uid: (radius, group_index)}。缓存到 memory.lightning_orbit_lanes[role.value]。
         """
         role_key = role.value
         if role is UnitType.VANGUARD:
@@ -6537,52 +7000,54 @@ class SmartTactic:
             units = list(turn.rangers)
         else:
             units = list(turn.workers)
+
         live = {str(u.id) for u in units}
         stored = dict(self.memory.lightning_orbit_lanes.get(role_key, {}))
+
+        # 清理死亡单位
         for dead in [k for k in stored if k not in live]:
             stored.pop(dead, None)
             self.memory.lightning_orbit_phase.pop(dead, None)
-        for unit in sorted(units, key=_uuid_key):
-            uid = str(unit.id)
-            if uid not in stored:
-                stored[uid] = len(stored)
-        ordered = sorted(stored.items(), key=lambda kv: kv[1])
-        compact = {uid_: i for i, (uid_, _) in enumerate(ordered)}
-        self.memory.lightning_orbit_lanes[role_key] = compact
-        return compact
 
-    def _lightning_orbit_lane_radius(
-        self,
-        turn: Turn,
-        role: UnitType,
-        lane: int,
-    ) -> int:
-        """role 第 lane 条行星子轨道的半径(相对 Core,近→中→远依次外括)。
-
-        层序(内→外):先锋(近行星) → 游侠(中行星) → 工人(远行星,闲时)。
-          先锋近轨内缘 = LIGHTNING_NEAR_ORBIT_RADIUS=5;先锋全部共享 lane 0 一条
-            近轨(_lightning_orbit_waypoint 内处理),故先锋的 lane 参数忽略。
-          游侠中轨内缘 = 先锋外缘 + GAP[R];游侠每 lane 一条子轨道,间距 GAP[R]=5。
-          工人远轨内缘 = 游侠中轨外缘 + GAP[W];闲时工人每 lane 一条子轨道,间距
-            GAP[W]=3。工人有资源目标时走经济逻辑(上方 _choose_workers 采集/回仓),
-            仅空闲(无货、无资源目标)才上此远轨巡逻,故远轨不会因工人忙采集而空缺
-            太久——工人在远轨点亮外围迷雾、防敌方钻空子。
-        """
-        gap_v = LIGHTNING_ORBIT_LANE_GAP_RADIUS[UnitType.VANGUARD]
-        gap_w = LIGHTNING_ORBIT_LANE_GAP_RADIUS[UnitType.WORKER]
-        gap_r = LIGHTNING_ORBIT_LANE_GAP_RADIUS[UnitType.RANGER]
-        vg_count = len(turn.vanguards)
-        rk_count = len(turn.rangers)
-        vg_inner = LIGHTNING_NEAR_ORBIT_RADIUS
-        vg_outer = vg_inner + max(0, vg_count - 1) * gap_v
-        rk_inner = vg_outer + gap_r
-        rk_outer = rk_inner + max(0, rk_count - 1) * gap_r
-        wk_inner = rk_outer + gap_w
+        # 计算轨道分配
+        gap = LIGHTNING_ORBIT_LANE_GAP_RADIUS[role]
         if role is UnitType.VANGUARD:
-            return vg_inner  # 全先锋共享一条近轨
-        if role is UnitType.RANGER:
-            return rk_inner + lane * gap_r   # 中行星轨道
-        return wk_inner + lane * gap_w        # 远行星轨道(闲时工人)
+            inner_radius = LIGHTNING_NEAR_ORBIT_RADIUS
+        elif role is UnitType.RANGER:
+            vg_count = len(turn.vanguards)
+            gap_v = LIGHTNING_ORBIT_LANE_GAP_RADIUS[UnitType.VANGUARD]
+            vg_outer = LIGHTNING_NEAR_ORBIT_RADIUS + max(0, vg_count - 1) * gap_v
+            inner_radius = vg_outer + gap
+        else:  # WORKER
+            vg_count = len(turn.vanguards)
+            rk_count = len(turn.rangers)
+            gap_v = LIGHTNING_ORBIT_LANE_GAP_RADIUS[UnitType.VANGUARD]
+            gap_r = LIGHTNING_ORBIT_LANE_GAP_RADIUS[UnitType.RANGER]
+            vg_outer = LIGHTNING_NEAR_ORBIT_RADIUS + max(0, vg_count - 1) * gap_v
+            rk_inner = vg_outer + gap_r
+            rk_outer = rk_inner + max(0, rk_count - 1) * gap_r
+            inner_radius = rk_outer + 3
+
+        vision_radius = LIGHTNING_ORBIT_LANE_GAP_RADIUS[role]
+        orbit_distribution = self._lightning_calculate_outer_first_orbits(
+            len(units), vision_radius, gap, inner_radius, min_units_per_orbit=2
+        )
+
+        # 按UUID序分配单位到各半径
+        sorted_units = sorted(units, key=_uuid_key)
+        assignments = {}
+        unit_idx = 0
+
+        for radius, count in orbit_distribution:
+            for group_idx in range(count):
+                if unit_idx >= len(sorted_units):
+                    break
+                uid = str(sorted_units[unit_idx].id)
+                assignments[uid] = (radius, group_idx)
+                unit_idx += 1
+
+        self.memory.lightning_orbit_lanes[role_key] = assignments
+        return assignments
 
     def _lightning_orbit_waypoint(
         self,
@@ -6591,37 +7056,30 @@ class SmartTactic:
         role: UnitType,
         lane: int | None = None,
     ) -> Position | None:
-        """绕 Core 转的行星轨道(近/中/远子轨道)下一目标点。
+        """绕 Core 转的行星轨道下一目标点。外圈优先分配，同半径单位phase错开。
 
-        圆心 = core.position(行星维度,与绕原点的开路/恒星轨道区分)。半径由
-        _lightning_orbit_lane_radius(role, lane) 定。沿方环四角顺时针轮转,到角
-        死区(CORE_BEACON_HYSTERESIS)推进下一角。起始 base phase 对齐 Core 巡逻
-        phase,使护卫顺 Core 行进方向绕。最终角钳到全局方环(安全区)防越框。
-
-        先锋:全部共享 lane 0 一条近轨,按 UUID 序 index 错开 phase_offset 实现对位
-        (2 先锋→0/2 对角,4 先锋→0/1/2/3 四等分)。工人:每单位一条子轨道(lane 由
-        _lightning_assign_orbit_lanes 按 UUID 序自动分配)。游侠(远行星):lane 由
-        调用方显式传入(=该游侠在远环中的序号 index-4),因为前 4 个游侠在开路
-        轨道、不占远环 lane,不能让 assign 把全游侠都编号挤到 lane 4+。
+        圆心 = core.position。半径由 _lightning_assign_orbit_lanes 分配。
+        同一半径的多个单位通过 phase_offset 错开（0/1/2/3 对应四个角）。
         """
         core = turn.core
         if core is None:
             return None
+
         uid = str(unit.id)
-        if role is UnitType.VANGUARD:
-            lane = 0
-            ordered_uids = [str(v.id) for v in sorted(turn.vanguards, key=_uuid_key)]
-            index = ordered_uids.index(uid) if uid in ordered_uids else 0
-            n = max(1, len(ordered_uids))
-            phase_offset = (index * 4) // n  # 0..3 均分对位
-        else:
-            lanes = self._lightning_assign_orbit_lanes(turn, role)  # 顺带剪枝死亡单位
-            if lane is None:
-                lane = lanes.get(uid, 0)
-            phase_offset = 0
-        radius = self._lightning_orbit_lane_radius(turn, role, lane)
-        if radius <= 0:
+
+        # 重新分配（顺带剪枝死亡单位）
+        lanes = self._lightning_assign_orbit_lanes(turn, role)
+
+        if uid not in lanes:
             return None
+
+        radius, group_index = lanes[uid]
+
+        # 计算该半径上的总单位数（用于phase_offset）
+        units_at_radius = sum(1 for (r, _) in lanes.values() if r == radius)
+        phase_offset = (group_index * 4) // max(1, units_at_radius)
+
+        # 生成四角目标
         cx, cy = core.position
         corners = (
             (cx + radius, cy + radius),
@@ -6629,12 +7087,15 @@ class SmartTactic:
             (cx - radius, cy - radius),
             (cx - radius, cy + radius),
         )
+
+        # 读取/初始化 base_phase
         base_phase = self.memory.lightning_orbit_phase.get(uid)
         if base_phase is None:
-            # 首次:对齐 Core 巡逻 phase,顺方向绕。
             base_phase = self.memory.lightning_patrol_phase % 4
             self.memory.lightning_orbit_phase[uid] = base_phase
+
         target = corners[(base_phase + phase_offset) % 4]
+
         # 动态跳角:目标角尚远却已知埋在乱石堆里 → 提前推下一角绕行。
         if (
             _distance(unit.position, target) > CORE_BEACON_HYSTERESIS * 2
@@ -6643,10 +7104,12 @@ class SmartTactic:
             base_phase = (base_phase + 1) % 4
             self.memory.lightning_orbit_phase[uid] = base_phase
             target = corners[(base_phase + phase_offset) % 4]
+
         if _distance(unit.position, target) <= CORE_BEACON_HYSTERESIS:
             base_phase = (base_phase + 1) % 4
             self.memory.lightning_orbit_phase[uid] = base_phase
             target = corners[(base_phase + phase_offset) % 4]
+
         # 新增：目标区域访问饱和时强制跳角（提前放弃不可达目标）
         elif (
             _distance(unit.position, target) < CORE_BEACON_HYSTERESIS * 2
@@ -6656,9 +7119,12 @@ class SmartTactic:
             base_phase = (base_phase + 1) % 4
             self.memory.lightning_orbit_phase[uid] = base_phase
             target = corners[(base_phase + phase_offset) % 4]
+
         target = self._lightning_clamp_to_donut(target)
+
         if target == unit.position:
             return None
+
         return target
 
     def _lightning_step_toward(
@@ -9768,6 +10234,15 @@ class SmartTactic:
                 acted_units.add(vanguard.id)
                 continue
             # 无猎杀/不进猎杀 → 绕 Core 近行星轨道转圈护卫（不走 A*，Core 风格四邻打分）。
+            # 局部威胁检测：先锋周围有敌方战斗单位且无猎杀目标时，撤向 Core 避战。
+            if self._lightning_has_local_threat(turn, vanguard):
+                retreat_target = turn.core.position
+                if not self._lightning_step_toward(
+                    turn, planner, vanguard, retreat_target, "lightning_retreat_local_threat"
+                ):
+                    vanguard.wait()
+                acted_units.add(vanguard.id)
+                continue
             orbit = self._lightning_orbit_waypoint(turn, vanguard, UnitType.VANGUARD)
             if orbit is not None and not self._lightning_step_toward(
                 turn, planner, vanguard, orbit, "lightning_vanguard_orbit"
@@ -9782,124 +10257,216 @@ class SmartTactic:
         acted_units: set[UUID],
         decisions: list[str],
     ) -> None:
-        """闪电模式游侠：前4 开路轨道（绕原点大环）+ 其余中行星轨道（绕 Core 中层），猎杀可打敌方 Core。"""
+        """闪电模式游侠：四层轨道职责 + 分层防御。
+
+        四层轨道职责：
+        - 开路轨道（4游侠，绕原点）：探索资源 + 侦察无守卫Core + 选择性交战
+          - 只有1v1先锋时游击（利用射程优势）
+          - 见游侠/多敌立即绕路
+          - 不能离开开路轨道范围
+        - 近轨道（先锋，r=5）：绝对不离开，守卫Core内层
+        - 中轨道（剩余游侠）：正常巡逻 + 分层应敌
+        - 远轨道（工人）：可离开采集，防御时回近轨道当肉盾
+
+        分层防御（按敌方深入程度）：
+        - 敌入远轨道 → 狙击驱离（不贴脸，最远追到外轨道边界）
+        - 敌入中轨道 → 集结所有中轨游侠围攻，工人回近轨道当肉盾
+        - 敌入近轨道 → 游侠退入工人包围圈阻击 + 召回开路游侠勤王（沿途绕过敌人）
+
+        总原则：
+        - 非必要不进攻（除非压倒性优势）
+        - 资源靠采集，不掠夺
+        - 禁止千里追击
+        """
         if turn.core is None:
             return
-        # 回防分级：NEAR/MID 全体游侠回防；FAR 仅局部(就地游击),不全撤;余者照常。
+
+        # Step 1: 威胁分级
         tier = self._lightning_defense_tier(turn)
-        if tier in ("NEAR", "MID"):
-            self._choose_rangers_recall(turn, planner, acted_units, decisions)
+
+        # Step 2: NEAR威胁 → 所有游侠回防（召回开路游侠勤王）
+        if tier == "NEAR":
+            for ranger in sorted(turn.rangers, key=_uuid_key):
+                if ranger.id in acted_units:
+                    continue
+                # 游侠退入工人包围圈阻击（近轨道r=5附近）
+                retreat_target = turn.core.position
+                if not self._lightning_step_toward(
+                    turn, planner, ranger, retreat_target, "lightning_defend_NEAR"
+                ):
+                    ranger.wait()
+                decisions.append(
+                    f"ranger:{_short_id(ranger.id)} defend_NEAR retreat_to_core"
+                )
+                self.memory.decision_totals["ranger:defend_NEAR"] += 1
+                acted_units.add(ranger.id)
             return
+
+        # Step 3: MID威胁 → 集结所有中轨游侠围攻
+        if tier == "MID":
+            nearest_threat = self._lightning_find_nearest_threat(turn)
+            if nearest_threat is None:
+                # 找不到威胁，降级为正常巡逻
+                tier = "NONE"
+            else:
+                for ranger in sorted(turn.rangers, key=_uuid_key):
+                    if ranger.id in acted_units:
+                        continue
+                    # 所有游侠集结到威胁位置，保持射程（2-3）狙击
+                    intercept_pos = self._lightning_intercept_position(
+                        turn, ranger, nearest_threat
+                    )
+                    if not self._lightning_step_toward(
+                        turn, planner, ranger, intercept_pos, "lightning_defend_MID"
+                    ):
+                        ranger.wait()
+                    decisions.append(
+                        f"ranger:{_short_id(ranger.id)} defend_MID intercept "
+                        f"threat={nearest_threat.position}"
+                    )
+                    self.memory.decision_totals["ranger:defend_MID"] += 1
+                    acted_units.add(ranger.id)
+                return
+
+        # Step 4: FAR威胁或无威胁 → 按职责分工
         ordered_rangers = sorted(turn.rangers, key=_uuid_key)
+        core_origin_dist = _distance(turn.core.position, (0, 0))
+        breakthrough_safe = core_origin_dist <= LIGHTNING_BREAKTHROUGH_MAX_CORE_DISTANCE
+
         for index, ranger in enumerate(ordered_rangers):
             if ranger.id in acted_units:
                 continue
-            uid = str(ranger.id)
-            core_id = self._lightning_claim_for(uid)
-            target_position: Position | None = None
-            visible_core: CoreView | None = None
-            if core_id is not None:
-                target_position, visible_core = self._lightning_target_position(
-                    turn, core_id
-                )
-                if self._lightning_target_attended(turn, target_position) or (
-                    visible_core is None
-                    and self._lightning_target_crowded(target_position)
-                ):
-                    self._lightning_blacklist_core(core_id)
-                    core_id = None
-                    target_position = None
-                    visible_core = None
-            if core_id is None:
-                core_id = self._lightning_acquire_target(turn, ranger)
-                if core_id is not None:
-                    target_position, visible_core = self._lightning_target_position(
-                        turn, core_id
-                    )
-            if core_id is not None and target_position is not None:
-                # 兵种细分：SKIP(有游侠守卫) → 拉黑回避;CHICKEN/PRESS → 进猎杀
-                # (PRESS 只先锋守卫时,游侠手长优势,现有 seek-firing-cell 已倾向
-                #  远守卫的射程内格,即天然游击/勾引+狙击位)。
-                assessment = self._lightning_engage_assessment(turn, target_position)
-                if assessment == "SKIP":
-                    self._lightning_blacklist_core(core_id)
-                    core_id = None
-                    target_position = None
-                    visible_core = None
-            if core_id is not None and target_position is not None:
-                shots = [
-                    (enemy, cell)
-                    for enemy, cell in self._ranger_shot_candidates(
-                        turn, ranger, planner
-                    )
-                    if isinstance(enemy, CoreView)
-                    and str(enemy.id) == core_id
-                ]
-                if shots:
-                    enemy, cell = min(shots, key=lambda pair: pair[1])
-                    ranger.shoot(enemy, expected_cell=cell)
-                    self._mark_ranger_shot(enemy, cell)
-                    decisions.append(
-                        f"lightning:{_short_id(ranger.id)} shoot "
-                        f"target={target_position}"
-                    )
-                    self.memory.decision_totals["lightning:ranger_shoot"] += 1
-                else:
-                    # 找最佳射击位（远离守卫、低威胁、可射线命中目标）。
-                    guard_cells = self._lightning_guard_cells(turn, target_position)
-                    firing_cells = {
-                        cell
-                        for cell in self._firing_cells(
-                            target_position, planner.obstacles
-                        )
-                        if cell not in guard_cells
-                    }
-                    firing_target = (
-                        min(
-                            firing_cells,
-                            key=lambda cell: (
-                                sum(
-                                    1
-                                    for g in turn.visible_enemies
-                                    if isinstance(g, UnitView)
-                                    and g.unit_type
-                                    in {UnitType.VANGUARD, UnitType.RANGER}
-                                    and _distance(cell, g.position)
-                                    <= LIGHTNING_HUNT_GUARD_CLOSE_RADIUS
-                                ),
-                                planner.final_occupancy(cell),
-                                planner.threat.get(cell, 0),
-                                _distance(ranger.position, cell),
-                                cell,
-                            ),
-                        )
-                        if firing_cells
-                        else target_position
-                    )
-                    # 朝射击位走。不再用 planner.toward(A*)，改用 _lightning_step_toward 防横跳。
-                    if not self._lightning_step_toward(
-                        turn, planner, ranger, firing_target, "lightning_hunt_seek_firing"
+
+            # 开路游侠（前4个）
+            if index < LIGHTNING_BREAKTHROUGH_SLOT_COUNT and breakthrough_safe:
+                # Phase 3: 开路游侠战术 - 威胁检测优先
+                action, target = self._lightning_breakthrough_threat_check(turn, ranger)
+
+                if action == "flee":
+                    # 见游侠/多敌 → 逃向Core（沿途绕过敌人）
+                    if target and not self._lightning_step_toward(
+                        turn, planner, ranger, target, "breakthrough_flee"
                     ):
                         ranger.wait()
+                    decisions.append(
+                        f"ranger:{_short_id(ranger.id)} breakthrough_flee to_core"
+                    )
+                    self.memory.decision_totals["breakthrough:flee"] += 1
+                    acted_units.add(ranger.id)
+                    continue
+
+                elif action == "kite":
+                    # 1v1先锋 → 游击（保持2-3格射程优势）
+                    if target and not self._lightning_step_toward(
+                        turn, planner, ranger, target, "breakthrough_kite"
+                    ):
+                        ranger.wait()
+                    decisions.append(
+                        f"ranger:{_short_id(ranger.id)} breakthrough_kite vs_vanguard"
+                    )
+                    self.memory.decision_totals["breakthrough:kite"] += 1
+                    acted_units.add(ranger.id)
+                    continue
+
+                # action == "patrol" → 继续巡逻（可能发现无守卫Core）
+                # 搜索附近无守卫Core（选择性交战）
+                unguarded_core = self._lightning_find_nearby_unguarded_core(turn, ranger)
+                if unguarded_core is not None:
+                    # 判定是否应交战
+                    should_engage = self._lightning_should_breakthrough_engage(
+                        turn, ranger, unguarded_core
+                    )
+                    if should_engage:
+                        # 可以打 → 朝目标移动或射击
+                        target_pos = unguarded_core.position
+                        shots = [
+                            (enemy, cell)
+                            for enemy, cell in self._ranger_shot_candidates(
+                                turn, ranger, planner
+                            )
+                            if isinstance(enemy, CoreView)
+                            and enemy.id == unguarded_core.id
+                        ]
+                        if shots:
+                            enemy, cell = min(shots, key=lambda pair: pair[1])
+                            ranger.shoot(enemy, expected_cell=cell)
+                            self._mark_ranger_shot(enemy, cell)
+                            decisions.append(
+                                f"breakthrough:{_short_id(ranger.id)} shoot_unguarded_core"
+                            )
+                            self.memory.decision_totals["breakthrough:shoot"] += 1
+                        else:
+                            # 朝目标移动
+                            if not self._lightning_step_toward(
+                                turn, planner, ranger, target_pos, "breakthrough_approach"
+                            ):
+                                ranger.wait()
+                            decisions.append(
+                                f"breakthrough:{_short_id(ranger.id)} approach_unguarded"
+                            )
+                            self.memory.decision_totals["breakthrough:approach"] += 1
+                        acted_units.add(ranger.id)
+                        continue
+
+                # 无可打目标 → 继续开路轨道巡逻
+                scout = self._lightning_breakthrough_target(turn, ranger, index)
+                if scout and not self._lightning_step_toward(
+                    turn, planner, ranger, scout, "breakthrough_patrol"
+                ):
+                    ranger.wait()
+                decisions.append(
+                    f"breakthrough:{_short_id(ranger.id)} patrol"
+                )
+                self.memory.decision_totals["breakthrough:patrol"] += 1
                 acted_units.add(ranger.id)
                 continue
-            # 无猎杀/不进猎杀 → 按职责绕圈：前 4 进开路轨道(绕原点大环),第 5 起进
-            # 中行星轨道(绕 Core 中层)。开路游侠不等 Core、自己转自己的,提前点亮覆盖
-            # Core 轨道的资源。走 Core 风格四邻打分(不走 A*,防乱石堆横跳)。
-            if index < LIGHTNING_BREAKTHROUGH_SLOT_COUNT:
-                scout = self._lightning_breakthrough_target(turn, ranger, index)
-                reason = "lightning_breakthrough"
+
+            # 中轨游侠（第5+个）
             else:
-                mid_lane = index - LIGHTNING_BREAKTHROUGH_SLOT_COUNT
+                # FAR威胁 → 就近游侠狙击驱离（不贴脸，最远追到外轨道边界）
+                if tier == "FAR":
+                    nearest_threat = self._lightning_find_nearest_threat(turn)
+                    if nearest_threat:
+                        # 检查该游侠是否靠近威胁（视野范围内）
+                        dist_to_threat = _distance(ranger.position, nearest_threat.position)
+                        ranger_vision = 5  # 游侠视野半径
+
+                        if dist_to_threat <= ranger_vision * 2:  # 视野范围内才参与狙击
+                            # 保持射程（2-3）狙击
+                            kite_pos = self._lightning_kiting_position(
+                                turn, ranger, nearest_threat
+                            )
+                            if not self._lightning_step_toward(
+                                turn, planner, ranger, kite_pos, "mid_orbit_snipe_FAR"
+                            ):
+                                ranger.wait()
+                            decisions.append(
+                                f"ranger:{_short_id(ranger.id)} mid_orbit_snipe_FAR "
+                                f"threat_dist={dist_to_threat}"
+                            )
+                            self.memory.decision_totals["mid_orbit:snipe_FAR"] += 1
+                            acted_units.add(ranger.id)
+                            continue
+
+                # 无威胁或不在狙击范围 → 正常中轨巡逻
+                if index < LIGHTNING_BREAKTHROUGH_SLOT_COUNT:
+                    mid_lane = index  # 原本应开路但因距离禁用
+                else:
+                    mid_lane = index - LIGHTNING_BREAKTHROUGH_SLOT_COUNT
+
                 scout = self._lightning_orbit_waypoint(
                     turn, ranger, UnitType.RANGER, lane=mid_lane
                 )
-                reason = "lightning_ranger_mid_orbit"
-            if scout is not None and not self._lightning_step_toward(
-                turn, planner, ranger, scout, reason
-            ):
-                ranger.wait()
-            acted_units.add(ranger.id)
+                if scout and not self._lightning_step_toward(
+                    turn, planner, ranger, scout, "mid_orbit_patrol"
+                ):
+                    ranger.wait()
+                decisions.append(
+                    f"ranger:{_short_id(ranger.id)} mid_orbit_patrol lane={mid_lane}"
+                )
+                self.memory.decision_totals["mid_orbit:patrol"] += 1
+                acted_units.add(ranger.id)
+
 
     def _core_patrol_slots(
         self,
