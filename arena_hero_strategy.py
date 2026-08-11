@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import heapq
 import json
+import logging
 import math
 import os
 import time
@@ -65,13 +66,12 @@ LIGHTNING_CROWD_THRESHOLD = 2
 LIGHTNING_CROWD_SIGHTING_MAX_AGE = 40
 # 猎手扇区探索的步长（限制不出方环）。
 LIGHTNING_SECTOR_STEP = 6
-# 闪电模式常驻兵力上限。绕银河轨道体系要更多角色铺子轨道,提到 20。
-# 注意:20+ 触发官方涨价档(+30%/5人口),后期长期造游侠会多吃涨价——这是
-# "非必要不进攻、发育为主、要更多角色扩轨道"路线接受的取舍。
-LIGHTNING_MAX_POPULATION = 20
-# 绝对人口上限：资源容量管理允许额外工人（20-100 区间纯工人，用于消耗资源+扩容量）。
-# 战斗配置保持 20 人不变，额外工人不影响游侠/先锋比例。
-ABSOLUTE_MAX_POPULATION = 100
+# 闪电模式常驻兵力软顶(经济软天花板)。100~110 是软天花板:游侠单价随 pop 涨价
+# (k=max(0,floor((pop-20)/5)+1, 单价=round(base×1.3^k)),pop100 时游侠≈1038、容量 500,
+# 造一个要攒 2+ tick,极慢但不停产。3:1 产能(游侠:工人)在此区间继续运作。
+LIGHTNING_MAX_POPULATION = 100
+# 绝对人口硬上限(兜底):比软顶多 5,防意外溢出。到此后不再产兵。
+ABSOLUTE_MAX_POPULATION = 105
 # 游侠同心周界 lane 间距：相邻游侠的方环半径错开 6 格（游侠视野 5，6>直径 10/2
 # 不重叠），径向铺开多条同心周界，N 游侠沿各自周界同向绕圈共同覆盖 Core 轨道。
 LIGHTNING_SCOUT_LANE_GAP = 6
@@ -91,26 +91,19 @@ LIGHTNING_HUNT_MAX_DISTANCE = 900
 LIGHTNING_SIGHTING_MAX_AGE = 300
 
 # === 绕银河多层轨道体系 ===
-# Core 轨道（恒星绕银心）绕原点 (0,0) 转 pr≈650 方环，慢；其余四类轨道围绕它：
-#   开路轨道（恒星维度，绕原点外更大同心方环）、近/中/远行星轨道（绕 Core 转圈）。
-# 开路轨道半径比 Core 轨道 pr 更外的同心跳数；起步用一个游侠视野直径量级，
-# 待运行后视覆盖深度再调。
+# Core 轨道（恒星绕银心）绕原点 (0,0) 转 pr≈650 方环，慢；游侠与工人共享中行星轨道
+#   （绕 Core 转圈），不再有开路/远行星轨道。
 # 行星轨道层序(内→外):先锋(近行星,半径 LIGHTNING_NEAR_ORBIT_RADIUS=5，
-#   贴 Core 视野边缘) → 游侠(中行星) → 工人(远行星,仅闲时上轨)。见
-#   _lightning_orbit_lane_radius。游侠中轨护 Core 中层、工人远轨点亮外围迷雾。
-LIGHTNING_BREAKTHROUGH_RING_OFFSET = 12
-# 固定 4 个开路游侠，最先排满；产出第 5 个游侠起进中行星轨道（绕 Core 中层）。
-LIGHTNING_BREAKTHROUGH_SLOT_COUNT = 4
-# 开路轨道安全阈值：Core 距原点超过此值时禁用 breakthrough（防止游侠孤军深入被击杀）。
-# 当 Core 远离原点时，开路的"提前点亮原点资源"意义不大，所有游侠改围 Core 护卫。
-LIGHTNING_BREAKTHROUGH_MAX_CORE_DISTANCE = 400
+#   贴 Core 视野边缘) → 游侠+工人(中行星，单一有序队列，游侠占内层、工人接外层)。见
+#   _lightning_assign_shared_middle_lanes。游侠护 Core 中层、工人外层点亮外围迷雾。
 # 局部威胁感知半径：游侠/先锋执行轨道巡逻时，检测周围此半径内的敌方战斗单位。
 # 发现威胁时执行局部避战（暂停巡逻，撤向 Core 或绕开），防止孤军深入被围杀。
 LIGHTNING_LOCAL_THREAT_RADIUS = 8
-# 固定产兵阶梯（用户指定，严格按 pop 槽位填，攒钱优先不 fallthrough）：
-#   pop0→先锋, 1→工人, 2→游侠, 3→工人, 4→游侠, 5→工人, 6→游侠, 7→工人,
-#   8+→游侠(直到 LIGHTNING_MAX_POPULATION)。只造 1 先锋(先锋弱,工人当肉盾)。
-# 容量 max(10,pop*5) 自然走通：pop0 cap10≥先锋10; pop1 cap10≥工人5; pop2 cap15≥游侠12。
+# 固定产兵阶梯（pop 1-8 严格按 pop 槽位填，攒钱优先不 fallthrough）：
+#   pop1→先锋, 2→工人, 3→游侠, 4→工人, 5→游侠, 6→工人, 7→游侠, 8→工人。
+#   pop≥9 不再固定,改由 _select_spawn 的 3:1(游侠:工人)+阵亡补同种逻辑决定。
+#   只造 1 先锋(先锋弱,工人当肉盾)。
+# 容量 max(10,pop*5) 自然走通：pop1 cap10≥先锋10; pop2 cap10≥工人5; pop3 cap15≥游侠12。
 LIGHTNING_BUILD_ORDER: tuple[UnitType, ...] = (
     UnitType.VANGUARD,  # slot 0
     UnitType.WORKER,    # slot 1
@@ -128,6 +121,16 @@ LIGHTNING_ORBIT_LANE_GAP_RADIUS: dict[UnitType, int] = {
     UnitType.WORKER: 3,
     UnitType.RANGER: 5,
 }
+# 基于周长分配的理想单位间距（格）：在视野覆盖和响应速度间平衡。
+# 间距过小（<视野直径）→ 视野重叠浪费；间距过大（>视野*2）→ 盲区大、单位稀疏。
+# 设定原则：间距 ≈ 视野直径 * 1.5~2.0（适度盲区换取更大防御圈）。
+LIGHTNING_IDEAL_INTERVAL: dict[UnitType, int] = {
+    UnitType.VANGUARD: 8,   # 视野4, 间距8 (2倍，近战需密集)
+    UnitType.RANGER: 10,    # 视野5, 间距10 (2倍，平衡覆盖与数量)
+    UnitType.WORKER: 6,     # 视野3, 间距6 (2倍，工人主要经济不需全覆盖)
+}
+# 每层轨道最少单位数（铺开领土阶段）：从2提到3，减少外层稀疏盲区。
+LIGHTNING_MIN_UNITS_PER_ORBIT = 3
 # 行星轨道叠格死区（到角多久推下一角）沿用 CORE_BEACON_HYSTERESIS=8。
 # === 鬼打墙逃生（战斗单位/工人轨道巡逻共用）===
 # 卡住检测：最近 ESCAPE_DETECT_WINDOW 个位置的活动范围（max-norm 直径）≤
@@ -438,13 +441,24 @@ class TacticMemory:
     # 先锋 V 字纵深状态机：UUID → {phase: "OUT"/"IN", leg: 0/1, origin: (x,y), target: (x,y)}。
     lightning_vee_state: dict[str, dict] = field(default_factory=dict)
     # 绕 Core 转的行星轨道（近/中/远）每单位周界角序号(0..3)，到角死区后推进。
-    # 与绕原点的 scout/breakthrough 区分：圆心是 core.position 而非 (0,0)。
+    # 与绕原点的 scout 区分：圆心是 core.position 而非 (0,0)。
     lightning_orbit_phase: dict[str, int] = field(default_factory=dict)
-    # 开路轨道（绕原点外大环）游侠的周界角序号(0..3)。前 4 个游侠填此槽。
-    # 复用 lightning_scout_phase 的相位机制，但半径档更大（开路环）。
+    # 已废弃(开路轨道删除后运行时无人读写):仅保留 save/load 以兼容旧 memory 文件。
     lightning_breakthrough_phase: dict[str, int] = field(default_factory=dict)
-    # 行星轨道 lane 分配缓存：role(str) → UUID → lane index，随死亡剪枝重排。
-    lightning_orbit_lanes: dict[str, dict[str, int]] = field(default_factory=dict)
+    # 行星轨道 lane 分配缓存：role(str) → UUID → (radius, group_idx)。
+    # RANGER/WORKER 的 lanes 由 _lightning_assign_shared_middle_lanes 从统一队列派生
+    # (游侠占内层、工人接外层,共享同一组同心半径);VANGUARD 独立(近行星)。
+    lightning_orbit_lanes: dict[str, dict[str, tuple[int, int]]] = field(default_factory=dict)
+    # 游侠+工人共享中轨的全局有序队列:uid → 序号(0 起,内→外)。游侠段 [0,rk),
+    # 工人段 [rk,total)。新游侠出生→游侠段扩 1→挤出最靠内的工人→该工人落到队尾。
+    # 总数(rk+wk)不变时不重算,保证位置稳定不抖动。
+    lightning_shared_orbit_seq: dict[str, int] = field(default_factory=dict)
+    # 上一 tick 存活单位 {uid: unit_type 名},用于"阵亡补同种"判定:对比当前存活,
+    # 差集即本 tick 阵亡的单位及其兵种,据此决定 pop≥9 时补造哪一类兵。
+    lightning_last_alive_uids: dict[str, str] = field(default_factory=dict)
+    # 本 tick 阵亡单位 {uid: unit_type 名},由 observe 每 tick 重算(运行时,
+    # 不序列化)。_select_spawn 只读它,保证被多次调用(预检 + 真正决策)时结果一致。
+    lightning_recent_deaths: dict[str, str] = field(default_factory=dict, repr=False)
     # 鬼打墙逃生：UUID → 连续"小范围震荡"检测计数（达阈值触发逃生）。
     lightning_unit_stuck_counters: dict[str, int] = field(default_factory=dict)
     # 鬼打墙逃生：UUID → 逃生模式截止 tick。逃生期间忽略巡逻目标，
@@ -452,6 +466,8 @@ class TacticMemory:
     lightning_unit_escape_until: dict[str, int] = field(default_factory=dict)
     attacked_units: dict[str, int] = field(default_factory=dict)
     replacement_queue: Counter[str] = field(default_factory=Counter)
+    # 进攻模式医疗轮转：patient_id → healer rotation index
+    aggress_heal_rotations: dict[str, int] = field(default_factory=dict)
     control_mtime: int = 0
     total_resources_harvested: int = 0
     total_resources_deposited: int = 0
@@ -770,11 +786,21 @@ class TacticMemory:
             raw_orbit_lanes = data.get("lightning_orbit_lanes", {})
             memory.lightning_orbit_lanes = {
                 str(role): {
-                    str(uid): int(lane)
-                    for uid, lane in lanes.items()
+                    str(uid): tuple(int(v) for v in value)
+                    if isinstance(value, (list, tuple))
+                    else (int(value), 0)
+                    for uid, value in lanes.items()
                 }
                 for role, lanes in raw_orbit_lanes.items()
                 if isinstance(lanes, dict)
+            }
+            memory.lightning_shared_orbit_seq = {
+                str(uid): int(seq)
+                for uid, seq in data.get("lightning_shared_orbit_seq", {}).items()
+            }
+            memory.lightning_last_alive_uids = {
+                str(uid): str(t)
+                for uid, t in data.get("lightning_last_alive_uids", {}).items()
             }
             memory.lightning_unit_stuck_counters = {
                 str(unit_id): int(count)
@@ -960,6 +986,12 @@ class TacticMemory:
                 role: dict(sorted(lanes.items()))
                 for role, lanes in sorted(self.lightning_orbit_lanes.items())
             },
+            "lightning_shared_orbit_seq": dict(
+                sorted(self.lightning_shared_orbit_seq.items())
+            ),
+            "lightning_last_alive_uids": dict(
+                sorted(self.lightning_last_alive_uids.items())
+            ),
             "lightning_unit_stuck_counters": dict(
                 sorted(self.lightning_unit_stuck_counters.items())
             ),
@@ -1070,6 +1102,17 @@ class TacticMemory:
         live_unit_ids = {str(unit.id) for unit in turn.units}
         lost_unit_ids = previous_unit_ids - live_unit_ids
         self.units_lost += len(lost_unit_ids)
+        # 阵亡补同种:本 tick 阵亡的单位及其兵种(用清理前的 unit_labels 查 type)。
+        # _select_spawn 读 lightning_recent_deaths 决定 pop≥9 补哪类兵;同时把
+        # 当前存活编制快照到 lightning_last_alive_uids 供下 tick 算差集。
+        self.lightning_recent_deaths = {
+            uid: previous_labels[uid].object_type
+            for uid in lost_unit_ids
+            if uid in previous_labels
+        }
+        self.lightning_last_alive_uids = {
+            str(unit.id): unit.unit_type.name for unit in turn.units
+        }
         self.replacement_queue.clear()
         self.unit_labels = {
             unit_id: label
@@ -3902,9 +3945,9 @@ class SmartTactic:
             return incoming_deposit
 
         if True:
-            # 工人远行星轨道：发现资源 → 现有经济逻辑(上方已处理采集/回仓)；
-            # 空闲(无货、无资源目标) → 上远行星轨道绕 Core 外圈转圈巡逻(工人距
-            # Core 最外层,游侠中轨内圈),点亮外围迷雾防敌方钻空子。分层见 _lightning_orbit_lane_radius。
+            # 工人中行星轨道(与游侠共享):发现资源 → 现有经济逻辑(上方已处理采集/回仓);
+            # 空闲(无货、无资源目标) → 上中轨绕 Core 转圈巡逻。游侠占内层、工人接外层,
+            # 共用 _lightning_assign_shared_middle_lanes 的统一有序队列,点亮外围迷雾。
             # NEAR 勤王 → 工人回 Core 卡位肉盾(游侠躲工人后面狙击)。
             tier = self._lightning_defense_tier(turn)
             if tier == "NEAR":
@@ -6417,56 +6460,6 @@ class SmartTactic:
                 return True
         return False
 
-    def _lightning_breakthrough_threat_check(
-        self,
-        turn: Turn,
-        ranger: Unit,
-    ) -> tuple[str, Position | None]:
-        """开路游侠威胁检测：返回 (action, target)。
-
-        用户战术要求（开路轨道职责）：
-        - 只有 1v1 先锋时游击（利用射程优势）
-        - 见游侠/多敌立即绕路（逃向 Core）
-
-        action:
-            "flee"   - 发现敌方游侠或多敌，逃向 Core
-            "kite"   - 发现单个敌方先锋，保持 2-3 格游击
-            "patrol" - 无威胁，继续巡逻
-
-        target: 逃跑/游击目标位置，None 表示继续巡逻
-        """
-        nearby_enemies = []
-        for enemy in turn.visible_enemies:
-            if not isinstance(enemy, UnitView):
-                continue
-            if enemy.unit_type not in {UnitType.VANGUARD, UnitType.RANGER}:
-                continue
-            dist = _distance(ranger.position, enemy.position)
-            if dist <= LIGHTNING_LOCAL_THREAT_RADIUS:
-                nearby_enemies.append((enemy, dist))
-
-        if not nearby_enemies:
-            return ("patrol", None)
-
-        # 发现敌方游侠 → 立即逃跑（我方 2HP 易亏，射程对等无优势）
-        if any(e.unit_type is UnitType.RANGER for e, _ in nearby_enemies):
-            return ("flee", turn.core.position if turn.core else None)
-
-        # 多个敌人 → 逃跑（敌众我寡）
-        if len(nearby_enemies) > 1:
-            return ("flee", turn.core.position if turn.core else None)
-
-        # 单个先锋 → 游击（射程 1-3 优势，先锋近战需贴脸）
-        enemy, dist = nearby_enemies[0]
-        if enemy.unit_type is UnitType.VANGUARD:
-            kite_pos = self._lightning_kiting_position(turn, ranger, enemy)
-            if kite_pos != ranger.position:
-                return ("kite", kite_pos)
-            # 距离已合适（2-3），原地不动让主逻辑处理射击
-            return ("patrol", None)
-
-        return ("patrol", None)
-
     def _lightning_engage_assessment(
         self,
         turn: Turn,
@@ -6503,98 +6496,6 @@ class SmartTactic:
         if has_vanguard:
             return "PRESS"
         return "CHICKEN"
-
-    def _lightning_find_nearby_unguarded_core(
-        self,
-        turn: Turn,
-        ranger: Unit,
-    ) -> CoreView | None:
-        """开路游侠巡逻途中搜索附近无守卫/弱守卫的敌方 Core（选择性交战用）。
-
-        仅搜索可见的 CoreView（不使用 enemy_sightings 历史记录），确保信息新鲜。
-        返回距离游侠最近的、满足"无守卫或仅1先锋"的敌方 Core。
-        """
-        candidates = []
-        for enemy in turn.visible_enemies:
-            if not isinstance(enemy, CoreView):
-                continue
-            # 跳过已拉黑的 Core
-            if str(enemy.id) in self.memory.lightning_blacklist:
-                continue
-            # 检测守卫情况
-            if self._lightning_target_attended(turn, enemy.position):
-                continue
-            if self._lightning_target_crowded(enemy.position):
-                continue
-            # 统计守卫兵种
-            guard_vanguards = 0
-            guard_rangers = 0
-            for other_enemy in turn.visible_enemies:
-                if not isinstance(other_enemy, UnitView):
-                    continue
-                dist = _distance(other_enemy.position, enemy.position)
-                if dist > LIGHTNING_HUNT_GUARD_RADIUS:
-                    continue
-                if other_enemy.unit_type is UnitType.VANGUARD:
-                    guard_vanguards += 1
-                elif other_enemy.unit_type is UnitType.RANGER:
-                    guard_rangers += 1
-            # 有游侠守卫 → 跳过（绕路）
-            if guard_rangers > 0:
-                continue
-            # 无守卫 or 仅先锋守卫 → 候选
-            dist_to_ranger = _distance(ranger.position, enemy.position)
-            candidates.append((dist_to_ranger, enemy))
-
-        if not candidates:
-            return None
-        candidates.sort(key=lambda x: x[0])
-        return candidates[0][1]
-
-    def _lightning_should_breakthrough_engage(
-        self,
-        turn: Turn,
-        ranger: Unit,
-        target_core: CoreView,
-    ) -> bool:
-        """判定开路游侠是否应对该 Core 交战（选择性交战规则）。
-
-        交战条件：
-        1. 无守卫 → 打
-        2. 仅1先锋守卫 → 游击（利用射程优势）
-        3. 有游侠守卫 OR 敌方战斗单位数量 > 我方开路游侠数量 → 绕路
-
-        返回 True 表示应交战，False 表示绕路继续巡逻。
-        """
-        # 统计目标周围的敌方战斗单位
-        enemy_combat_units = []
-        for enemy in turn.visible_enemies:
-            if not isinstance(enemy, UnitView):
-                continue
-            if enemy.unit_type not in {UnitType.VANGUARD, UnitType.RANGER}:
-                continue
-            dist = _distance(enemy.position, target_core.position)
-            if dist <= LIGHTNING_HUNT_GUARD_RADIUS:
-                enemy_combat_units.append(enemy)
-
-        # 有游侠守卫 → 绕路（不打）
-        for enemy_unit in enemy_combat_units:
-            if enemy_unit.unit_type is UnitType.RANGER:
-                return False
-
-        # 统计我方开路游侠数量
-        my_breakthrough_rangers = 0
-        ordered_rangers = sorted(turn.rangers, key=_uuid_key)
-        for index, r in enumerate(ordered_rangers):
-            if index < LIGHTNING_BREAKTHROUGH_SLOT_COUNT:
-                my_breakthrough_rangers += 1
-
-        # 敌方战斗单位数量 > 我方开路游侠数量 → 绕路（敌众我寡）
-        if len(enemy_combat_units) > my_breakthrough_rangers:
-            return False
-
-        # 否则：无守卫 or 仅先锋守卫 → 可以打
-        return True
 
     def _lightning_find_nearest_threat(
         self,
@@ -6847,139 +6748,163 @@ class SmartTactic:
             return None
         return target
 
-    def _lightning_breakthrough_target(
-        self,
-        turn: Turn,
-        ranger: Unit,
-        lane_idx: int,
-    ) -> Position | None:
-        """开路轨道(恒星维度,绕原点外大同心方环)下一目标点。
-
-        与 _lightning_ranger_scout_target 共享"绕原点四角顺时针 + phase 独立推进"
-        机制,但半径档更大——在 Core 轨道 pr 之外 LIGHTNING_BREAKTHROUGH_RING_OFFSET
-        再外括,且 4 个开路游侠按 lane_idx 错开同心环(每档一个游侠视野半径)。
-        越外越钳到 outer_r(绝不深入 <inner 的火力密集区)。
-
-        开路游侠自己转自己的、不等 Core(游侠 1格/tick,Core 1格/4tick):开路可能
-        已绕原点好几圈,Core 才转一圈。在恒星轨道维度提前点亮覆盖 Core 轨道的资源、
-        摧毁低守卫敌方 Core。仅勤王(NEAR/MID 回防)时回援,否则持续绕圈开路。
-        """
-        core = turn.core
-        if core is None:
-            return None
-        uid = str(ranger.id)
-        pr = self._lightning_patrol_radius()
-        gap_r = LIGHTNING_ORBIT_LANE_GAP_RADIUS[UnitType.RANGER]
-        radius = pr + LIGHTNING_BREAKTHROUGH_RING_OFFSET + lane_idx * gap_r
-        inner_r, outer_r = self.memory.lightning_ring
-        radius = max(inner_r + 2, min(outer_r, radius))  # 不深入内圈
-        corners = (
-            (radius, radius),
-            (radius, -radius),
-            (-radius, -radius),
-            (-radius, radius),
-        )
-        phase = self.memory.lightning_breakthrough_phase.get(uid, 0) % 4
-        if uid not in self.memory.lightning_breakthrough_phase:
-            phase = self.memory.lightning_patrol_phase % 4
-            self.memory.lightning_breakthrough_phase[uid] = phase
-        target = corners[phase]
-        # 动态跳角:目标角尚远却已知埋在乱石堆里 → 提前推下一角绕行。
-        if (
-            _distance(ranger.position, target) > CORE_BEACON_HYSTERESIS * 2
-            and self._lightning_corner_obstructed(target)
-        ):
-            phase = (phase + 1) % 4
-            self.memory.lightning_breakthrough_phase[uid] = phase
-            target = corners[phase]
-        if _distance(ranger.position, target) <= CORE_BEACON_HYSTERESIS:
-            phase = (phase + 1) % 4
-            self.memory.lightning_breakthrough_phase[uid] = phase
-            target = corners[phase]
-        # 新增：目标区域访问饱和时强制跳角（提前放弃不可达目标）
-        elif (
-            _distance(ranger.position, target) < CORE_BEACON_HYSTERESIS * 2
-            and self.memory.visited.get(target, 0) > 10
-            and self._lightning_corner_obstructed(target)
-        ):
-            phase = (phase + 1) % 4
-            self.memory.lightning_breakthrough_phase[uid] = phase
-            target = corners[phase]
-        target = self._lightning_clamp_to_donut(target)
-        if target == ranger.position:
-            return None
-        return target
-
     def _lightning_calculate_outer_first_orbits(
         self,
         unit_count: int,
         vision_radius: int,
         gap: int,
         inner_radius: int,
-        min_units_per_orbit: int = 2,
+        min_units_per_orbit: int = 3,
+        ideal_interval: int = 10,
     ) -> list[tuple[int, int]]:
-        """混合策略：先铺开领土（每轨道最少单位），再按周长比例加密。
+        """电子排布风格的轨道分配：层容量=2n，循环队列填充。
 
         返回 [(radius, unit_count), ...] 列表。
 
         策略：
-        1. Phase 1: 每条轨道先分配 min_units_per_orbit，尽量铺开
-        2. Phase 2: 剩余单位按周长比例分配（外层轨道周长大，分配更多）
-        3. 单轨道上限8个单位（四角+四边中点）
+        1. 层容量：第n层容量 = 2*n（层1→2个，层2→4个，层3→6个...）
+        2. 填充顺序：循环队列，轮流填充活跃层，层满时移除
+        3. 示例（10个单位）：
+           - 活跃层[1,2,3]：单位1→层1, 2→层2, 3→层3, 4→层1(满)
+           - 活跃层[2,3]：单位5→层2, 6→层3, 7→层2, 8→层3, 9→层2(满)
+           - 活跃层[3]：单位10→层3
+           - 结果：层1=2个，层2=4个，层3=4个
+        4. 半径映射：层n → radius = inner_radius + (n-1)*gap
         """
         if unit_count == 0:
             return []
 
-        # 最多能铺几条轨道
-        max_orbits = unit_count // min_units_per_orbit
+        # 计算需要的最大层数（求和公式：1+2+...+n = n(n+1))
+        max_layers = 1
+        while max_layers * (max_layers + 1) < unit_count:
+            max_layers += 1
+        max_layers = min(max_layers + 1, 20)  # 最多20层
 
-        # 合理外边界：游侠≤80，工人≤60
-        max_radius_by_gap = {5: 80, 3: 60}
-        reasonable_limit = max_radius_by_gap.get(gap, 100)
-        max_radius = min(inner_radius + gap * max_orbits, reasonable_limit)
+        # 生成层容量列表
+        layers = []
+        for n in range(1, max_layers + 1):
+            radius = inner_radius + (n - 1) * gap
+            capacity = 2 * n
+            layers.append({'layer': n, 'radius': radius, 'capacity': capacity, 'count': 0})
 
-        result = []
+        # 循环队列填充
+        active_layers = list(range(min(3, len(layers))))  # 初始活跃层：前3层
         remaining = unit_count
-        radius = inner_radius
+        unit_idx = 0
 
-        # Phase 1: 每条轨道先分配最少单位，铺开领土
-        while remaining >= min_units_per_orbit and radius <= max_radius:
-            result.append([radius, min_units_per_orbit])
-            remaining -= min_units_per_orbit
-            radius += gap
-
-        if remaining == 0:
-            return [(r, c) for r, c in result]
-
-        # Phase 2: 剩余单位按周长比例分配
-        # 计算各轨道周长
-        circumferences = [8 * r for r, c in result]
-        total_circumference = sum(circumferences)
-
-        if total_circumference > 0:
-            # 按周长比例分配剩余单位
-            for i, circ in enumerate(circumferences):
+        while remaining > 0 and active_layers:
+            # 轮流填充活跃层
+            for i in list(active_layers):
                 if remaining <= 0:
                     break
-                r, count = result[i]
-                # 该轨道应分配的额外单位数 = 剩余单位 × (该轨道周长 / 总周长)
-                # 四舍五入，至少1个（如果总剩余>0）
-                extra = max(1, round(remaining * circ / total_circumference))
-                # 不超过单轨道上限
-                max_extra = min(extra, 8 - count, remaining)
-                result[i][1] = count + max_extra
-                remaining -= max_extra
-
-        # Phase 3: 如果Phase 2舍入导致还有剩余，从外向内依次加1
-        orbit_idx = len(result) - 1
-        while remaining > 0 and orbit_idx >= 0:
-            r, count = result[orbit_idx]
-            if count < 8:
-                result[orbit_idx][1] = count + 1
+                layer = layers[i]
+                layer['count'] += 1
                 remaining -= 1
-            orbit_idx -= 1
+                unit_idx += 1
 
-        return [(r, c) for r, c in result]
+                # 层满时移除
+                if layer['count'] >= layer['capacity']:
+                    active_layers.remove(i)
+                    # 如果需要新层且还有未开放的层
+                    next_layer_idx = max(active_layers) + 1 if active_layers else len([l for l in layers if l['count'] > 0])
+                    if next_layer_idx < len(layers) and remaining > 0:
+                        active_layers.append(next_layer_idx)
+
+        # 转换为 [(radius, count), ...] 格式
+        distribution = [(l['radius'], l['count']) for l in layers if l['count'] > 0]
+        return distribution
+
+    def _lightning_assign_shared_middle_lanes(
+        self,
+        turn: Turn,
+    ) -> dict[str, tuple[int, int]]:
+        """游侠+工人共用中行星轨道的单一有序队列分配。
+
+        游侠优先按电子排布填内层(序号 0..rk-1),第一个工人排在最后一个游侠后面用
+        同一公式接排(序号 rk..total-1)。新游侠出生→游侠段扩 1→挤出最靠内的工人
+        →该工人落到队尾(total-1)。总数不变时不重算,保证位置稳定不抖动。
+
+        返回合并后的 lanes {uid:(radius,group_idx)}(游侠+工人同层,用于 phase_offset
+        的 units_at_radius 计算)。结果同时写入 memory.lightning_orbit_lanes[RANGER/WORKER]
+        和 memory.lightning_shared_orbit_seq。
+        """
+        rangers = sorted(turn.rangers, key=_uuid_key)
+        workers = sorted(turn.workers, key=_uuid_key)
+        rk = len(rangers)
+        wk = len(workers)
+        total = rk + wk
+
+        ranger_uids = {str(r.id) for r in rangers}
+        worker_uids = {str(w.id) for w in workers}
+        live_uids = ranger_uids | worker_uids
+
+        seq = self.memory.lightning_shared_orbit_seq
+        # 判断是否需要重算:对比 seq 里仍存活的游侠/工人数 vs 当前。
+        # 总数不变且 seq 覆盖全部存活单位 → 复用,不抖动。
+        cached_rk = sum(1 for uid in seq if uid in ranger_uids)
+        cached_wk = sum(1 for uid in seq if uid in worker_uids)
+        seq_covers_live = live_uids.issubset(seq.keys()) and not (
+            seq.keys() - live_uids
+        )
+        stable = (cached_rk == rk and cached_wk == wk and seq_covers_live)
+
+        if stable:
+            # 复用 cached lanes,只补合并视图。
+            merged: dict[str, tuple[int, int]] = {}
+            for role_key in (UnitType.RANGER.value, UnitType.WORKER.value):
+                merged.update(self.memory.lightning_orbit_lanes.get(role_key, {}))
+            return merged
+
+        if total == 0:
+            self.memory.lightning_orbit_lanes[UnitType.RANGER.value] = {}
+            self.memory.lightning_orbit_lanes[UnitType.WORKER.value] = {}
+            self.memory.lightning_shared_orbit_seq = {}
+            return {}
+
+        # 统一电子排布:inner=10(先锋层外), gap=5(游侠视野), ideal_interval=10。
+        gap = LIGHTNING_ORBIT_LANE_GAP_RADIUS[UnitType.RANGER]
+        inner_radius = LIGHTNING_NEAR_ORBIT_RADIUS + gap
+        ideal_interval = LIGHTNING_IDEAL_INTERVAL[UnitType.RANGER]
+        vision_radius = LIGHTNING_ORBIT_LANE_GAP_RADIUS[UnitType.RANGER]
+        distribution = self._lightning_calculate_outer_first_orbits(
+            total,
+            vision_radius,
+            gap,
+            inner_radius,
+            min_units_per_orbit=LIGHTNING_MIN_UNITS_PER_ORBIT,
+            ideal_interval=ideal_interval,
+        )
+        # 展开成全局位置序列(内→外),每个位置 = (radius, group_idx)。
+        positions = [(r, g) for r, cnt in distribution for g in range(cnt)]
+
+        # 游侠占前 rk 个位置(按 uuid 序),工人接后面 wk 个。
+        new_seq: dict[str, int] = {}
+        for i, r in enumerate(rangers):
+            new_seq[str(r.id)] = i
+        base = rk
+        for j, w in enumerate(workers):
+            new_seq[str(w.id)] = base + j
+
+        ranger_lanes: dict[str, tuple[int, int]] = {}
+        worker_lanes: dict[str, tuple[int, int]] = {}
+        merged = {}
+        for uid, idx in new_seq.items():
+            pos = positions[idx] if idx < len(positions) else positions[-1]
+            merged[uid] = pos
+            if uid in ranger_uids:
+                ranger_lanes[uid] = pos
+            else:
+                worker_lanes[uid] = pos
+
+        self.memory.lightning_orbit_lanes[UnitType.RANGER.value] = ranger_lanes
+        self.memory.lightning_orbit_lanes[UnitType.WORKER.value] = worker_lanes
+        self.memory.lightning_shared_orbit_seq = new_seq
+
+        logging.info(
+            f"[orbit_assign] shared: rk={rk} wk={wk} total={total}, "
+            f"distribution={distribution}"
+        )
+        return merged
 
     def _lightning_assign_orbit_lanes(
         self,
@@ -6988,66 +6913,35 @@ class SmartTactic:
     ) -> dict[str, tuple[int, int]]:
         """给某 role 的所有存活单位分配 (radius, group_index)。
 
-        外圈优先混合策略：先铺开外层轨道（最大化领土），再按周长比例加密。
-        同一半径的单位通过 group_index 错开 phase（phase_offset = group_index * 4 // group_size）。
+        VANGUARD:独立近行星轨道(radius=LIGHTNING_NEAR_ORBIT_RADIUS),按 uuid 序在同层
+        错开 group_index。
+        RANGER/WORKER:由 _lightning_assign_shared_middle_lanes 统一分配(游侠占内层、
+        工人接外层,共享同一组同心半径),本方法返回该 role 对应的 lanes。
 
+        同一半径的单位通过 group_index 错开 phase(phase_offset = group_index * 4 // group_size)。
         返回 {uid: (radius, group_index)}。缓存到 memory.lightning_orbit_lanes[role.value]。
         """
-        role_key = role.value
         if role is UnitType.VANGUARD:
             units = list(turn.vanguards)
-        elif role is UnitType.RANGER:
-            units = list(turn.rangers)
-        else:
-            units = list(turn.workers)
+            live = {str(u.id) for u in units}
+            role_key = UnitType.VANGUARD.value
+            stored = self.memory.lightning_orbit_lanes.get(role_key, {})
+            for dead in [k for k in stored if k not in live]:
+                stored.pop(dead, None)
+                self.memory.lightning_orbit_phase.pop(dead, None)
 
-        live = {str(u.id) for u in units}
-        stored = dict(self.memory.lightning_orbit_lanes.get(role_key, {}))
+            radius = LIGHTNING_NEAR_ORBIT_RADIUS
+            sorted_units = sorted(units, key=lambda u: _uuid_key(u))
+            assignments = {
+                str(u.id): (radius, idx) for idx, u in enumerate(sorted_units)
+            }
+            self.memory.lightning_orbit_lanes[role_key] = assignments
+            return assignments
 
-        # 清理死亡单位
-        for dead in [k for k in stored if k not in live]:
-            stored.pop(dead, None)
-            self.memory.lightning_orbit_phase.pop(dead, None)
-
-        # 计算轨道分配
-        gap = LIGHTNING_ORBIT_LANE_GAP_RADIUS[role]
-        if role is UnitType.VANGUARD:
-            inner_radius = LIGHTNING_NEAR_ORBIT_RADIUS
-        elif role is UnitType.RANGER:
-            vg_count = len(turn.vanguards)
-            gap_v = LIGHTNING_ORBIT_LANE_GAP_RADIUS[UnitType.VANGUARD]
-            vg_outer = LIGHTNING_NEAR_ORBIT_RADIUS + max(0, vg_count - 1) * gap_v
-            inner_radius = vg_outer + gap
-        else:  # WORKER
-            vg_count = len(turn.vanguards)
-            rk_count = len(turn.rangers)
-            gap_v = LIGHTNING_ORBIT_LANE_GAP_RADIUS[UnitType.VANGUARD]
-            gap_r = LIGHTNING_ORBIT_LANE_GAP_RADIUS[UnitType.RANGER]
-            vg_outer = LIGHTNING_NEAR_ORBIT_RADIUS + max(0, vg_count - 1) * gap_v
-            rk_inner = vg_outer + gap_r
-            rk_outer = rk_inner + max(0, rk_count - 1) * gap_r
-            inner_radius = rk_outer + 3
-
-        vision_radius = LIGHTNING_ORBIT_LANE_GAP_RADIUS[role]
-        orbit_distribution = self._lightning_calculate_outer_first_orbits(
-            len(units), vision_radius, gap, inner_radius, min_units_per_orbit=2
-        )
-
-        # 按UUID序分配单位到各半径
-        sorted_units = sorted(units, key=_uuid_key)
-        assignments = {}
-        unit_idx = 0
-
-        for radius, count in orbit_distribution:
-            for group_idx in range(count):
-                if unit_idx >= len(sorted_units):
-                    break
-                uid = str(sorted_units[unit_idx].id)
-                assignments[uid] = (radius, group_idx)
-                unit_idx += 1
-
-        self.memory.lightning_orbit_lanes[role_key] = assignments
-        return assignments
+        # RANGER/WORKER 共用中轨:统一分配后取该 role 的 lanes。
+        self._lightning_assign_shared_middle_lanes(turn)
+        role_key = role.value
+        return self.memory.lightning_orbit_lanes.get(role_key, {})
 
     def _lightning_orbit_waypoint(
         self,
@@ -7067,8 +6961,13 @@ class SmartTactic:
 
         uid = str(unit.id)
 
-        # 重新分配（顺带剪枝死亡单位）
-        lanes = self._lightning_assign_orbit_lanes(turn, role)
+        # 重新分配（顺带剪枝死亡单位）。RANGER/WORKER 共用中轨——必须用合并后的
+        # lanes(游侠+工人同层)才能正确算 units_at_radius(phase_offset 错位依据);
+        # VANGUARD 独立近行星轨道,用单 role lanes 即可。
+        if role is UnitType.VANGUARD:
+            lanes = self._lightning_assign_orbit_lanes(turn, role)
+        else:
+            lanes = self._lightning_assign_shared_middle_lanes(turn)
 
         if uid not in lanes:
             return None
@@ -10328,144 +10227,89 @@ class SmartTactic:
                     acted_units.add(ranger.id)
                 return
 
-        # Step 4: FAR威胁或无威胁 → 按职责分工
+        # Step 4: FAR威胁或无威胁 → 所有游侠走中行星轨道（取消开路/突破轨）。
         ordered_rangers = sorted(turn.rangers, key=_uuid_key)
-        core_origin_dist = _distance(turn.core.position, (0, 0))
-        breakthrough_safe = core_origin_dist <= LIGHTNING_BREAKTHROUGH_MAX_CORE_DISTANCE
 
         for index, ranger in enumerate(ordered_rangers):
             if ranger.id in acted_units:
                 continue
 
-            # 开路游侠（前4个）
-            if index < LIGHTNING_BREAKTHROUGH_SLOT_COUNT and breakthrough_safe:
-                # Phase 3: 开路游侠战术 - 威胁检测优先
-                action, target = self._lightning_breakthrough_threat_check(turn, ranger)
-
-                if action == "flee":
-                    # 见游侠/多敌 → 逃向Core（沿途绕过敌人）
-                    if target and not self._lightning_step_toward(
-                        turn, planner, ranger, target, "breakthrough_flee"
-                    ):
-                        ranger.wait()
-                    decisions.append(
-                        f"ranger:{_short_id(ranger.id)} breakthrough_flee to_core"
-                    )
-                    self.memory.decision_totals["breakthrough:flee"] += 1
-                    acted_units.add(ranger.id)
-                    continue
-
-                elif action == "kite":
-                    # 1v1先锋 → 游击（保持2-3格射程优势）
-                    if target and not self._lightning_step_toward(
-                        turn, planner, ranger, target, "breakthrough_kite"
-                    ):
-                        ranger.wait()
-                    decisions.append(
-                        f"ranger:{_short_id(ranger.id)} breakthrough_kite vs_vanguard"
-                    )
-                    self.memory.decision_totals["breakthrough:kite"] += 1
-                    acted_units.add(ranger.id)
-                    continue
-
-                # action == "patrol" → 继续巡逻（可能发现无守卫Core）
-                # 搜索附近无守卫Core（选择性交战）
-                unguarded_core = self._lightning_find_nearby_unguarded_core(turn, ranger)
-                if unguarded_core is not None:
-                    # 判定是否应交战
-                    should_engage = self._lightning_should_breakthrough_engage(
-                        turn, ranger, unguarded_core
-                    )
-                    if should_engage:
-                        # 可以打 → 朝目标移动或射击
-                        target_pos = unguarded_core.position
-                        shots = [
-                            (enemy, cell)
-                            for enemy, cell in self._ranger_shot_candidates(
-                                turn, ranger, planner
-                            )
-                            if isinstance(enemy, CoreView)
-                            and enemy.id == unguarded_core.id
-                        ]
-                        if shots:
-                            enemy, cell = min(shots, key=lambda pair: pair[1])
-                            ranger.shoot(enemy, expected_cell=cell)
-                            self._mark_ranger_shot(enemy, cell)
-                            decisions.append(
-                                f"breakthrough:{_short_id(ranger.id)} shoot_unguarded_core"
-                            )
-                            self.memory.decision_totals["breakthrough:shoot"] += 1
-                        else:
-                            # 朝目标移动
-                            if not self._lightning_step_toward(
-                                turn, planner, ranger, target_pos, "breakthrough_approach"
-                            ):
-                                ranger.wait()
-                            decisions.append(
-                                f"breakthrough:{_short_id(ranger.id)} approach_unguarded"
-                            )
-                            self.memory.decision_totals["breakthrough:approach"] += 1
-                        acted_units.add(ranger.id)
-                        continue
-
-                # 无可打目标 → 继续开路轨道巡逻
-                scout = self._lightning_breakthrough_target(turn, ranger, index)
-                if scout and not self._lightning_step_toward(
-                    turn, planner, ranger, scout, "breakthrough_patrol"
-                ):
-                    ranger.wait()
-                decisions.append(
-                    f"breakthrough:{_short_id(ranger.id)} patrol"
+            # 中轨游侠：先尝试射击（无论威胁等级）
+            shots = [
+                (enemy, cell)
+                for enemy, cell in self._ranger_shot_candidates(
+                    turn, ranger, planner
                 )
-                self.memory.decision_totals["breakthrough:patrol"] += 1
+            ]
+            if shots:
+                # 优先射击敌方战斗单位（RANGER > VANGUARD > WORKER > Core）
+                def shot_priority(pair):
+                    enemy, cell = pair
+                    if isinstance(enemy, UnitView):
+                        if enemy.unit_type == UnitType.RANGER:
+                            return (0, enemy.hp, cell)
+                        elif enemy.unit_type == UnitType.VANGUARD:
+                            return (1, enemy.hp, cell)
+                        else:  # WORKER
+                            return (2, enemy.hp, cell)
+                    else:  # CoreView
+                        return (3, enemy.hp, cell)
+
+                enemy, cell = min(shots, key=shot_priority)
+                ranger.shoot(enemy, expected_cell=cell)
+                self._mark_ranger_shot(enemy, cell)
+
+                target_type = (
+                    f"{enemy.unit_type.name.lower()}"
+                    if isinstance(enemy, UnitView)
+                    else "core"
+                )
+                decisions.append(
+                    f"ranger:{_short_id(ranger.id)} shoot_{target_type} "
+                    f"hp={enemy.hp}"
+                )
+                self.memory.decision_totals["ranger:shoot"] += 1
                 acted_units.add(ranger.id)
                 continue
 
-            # 中轨游侠（第5+个）
-            else:
-                # FAR威胁 → 就近游侠狙击驱离（不贴脸，最远追到外轨道边界）
-                if tier == "FAR":
-                    nearest_threat = self._lightning_find_nearest_threat(turn)
-                    if nearest_threat:
-                        # 检查该游侠是否靠近威胁（视野范围内）
-                        dist_to_threat = _distance(ranger.position, nearest_threat.position)
-                        ranger_vision = 5  # 游侠视野半径
+            # FAR威胁 → 就近游侠狙击驱离（不贴脸，最远追到外轨道边界）
+            if tier == "FAR":
+                nearest_threat = self._lightning_find_nearest_threat(turn)
+                if nearest_threat:
+                    # 检查该游侠是否靠近威胁（视野范围内）
+                    dist_to_threat = _distance(ranger.position, nearest_threat.position)
+                    ranger_vision = 5  # 游侠视野半径
 
-                        if dist_to_threat <= ranger_vision * 2:  # 视野范围内才参与狙击
-                            # 保持射程（2-3）狙击
-                            kite_pos = self._lightning_kiting_position(
-                                turn, ranger, nearest_threat
-                            )
-                            if not self._lightning_step_toward(
-                                turn, planner, ranger, kite_pos, "mid_orbit_snipe_FAR"
-                            ):
-                                ranger.wait()
-                            decisions.append(
-                                f"ranger:{_short_id(ranger.id)} mid_orbit_snipe_FAR "
-                                f"threat_dist={dist_to_threat}"
-                            )
-                            self.memory.decision_totals["mid_orbit:snipe_FAR"] += 1
-                            acted_units.add(ranger.id)
-                            continue
+                    if dist_to_threat <= ranger_vision * 2:  # 视野范围内才参与狙击
+                        # 保持射程（2-3）狙击
+                        kite_pos = self._lightning_kiting_position(
+                            turn, ranger, nearest_threat
+                        )
+                        if not self._lightning_step_toward(
+                            turn, planner, ranger, kite_pos, "mid_orbit_snipe_FAR"
+                        ):
+                            ranger.wait()
+                        decisions.append(
+                            f"ranger:{_short_id(ranger.id)} mid_orbit_snipe_FAR "
+                            f"threat_dist={dist_to_threat}"
+                        )
+                        self.memory.decision_totals["mid_orbit:snipe_FAR"] += 1
+                        acted_units.add(ranger.id)
+                        continue
 
-                # 无威胁或不在狙击范围 → 正常中轨巡逻
-                if index < LIGHTNING_BREAKTHROUGH_SLOT_COUNT:
-                    mid_lane = index  # 原本应开路但因距离禁用
-                else:
-                    mid_lane = index - LIGHTNING_BREAKTHROUGH_SLOT_COUNT
-
-                scout = self._lightning_orbit_waypoint(
-                    turn, ranger, UnitType.RANGER, lane=mid_lane
-                )
-                if scout and not self._lightning_step_toward(
-                    turn, planner, ranger, scout, "mid_orbit_patrol"
-                ):
-                    ranger.wait()
-                decisions.append(
-                    f"ranger:{_short_id(ranger.id)} mid_orbit_patrol lane={mid_lane}"
-                )
-                self.memory.decision_totals["mid_orbit:patrol"] += 1
-                acted_units.add(ranger.id)
+            # 无威胁或不在狙击范围 → 正常中轨巡逻
+            scout = self._lightning_orbit_waypoint(
+                turn, ranger, UnitType.RANGER, lane=index
+            )
+            if scout and not self._lightning_step_toward(
+                turn, planner, ranger, scout, "mid_orbit_patrol"
+            ):
+                ranger.wait()
+            decisions.append(
+                f"ranger:{_short_id(ranger.id)} mid_orbit_patrol lane={index}"
+            )
+            self.memory.decision_totals["mid_orbit:patrol"] += 1
+            acted_units.add(ranger.id)
 
 
     def _core_patrol_slots(
@@ -10652,18 +10496,69 @@ class SmartTactic:
 
     def _lightning_build_slot(self, current_population: int) -> UnitType | None:
         """固定产兵阶梯第 current_population 槽(0-indexed,即"再造一个就是第几个")
-        该造的兵种。前 8 槽按 LIGHTNING_BUILD_ORDER,第 9 槽起全游侠,满 20 返回 None。
+        该造的兵种。
 
-        索引 = current_population - 1：游戏起手送 1 免费工人(pop1),所以"第 1 个造的
+        - pop 1-8: 按 LIGHTNING_BUILD_ORDER 阶梯(先锋/工人/游侠交替)。
+        - pop ≥ 9: 返回 None——改由 _select_spawn 的 ratio-aware 选择器决定
+          (阵亡补同种优先,否则按 3:1 游侠:工人趋近)。
+        - 硬顶 ABSOLUTE_MAX_POPULATION:返回 None(不再造)。
+
+        索引 = current_population - 1:游戏起手送 1 免费工人(pop1),所以"第 1 个造的
         兵"是在 pop1 时造,对应槽 0。容量 max(10,pop*5) 自然走通:
         pop1 cap10≥先锋10 → pop2; pop2 cap10≥工人5 → pop3; pop3 cap15≥游侠12。
         """
-        if current_population >= LIGHTNING_MAX_POPULATION:
+        if current_population >= ABSOLUTE_MAX_POPULATION:
             return None
         slot = max(0, current_population - 1)
         if slot < len(LIGHTNING_BUILD_ORDER):
             return LIGHTNING_BUILD_ORDER[slot]
-        return UnitType.RANGER
+        # pop ≥ 9:由 _select_spawn 的 3:1/阵亡补同种逻辑决定,这里返回 None 占位。
+        return None
+
+    def _lightning_ratio_spawn(
+        self,
+        turn: Turn,
+        died: dict[str, str],
+    ) -> UnitType | None:
+        """pop ≥ 9 的选兵:阵亡补同种优先,否则按 3:1(游侠:工人)趋近。
+
+        died: 本 tick 阵亡单位 {uid: unit_type 名}。
+        先锋维持 1 个(先锋阵亡且当前 vg=0 → 补先锋);否则补最近阵亡且缺失更
+        严重的那类;无阵亡则纯增长按 3:1 趋近(rk<3*wk 补游侠,反之补工人,
+        持平时默认补游侠推到下一档 3:1)。
+        """
+        rk = len(turn.rangers)
+        wk = len(turn.workers)
+        vg = len(turn.vanguards)
+
+        died_rk = sum(1 for t in died.values() if t == UnitType.RANGER.name)
+        died_wk = sum(1 for t in died.values() if t == UnitType.WORKER.name)
+        died_vg = sum(1 for t in died.values() if t == UnitType.VANGUARD.name)
+
+        # 先锋维持 1:先锋死了且现在没有 → 补先锋。
+        if died_vg > 0 and vg == 0:
+            return UnitType.VANGUARD
+
+        if died:
+            # 补阵亡更严重的那类(死的游侠多→补游侠,死工人多→补工人;
+            # 持平时看当前比例,谁离 3:1 更远补谁)。
+            if died_rk > died_wk:
+                return UnitType.RANGER
+            if died_wk > died_rk:
+                return UnitType.WORKER
+            # 死亡数相等 → 按 3:1 偏差补(与纯增长同逻辑)。
+            err_if_ranger = abs((rk + 1) - 3 * wk)
+            err_if_worker = abs(rk - 3 * (wk + 1))
+            return UnitType.RANGER if err_if_ranger <= err_if_worker else UnitType.WORKER
+
+        # 无阵亡,纯增长:按 3:1 趋近。每步选让 |rk - 3*wk| 偏差更小的兵种;
+        # 偏差相等时补游侠(推到下一档 3:1)。从任意起点(wk=0 含工人全死光的边缘
+        # 情况)都能自然收敛到 3 游侠 : 1 工人。
+        err_if_ranger = abs((rk + 1) - 3 * wk)
+        err_if_worker = abs(rk - 3 * (wk + 1))
+        if err_if_ranger <= err_if_worker:
+            return UnitType.RANGER
+        return UnitType.WORKER
 
     def _select_spawn(
         self,
@@ -10680,19 +10575,13 @@ class SmartTactic:
         vanguard_cost = unit_cost(UnitType.VANGUARD, current_population)
         ranger_cost = unit_cost(UnitType.RANGER, current_population)
 
-        # === 资源容量紧急管理：资源达到容量 80% 时优先造工人消耗资源 ===
-        # 触发条件：未达 100 人总上限 + 资源≥容量*0.8 + 买得起工人
-        # 优先级高于固定产兵阶梯，避免资源溢出浪费。20-100 人区间纯工人，
-        # 不影响 20 人内战斗配置（游侠/先锋比例照旧）。
-        capacity = turn.resource_capacity
-        urgency_threshold = int(capacity * 0.8)
-        if (
-            current_population < ABSOLUTE_MAX_POPULATION
-            and projected_resources >= urgency_threshold
-            and projected_resources >= worker_cost
-            and current_population >= LIGHTNING_MAX_POPULATION  # 只在超过 20 人后才触发紧急工人
-        ):
-            return UnitType.WORKER
+        # 硬顶 ABSOLUTE_MAX_POPULATION:不再产兵。
+        if current_population >= ABSOLUTE_MAX_POPULATION:
+            return None
+
+        # 阵亡补同种:读 observe 里算好的本 tick 阵亡 dict(每 tick 一次,避免
+        # _select_spawn 被多次调用时重复消费/清空 last_alive)。
+        died = dict(self.memory.lightning_recent_deaths)
 
         near_threat = any(
             _distance(core.position, enemy.position) <= 5
@@ -10707,17 +10596,17 @@ class SmartTactic:
         reserve = 2 if near_threat or core.shield < shield_cap else 0
         budget = projected_resources - reserve
 
-        # 闪电模式固定产兵阶梯（用户指定，攒钱优先不 fallthrough）：
-        #   pop1→先锋, 2→工人, 3→游侠, 4→工人, 5→游侠, 6→工人,
-        #   7→游侠, 8→工人, 9+→游侠, 满 20 停。
-        # 只造 1 先锋(先锋不强,前期一个够;肉盾由工人充当,勤王时游侠躲工人
-        # 后面狙击)。pop≥9 起只造游侠。容量 max(10,pop*5) 自然走通:
-        # pop1 cap10≥先锋10; pop2 cap10≥工人5; pop3 cap15≥游侠12。
-        # 阵亡补回：current_population 回落即按该 pop 槽位补(尾段全是游侠,
-        # 撤一个补一个游侠);先锋阵亡不强制重建(符合"先锋弱、工人当肉盾")。
-        if current_population >= LIGHTNING_MAX_POPULATION:
-            return None
-        target_type = self._lightning_build_slot(current_population)
+        # 闪电模式产兵:
+        #   pop 1-8: 固定阶梯 LIGHTNING_BUILD_ORDER(撤一个补一个,自然补回同槽位)。
+        #   pop ≥ 9: 阵亡补同种优先,否则按 3:1(游侠:工人)趋近(取消 pop-20 停产,
+        #     软顶 LIGHTNING_MAX_POPULATION=100,经济随涨价自然放缓但不停产)。
+        slot = max(0, current_population - 1)
+        if slot < len(LIGHTNING_BUILD_ORDER):
+            target_type = LIGHTNING_BUILD_ORDER[slot]
+        else:
+            # pop ≥ 9:阵亡补同种优先,否则按 3:1(游侠:工人)趋近。取消 pop-20
+            # 停产;软顶 LIGHTNING_MAX_POPULATION=100 处资源涨价极慢但仍按 3:1 补兵。
+            target_type = self._lightning_ratio_spawn(turn, died)
         if target_type is None:
             return None
         cost = (
@@ -10729,7 +10618,7 @@ class SmartTactic:
         )
         if budget >= cost:
             return target_type
-        return None
+        return None  # 攒钱下个 tick
 
     def _choose_core(
         self,

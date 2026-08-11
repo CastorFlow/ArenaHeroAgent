@@ -388,10 +388,11 @@ class LightningModeTests(unittest.TestCase):
         # 重兵 Core 一旦放弃 → 永久黑名单，即使之后 sighting 老化也不再 claim。
         from arena_hero_strategy import EnemySighting
         memory = TacticMemory()
+        # 曼哈顿距离 = |600-700| + |600-300| = 400 < 900
         memory.enemy_sightings = {
-            "crowded-core": EnemySighting(position=(515, -216), seen_tick=1000, is_core=True),
-            "g-1": EnemySighting(position=(514, -214), seen_tick=1010, is_core=False),
-            "g-2": EnemySighting(position=(514, -218), seen_tick=1011, is_core=False),
+            "crowded-core": EnemySighting(position=(700, 300), seen_tick=1000, is_core=True),
+            "g-1": EnemySighting(position=(699, 302), seen_tick=1010, is_core=False),
+            "g-2": EnemySighting(position=(699, 298), seen_tick=1011, is_core=False),
         }
         memory.last_tick = 1015
         turn, _ = make_turn(
@@ -402,7 +403,7 @@ class LightningModeTests(unittest.TestCase):
         self.assertIn("crowded-core", memory.lightning_blacklist)
         # 模拟 sighting 老化后（守卫 sighting 超龄，crowd 不再触发）仍不 claim。
         memory.enemy_sightings = {
-            "crowded-core": EnemySighting(position=(515, -216), seen_tick=1000, is_core=True),
+            "crowded-core": EnemySighting(position=(700, 300), seen_tick=1000, is_core=True),
         }
         memory.last_tick = 9999  # 守卫 sighting 已删，即使还在黑名单也不 claim
         turn2, _ = make_turn(
@@ -418,10 +419,11 @@ class LightningModeTests(unittest.TestCase):
         # 不 claim，先锋转扇区探索。补住"雾里守卫看不见→误判无护卫→凑过去卡死"。
         memory = TacticMemory()
         from arena_hero_strategy import EnemySighting
+        # 曼哈顿距离 = |600-700| + |600-300| = 400 < 900
         memory.enemy_sightings = {
-            "core-1": EnemySighting(position=(515, -216), seen_tick=1000, is_core=True),
-            "g-1": EnemySighting(position=(514, -214), seen_tick=1010, is_core=False),
-            "g-2": EnemySighting(position=(514, -218), seen_tick=1011, is_core=False),
+            "core-1": EnemySighting(position=(700, 300), seen_tick=1000, is_core=True),
+            "g-1": EnemySighting(position=(699, 302), seen_tick=1010, is_core=False),
+            "g-2": EnemySighting(position=(699, 298), seen_tick=1011, is_core=False),
         }
         memory.last_tick = 1015
         turn, _ = make_turn(
@@ -568,7 +570,7 @@ class LightningModeTests(unittest.TestCase):
 
     def test_ranger_step_does_not_use_astar(self) -> None:
         # 游侠绕圈走 Core 风格四邻打分(_lightning_step_toward),不走 A*。
-        # 空旷地形朝目标角单调推进,产生 lightning_ranger_scout 决策(非 fallback)。
+        # 空旷地形朝目标角单调推进,产生 mid_orbit_patrol 决策(非 fallback)。
         from arena_hero_strategy import MovementPlanner
         memory = TacticMemory()
         memory.lightning_patrol_phase = 2  # 目标第三象限角 (-650,-650)
@@ -580,15 +582,11 @@ class LightningModeTests(unittest.TestCase):
         decisions: list[str] = []
         planner = MovementPlanner(turn, memory, decisions)
         tactic._choose_rangers_lightning(turn, planner, set(), decisions)
-        # 产生了轨道单步决策(前 4 游侠走开路 lightning_breakthrough,第 5 起走
-        # 中行星 lightning_ranger_mid_orbit),且不是 A* fallback。
+        # Core 离原点 1200；取消突破轨后所有游侠走中行星轨道单步,
+        # 理由为 mid_orbit_patrol(四邻打分,非 A* fallback)。
         self.assertTrue(
-            any(
-                "reason=lightning_breakthrough" in d
-                or "reason=lightning_ranger_mid_orbit" in d
-                for d in decisions
-            ),
-            f"expected orbit step decision, got {decisions}",
+            any("reason=mid_orbit_patrol" in d for d in decisions),
+            f"expected mid_orbit_patrol decision, got {decisions}",
         )
         self.assertFalse(
             any(":fallback" in d for d in decisions),
@@ -749,6 +747,7 @@ class LightningModeTests(unittest.TestCase):
 
     def test_focus_fire_multiple_units_claim_same_core(self) -> None:
         # 同一敌方 Core 允许多 unit 同时 claim(集火),不互相排除。
+        # 先锋走 _lightning_acquire_target 路径,故用两个先锋验证集火。
         from arena_hero_strategy import EnemySighting
         memory = TacticMemory()
         memory.enemy_sightings = {
@@ -760,12 +759,12 @@ class LightningModeTests(unittest.TestCase):
             own_core=core((600, 600)),
             units=(
                 vanguard((610, 600)),
-                ranger((610, 605)),
+                vanguard((615, 605), UUID(int=0xD010)),
             ),
         )
         tactic.choose_actions(turn)
         claims = list(memory.lightning_claims.values())
-        # 两个 unit 都 claim 同一 target-A(集火)。
+        # 两个先锋都 claim 同一 target-A(集火)。
         self.assertEqual(claims, ["target-A", "target-A"])
 
     def test_focus_fire_caps_at_max_attackers(self) -> None:
@@ -845,48 +844,20 @@ class LightningModeTests(unittest.TestCase):
         self.assertNotIsInstance(turn.plan.core_action, SpawnAction)
 
     def test_lightning_build_order_first_three_slots(self) -> None:
-        # 槽 0=先锋, 1=工人, 2=游侠。逐 pop 检查 _lightning_build_slot。
+        # 槽 0=先锋, 1=工人, 2=游侠。逐 pop 检查 _lightning_build_slot(只管 pop1-8 阶梯)。
         from arena_hero_strategy import SmartTactic
         tactic = SmartTactic(TacticMemory())
         self.assertIs(tactic._lightning_build_slot(1), UnitType.VANGUARD)
         self.assertIs(tactic._lightning_build_slot(2), UnitType.WORKER)
         self.assertIs(tactic._lightning_build_slot(3), UnitType.RANGER)
-        # pop≥9 起全游侠
-        self.assertIs(tactic._lightning_build_slot(9), UnitType.RANGER)
-        self.assertIs(tactic._lightning_build_slot(15), UnitType.RANGER)
-        # 满 20 停
-        self.assertIsNone(tactic._lightning_build_slot(20))
-
-    def test_breakthrough_rings_spaced_by_ranger_vision(self) -> None:
-        # 前 4 游侠走开路轨道(绕原点同心大环),半径 = pr + OFFSET + lane*GAP[R],
-        # 相邻差 = 游侠视野半径(GAP[R]=5),覆盖连续不重叠。
-        from arena_hero_strategy import LIGHTNING_ORBIT_LANE_GAP_RADIUS
-
-        rangers = tuple(
-            ranger((605, 600 + i), UUID(int=0xC000 + i)) for i in range(4)
-        )
-        memory = TacticMemory()
-        tactic = SmartTactic(memory)
-        turn, _ = make_turn(own_core=core((600, 600)), units=rangers)
-        tactic.choose_actions(turn)
-        pts = [
-            tactic._lightning_breakthrough_target(turn, r, i)
-            for i, r in enumerate(turn.rangers)
-        ]
-        pts = [p for p in pts if p is not None]
-        self.assertGreaterEqual(len(pts), 2)
-        gap_r = LIGHTNING_ORBIT_LANE_GAP_RADIUS[UnitType.RANGER]
-        radii = sorted(max(abs(p[0]), abs(p[1])) for p in pts)
-        for i in range(len(radii) - 1):
-            self.assertGreaterEqual(
-                radii[i + 1] - radii[i],
-                gap_r - 1,
-                f"breakthrough rings {radii} too close",
-            )
-        # 都在方环安全区内。
-        for s in pts:
-            self.assertGreaterEqual(max(abs(s[0]), abs(s[1])), 500)
-            self.assertLessEqual(max(abs(s[0]), abs(s[1])), 700)
+        self.assertIs(tactic._lightning_build_slot(4), UnitType.WORKER)
+        self.assertIs(tactic._lightning_build_slot(8), UnitType.WORKER)
+        # pop≥9 不再走固定阶梯:改由 _select_spawn 的 3:1/阵亡补同种逻辑决定。
+        self.assertIsNone(tactic._lightning_build_slot(9))
+        self.assertIsNone(tactic._lightning_build_slot(15))
+        # 硬顶 ABSOLUTE_MAX_POPULATION=105:绝不再造。
+        self.assertIsNone(tactic._lightning_build_slot(105))
+        self.assertIsNone(tactic._lightning_build_slot(200))
 
     def test_engage_assessment_skips_ranger_guards(self) -> None:
         # 敌方 Core 周围有游侠守卫(远程) → SKIP(我 2HP 游侠易亏,回避)。
@@ -1131,9 +1102,10 @@ class LightningModeTests(unittest.TestCase):
         self.assertEqual(restored.lightning_unit_stuck_counters, {"u-1": 2})
         self.assertEqual(restored.lightning_unit_escape_until, {"u-2": 345})
 
-    def test_emergency_worker_at_80_percent_capacity(self) -> None:
-        # 资源达到容量 80% 时优先造工人，而非按产兵阶梯造游侠。
-        # 设置：pop=20 (容量 100), resources=80 (80%)，已达常规上限
+    def test_no_emergency_worker_on_cap(self) -> None:
+        # 删除 urgency_threshold 后:资源满仓(80%+)且 pop<100 不再因满仓而造工人。
+        # 设置:pop=20 (容量 100), resources=80 (80%),20 人全工人(rk=0,wk=20)。
+        # pop≥9 走 ratio:rk<3*wk → 按 3:1 应补游侠(而非旧的紧急工人)。
         from arena_hero_strategy import SmartTactic
         units = tuple(worker(UUID(int=i), (600 + i % 10, 600 + i // 10)) for i in range(20))
         turn, _ = make_turn(
@@ -1142,37 +1114,36 @@ class LightningModeTests(unittest.TestCase):
             resources=80,  # 容量 max(10, 20*5)=100, 80/100=80%
         )
         SmartTactic(TacticMemory()).choose_actions(turn)
-        # 预期：造工人（紧急消耗资源），因为已达 20 人且资源压力大
+        # 预期:造游侠(3:1 趋近),不是因满仓造工人。
         self.assertIsInstance(turn.plan.core_action, SpawnAction)
-        self.assertEqual(turn.plan.core_action.unit_type, UnitType.WORKER)
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.RANGER)
 
-    def test_emergency_worker_respects_100_cap(self) -> None:
-        # pop=100 时不再产兵，即使资源很多。
+    def test_spawn_stops_at_absolute_cap(self) -> None:
+        # pop=105 (ABSOLUTE_MAX_POPULATION) 时硬顶不再产兵,即使资源很多。
         from arena_hero_strategy import SmartTactic
-        units = tuple(worker(UUID(int=i), (600 + i % 20, 600 + i // 20)) for i in range(100))
+        units = tuple(worker(UUID(int=i), (600 + i % 30, 600 + i // 30)) for i in range(105))
         turn, _ = make_turn(
             own_core=core((600, 600)),
             units=units,
-            resources=500,  # 容量 max(10, 100*5)=500, 已满
+            resources=600,
         )
         SmartTactic(TacticMemory()).choose_actions(turn)
-        # 预期：不造兵（已达 ABSOLUTE_MAX_POPULATION）
+        # 预期:不造兵(已达 ABSOLUTE_MAX_POPULATION=105)
         self.assertNotIsInstance(turn.plan.core_action, SpawnAction)
 
-    def test_regular_build_order_under_20_when_capacity_ok(self) -> None:
-        # 资源未达 80% 容量时，按产兵阶梯造兵，不触发紧急工人。
-        # 设置：pop=10 (容量 50), resources=15 (30%)
+    def test_spawn_ratio_under_soft_cap_when_capacity_ok(self) -> None:
+        # pop=10 (容量 50), resources 充足:pop≥9 走 ratio(3:1)。
+        # 10 人全工人(rk=0,wk=10) → rk<3*wk → 补游侠。
         from arena_hero_strategy import SmartTactic
         units = tuple(worker(UUID(int=i), (600 + i, 600)) for i in range(10))
         turn, _ = make_turn(
             own_core=core((600, 600)),
             units=units,
-            resources=15,  # 30% < 80% 不触发紧急
+            resources=100,  # 远超成本,确保买得起
         )
-        tactic = SmartTactic(TacticMemory())
-        # 槽 10 (pop10→11) 应按阶梯造游侠，而非紧急工人
-        slot_type = tactic._lightning_build_slot(10)
-        self.assertEqual(slot_type, UnitType.RANGER)
+        SmartTactic(TacticMemory()).choose_actions(turn)
+        self.assertIsInstance(turn.plan.core_action, SpawnAction)
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.RANGER)
 
     def test_worker_switches_to_closer_resource(self) -> None:
         # 工人途中发现更近资源（近 2 格以上）时切换目标。
@@ -1243,6 +1214,359 @@ class LightningModeTests(unittest.TestCase):
         # 验证至少有一个工人切换了
         switch_decisions = [d for d in summary.decisions if "switch_to_closer" in d]
         self.assertGreater(len(switch_decisions), 0, "w1 应切换到近资源")
+
+    def test_electronic_orbit_distribution_11_rangers(self) -> None:
+        """电子排布：11 个游侠，层容量=2n 循环队列填充。"""
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+
+        # 11 个游侠，gap=5，inner=10
+        result = tactic._lightning_calculate_outer_first_orbits(
+            unit_count=11, vision_radius=5, gap=5, inner_radius=10, min_units_per_orbit=3
+        )
+
+        # 总数必须恰好 11
+        self.assertEqual(sum(c for _, c in result), 11)
+        # 半径从 inner=10 起按 gap=5 递增，无空洞层
+        radii = [r for r, _ in result]
+        self.assertEqual(radii, [10, 15, 20, 25])
+        # 电子排布层容量：层1=2, 层2=4, 层3=4, 层4=1
+        self.assertEqual(dict(result), {10: 2, 15: 4, 20: 4, 25: 1})
+
+    def test_electronic_orbit_distribution_grows_outer_layers(self) -> None:
+        """25 个游侠：外层(周长大)承载更多单位,体现分层防御。"""
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+
+        result = tactic._lightning_calculate_outer_first_orbits(
+            unit_count=25, vision_radius=5, gap=5, inner_radius=10, min_units_per_orbit=3
+        )
+
+        self.assertEqual(sum(c for _, c in result), 25)
+        # 半径连续无洞
+        radii = [r for r, _ in result]
+        self.assertEqual(radii, [10, 15, 20, 25, 30, 35])
+        # 外层(35)单位数 >= 内层(10)
+        counts = dict(result)
+        self.assertGreaterEqual(counts[35], counts[10])
+
+    def test_orbit_distribution_counts_all_units_at_scale(self) -> None:
+        """50 个单位：总数必须全部落位,半径连续。"""
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+
+        result = tactic._lightning_calculate_outer_first_orbits(
+            unit_count=50, vision_radius=5, gap=5, inner_radius=10, min_units_per_orbit=3
+        )
+
+        # 不丢单位
+        self.assertEqual(sum(c for _, c in result), 50)
+        # 半径连续递增
+        radii = [r for r, _ in result]
+        self.assertEqual(radii, list(range(10, 10 + 5 * len(radii), 5)))
+
+    def test_orbit_phase_offset_distributes_units(self) -> None:
+        """验证同半径多单位通过 phase_offset 错开到不同角。"""
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+
+        # 构造场景：r=10 有 3 个游侠
+        r1 = ranger((605, 605), UUID(int=0xE001))
+        r2 = ranger((615, 605), UUID(int=0xE002))
+        r3 = ranger((625, 605), UUID(int=0xE003))
+
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(r1, r2, r3),
+        )
+
+        # 手动设置分配：3 个都在 r=10
+        memory.lightning_orbit_lanes[UnitType.RANGER.value] = {
+            str(r1.id): (10, 0),
+            str(r2.id): (10, 1),
+            str(r3.id): (10, 2),
+        }
+
+        # 获取各自的目标点
+        target1 = tactic._lightning_orbit_waypoint(turn, r1, UnitType.RANGER)
+        target2 = tactic._lightning_orbit_waypoint(turn, r2, UnitType.RANGER)
+        target3 = tactic._lightning_orbit_waypoint(turn, r3, UnitType.RANGER)
+
+        # 验证目标点不同（phase_offset 生效）
+        self.assertIsNotNone(target1)
+        self.assertIsNotNone(target2)
+        self.assertIsNotNone(target3)
+
+        targets = {target1, target2, target3}
+        # 3 个单位应分布在至少 2 个不同的角（phase_offset = 0, 1, 2 → 角 0, 1, 2）
+        self.assertGreaterEqual(len(targets), 2, "同半径单位应分散到不同角")
+
+
+class SharedOrbitTests(unittest.TestCase):
+    """游侠+工人共用中轨(单一有序队列):游侠占内层、工人接外层、新游侠挤出工人。"""
+
+    @staticmethod
+    def _rk_wk_turn(num_rangers: int, num_workers: int, core_pos=(600, 600)):
+        """构造 num_rangers 游侠 + num_workers 工人的 turn(UUID 按 0xD0 段递增)。"""
+        units = []
+        for i in range(num_rangers):
+            units.append(
+                ranger((core_pos[0] + 10 + i, core_pos[1]), UUID(int=0xD100 + i))
+            )
+        for j in range(num_workers):
+            units.append(
+                worker(UUID(int=0xD200 + j), (core_pos[0] - 10 - j, core_pos[1]))
+            )
+        turn, _ = make_turn(own_core=core(core_pos), units=tuple(units))
+        return turn
+
+    def test_shared_orbit_rangers_inner_workers_outer(self) -> None:
+        # 3 游侠 + 2 工人:游侠序号 [0,3),工人序号 [3,5);位置半径非递减,
+        # 故工人整体不比游侠更靠内(min 工人 radius ≥ min 游侠 radius)。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        turn = self._rk_wk_turn(num_rangers=3, num_workers=2)
+        tactic._lightning_assign_shared_middle_lanes(turn)
+
+        seq = memory.lightning_shared_orbit_seq
+        ranger_lanes = memory.lightning_orbit_lanes[UnitType.RANGER.value]
+        worker_lanes = memory.lightning_orbit_lanes[UnitType.WORKER.value]
+
+        # 游侠 3 个、工人 2 个,序号互不重叠。
+        self.assertEqual(len(ranger_lanes), 3)
+        self.assertEqual(len(worker_lanes), 2)
+        ranger_seqs = {seq[uid] for uid in ranger_lanes}
+        worker_seqs = {seq[uid] for uid in worker_lanes}
+        self.assertEqual(ranger_seqs, {0, 1, 2})
+        self.assertEqual(worker_seqs, {3, 4})
+
+        # 不变量:工人 radius ≥ 游侠最小 radius(工人不钻到游侠内侧)。
+        min_ranger_r = min(r for r, _ in ranger_lanes.values())
+        for r, _ in worker_lanes.values():
+            self.assertGreaterEqual(
+                r, min_ranger_r, f"工人 radius {r} 比最内游侠 {min_ranger_r} 还内"
+            )
+
+    def test_new_ranger_pushes_worker_outward(self) -> None:
+        # rk=3 wk=2 时工人序号 3,4;造第 4 游侠后 rk=4 wk=2 → 游侠段扩到 [0,4),
+        # 原序号 3 的工人被推到序号 4,radius 增大(外推)。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+
+        # 第一阶段:3 游侠 2 工人。记录工人的 radius。
+        turn1 = self._rk_wk_turn(num_rangers=3, num_workers=2)
+        tactic._lightning_assign_shared_middle_lanes(turn1)
+        worker_lanes_1 = dict(memory.lightning_orbit_lanes[UnitType.WORKER.value])
+        self.assertEqual(len(worker_lanes_1), 2)
+
+        # 第二阶段:4 游侠 2 工人(同样的两个工人 UUID,新增一个游侠)。
+        turn2 = self._rk_wk_turn(num_rangers=4, num_workers=2)
+        tactic._lightning_assign_shared_middle_lanes(turn2)
+        worker_lanes_2 = dict(memory.lightning_orbit_lanes[UnitType.WORKER.value])
+
+        # 同一批工人 UUID,造新游侠后 radius 应不减小(被往外挤或持平)。
+        for uid in worker_lanes_1:
+            self.assertIn(uid, worker_lanes_2)
+            self.assertGreaterEqual(
+                worker_lanes_2[uid][0],
+                worker_lanes_1[uid][0],
+                f"工人 {uid} 被挤出后 radius 应不减小: "
+                f"{worker_lanes_1[uid][0]} → {worker_lanes_2[uid][0]}",
+            )
+        # 至少一个工人的 radius 严格增大(外推效果可见)。
+        pushed = any(
+            worker_lanes_2[uid][0] > worker_lanes_1[uid][0]
+            for uid in worker_lanes_1
+        )
+        self.assertTrue(pushed, "新游侠应把至少一个工人往外挤")
+
+    def test_stable_when_counts_unchanged(self) -> None:
+        # 连续两次同样人数(rk=3 wk=2)→ lanes 完全一致(不抖动)。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        turn1 = self._rk_wk_turn(num_rangers=3, num_workers=2)
+        tactic._lightning_assign_shared_middle_lanes(turn1)
+        lanes_1 = {
+            role: dict(v) for role, v in memory.lightning_orbit_lanes.items()
+        }
+        seq_1 = dict(memory.lightning_shared_orbit_seq)
+
+        # 第二次:同样单位,应复用 cached,不重算。
+        turn2 = self._rk_wk_turn(num_rangers=3, num_workers=2)
+        tactic._lightning_assign_shared_middle_lanes(turn2)
+        lanes_2 = {
+            role: dict(v) for role, v in memory.lightning_orbit_lanes.items()
+        }
+        seq_2 = dict(memory.lightning_shared_orbit_seq)
+
+        self.assertEqual(lanes_1, lanes_2, "人数不变时 lanes 不应抖动")
+        self.assertEqual(seq_1, seq_2, "人数不变时 seq 不应抖动")
+
+    def test_mixed_layer_phase_offset_uses_combined_count(self) -> None:
+        # §7 关键:同一半径混合游侠+工人时,phase_offset 按"合并后该层单位总数"算。
+        # 构造游侠+工人在同一半径层,验证 _lightning_orbit_waypoint 读的 units_at_radius
+        # 是合并值(游侠+工人),而非单 role 值。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        # 2 游侠 + 2 工人:total=4 → 电子排布 total=4 的分布。
+        turn = self._rk_wk_turn(num_rangers=2, num_workers=2)
+        merged = tactic._lightning_assign_shared_middle_lanes(turn)
+        # 找出混合层(同半径同时有游侠和工人)。
+        ranger_radii = {
+            r for uid, (r, _) in merged.items()
+            if uid in {str(u.id) for u in turn.rangers}
+        }
+        worker_radii = {
+            r for uid, (r, _) in merged.items()
+            if uid in {str(u.id) for u in turn.workers}
+        }
+        mixed = ranger_radii & worker_radii
+        if mixed:
+            mixed_r = next(iter(mixed))
+            # 该层合并单位数 = 游侠数 + 工人数(同层)。
+            combined = sum(1 for (r, _) in merged.values() if r == mixed_r)
+            ranger_only = sum(
+                1 for uid, (r, _) in merged.items()
+                if r == mixed_r
+                and uid in {str(u.id) for u in turn.rangers}
+            )
+            self.assertGreater(
+                combined, ranger_only,
+                "混合层的 units_at_radius 必须是游侠+工人合计,而非单 role",
+            )
+
+    def test_load_roundtrip_shared_seq(self) -> None:
+        # save→load 后 lightning_shared_orbit_seq 和 lanes 完整保留。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        turn = self._rk_wk_turn(num_rangers=3, num_workers=2)
+        tactic._lightning_assign_shared_middle_lanes(turn)
+        seq_before = dict(memory.lightning_shared_orbit_seq)
+        lanes_before = {
+            role: dict(v) for role, v in memory.lightning_orbit_lanes.items()
+        }
+        self.assertGreater(len(seq_before), 0)
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "memory.json"
+            memory.save(path)
+            restored = TacticMemory.load(path)
+
+        # seq 完整恢复(uid→int)。
+        self.assertEqual(restored.lightning_shared_orbit_seq, seq_before)
+        # lanes 完整恢复,且值是 (radius, group_idx) 元组。
+        for role in (UnitType.RANGER.value, UnitType.WORKER.value):
+            self.assertEqual(
+                restored.lightning_orbit_lanes[role], lanes_before[role]
+            )
+            for value in restored.lightning_orbit_lanes[role].values():
+                self.assertIsInstance(value, tuple)
+                self.assertEqual(len(value), 2)
+
+
+class SpawnRatioTests(unittest.TestCase):
+    """pop≥9 产兵:3:1(游侠:工人)趋近 + 阵亡补同种 + 先锋维持 1。"""
+
+    @staticmethod
+    def _turn_with(rk: int, wk: int, vg: int = 1):
+        units = []
+        for i in range(vg):
+            units.append(vanguard((700 + i, 700), UUID(int=0xF000 + i)))
+        for i in range(rk):
+            units.append(ranger((610 + i, 600), UUID(int=0xF100 + i)))
+        for i in range(wk):
+            units.append(worker(UUID(int=0xF200 + i), (590 - i, 600)))
+        turn, _ = make_turn(own_core=core((600, 600)), units=tuple(units))
+        return turn
+
+    def test_spawn_3to1_ratio(self) -> None:
+        # 从 pop1-8 阶梯结束的真实起点 (rk=3, wk=4) 连续纯增长(无阵亡),
+        # 断言最终 rk:wk 趋近 3:1(误差 ≤ 1 兵)。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        rk, wk = 3, 4
+        for _ in range(60):
+            turn = self._turn_with(rk, wk, vg=1)
+            pick = tactic._lightning_ratio_spawn(turn, died={})
+            self.assertIsNotNone(pick)
+            if pick is UnitType.RANGER:
+                rk += 1
+            else:
+                wk += 1
+        # ratio 在 [2.5, 3.5] 之间即视为收敛到 3:1。
+        ratio = rk / max(1, wk)
+        self.assertGreaterEqual(ratio, 2.5, f"rk={rk} wk={wk} ratio={ratio:.2f} 偏低")
+        self.assertLessEqual(ratio, 3.5, f"rk={rk} wk={wk} ratio={ratio:.2f} 偏高")
+
+    def test_spawn_replaces_dead_type(self) -> None:
+        # rk=6 wk=2(正好 3:1):死一个游侠 → 补游侠;死一个工人 → 补工人。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+
+        turn = self._turn_with(rk=6, wk=2, vg=1)
+        pick = tactic._lightning_ratio_spawn(
+            turn, died={"dead-rk": UnitType.RANGER.name}
+        )
+        self.assertIs(pick, UnitType.RANGER, "死游侠应补游侠")
+
+        turn = self._turn_with(rk=6, wk=2, vg=1)
+        pick = tactic._lightning_ratio_spawn(
+            turn, died={"dead-wk": UnitType.WORKER.name}
+        )
+        self.assertIs(pick, UnitType.WORKER, "死工人应补工人")
+
+    def test_spawn_keeps_one_vanguard(self) -> None:
+        # 先锋死了且当前 vg=0 → 下次补先锋(维持 1 个先锋)。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        turn = self._turn_with(rk=3, wk=1, vg=0)
+        pick = tactic._lightning_ratio_spawn(
+            turn, died={"dead-vg": UnitType.VANGUARD.name}
+        )
+        self.assertIs(pick, UnitType.VANGUARD)
+
+    def test_select_spawn_survives_double_call_and_replaces_dead(self) -> None:
+        # 集成:observe 算出本 tick 阵亡后,_select_spawn 被调多次(预检 + 决策)
+        # 都应读到同一 died,pop≥9 时补阵亡的同种兵。
+        from arena_hero_strategy import SmartTactic
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+
+        # 第 1 个 tick:rk=7 wk=2 vg=1(pop=10,slot9≥8 进入 ratio 逻辑)。
+        rangers_t1 = [
+            ranger((610 + i, 600), UUID(int=0xF100 + i)) for i in range(7)
+        ]
+        workers_t1 = [worker(UUID(int=0xF200 + i), (590 - i, 600)) for i in range(2)]
+        vg_t1 = vanguard((700, 700), UUID(int=0xF000))
+        turn1, _ = make_turn(
+            own_core=core((600, 600)),
+            units=tuple([vg_t1] + rangers_t1 + workers_t1),
+            resources=1000,
+        )
+        memory.observe(turn1)
+        self.assertEqual(memory.lightning_recent_deaths, {})  # 首 tick 无阵亡
+
+        # 第 2 个 tick:一个游侠阵亡(rk=6 wk=2,pop=9 仍 ≥9),observe 记 recent_deaths。
+        rangers_t2 = rangers_t1[1:]  # 第一个游侠死了
+        turn2, _ = make_turn(
+            own_core=core((600, 600)),
+            units=tuple([vg_t1] + rangers_t2 + workers_t1),
+            resources=1000,
+        )
+        memory.observe(turn2)
+        died_uids = set(memory.lightning_recent_deaths.keys())
+        self.assertEqual(len(died_uids), 1)
+        self.assertEqual(
+            memory.lightning_recent_deaths[next(iter(died_uids))],
+            UnitType.RANGER.name,
+        )
+
+        # 模拟 _select_spawn 被调两次(预检 + 决策):两次都应读同一个 died。
+        pick1 = tactic._select_spawn(turn2, 1000)
+        pick2 = tactic._select_spawn(turn2, 1000)
+        # 阵亡游侠 → pop≥9 ratio 逻辑补游侠(died_rk>died_wk)。
+        self.assertIs(pick1, UnitType.RANGER, "阵亡游侠应补游侠")
+        self.assertIs(pick2, UnitType.RANGER, "第二次调用也应补游侠(died 不被消费)")
 
 
 if __name__ == "__main__":

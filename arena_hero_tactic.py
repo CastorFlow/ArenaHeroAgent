@@ -238,7 +238,7 @@ def play(
             memory.save(memory_path)
             memory.write_stats(stats_path, turn)
             _append_telemetry(telemetry_path, summary, accepted=True)
-            decision_text = " | ".join(summary.decisions[:8]) or "wait"
+            decision_text = " | ".join(summary.decisions) or "wait"
             print(
                 f"tick={accepted.tick} accepted={accepted.accepted} "
                 f"resources={summary.resources}/{summary.resource_capacity} "
