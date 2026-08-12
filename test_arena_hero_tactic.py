@@ -320,9 +320,35 @@ def make_turn(
 class LightningModeTests(unittest.TestCase):
     """闪电模式：建造顺序、独立猎手 claim/释放、巡逻不越框、Core 告急召回。"""
 
+    @staticmethod
+    def _isolated_lightning_memory() -> TacticMemory:
+        """Keep local-behaviour fixtures independent of Core migration.
+
+        These tests intentionally place the Core at (600, 600) to exercise
+        spawning and lane helpers.  The production donut is now (400, 600),
+        so use the former neutral test ring rather than let a global Core
+        relocation consume the Core action under test.
+        """
+        memory = TacticMemory()
+        memory.lightning_ring = (500, 700)
+        return memory
+
     def _box_core(self) -> CoreView:
-        # Core 落在默认方框内，避免被入框迁移逻辑覆盖猎手行为。
+        # Stable coordinate for the isolated lightning fixtures below.
         return core((600, 600))
+
+    def test_default_core_patrol_ring_is_shifted_100_toward_origin(self) -> None:
+        self.assertEqual(LIGHTNING_DEFAULT_RING, (400, 600))
+        self.assertEqual(SmartTactic(TacticMemory())._lightning_patrol_radius(), 450)
+
+    def test_patrol_reprojects_persisted_waypoint_after_ring_change(self) -> None:
+        memory = TacticMemory()
+        memory.lightning_patrol_waypoint = (-650, -650)
+        memory.lightning_patrol_phase = 2
+        tactic = SmartTactic(memory)
+        turn, _ = make_turn(own_core=core((446, -650)))
+        self.assertEqual(tactic._lightning_patrol_waypoint(turn), (-450, -450))
+        self.assertEqual(memory.lightning_patrol_phase, 2)
 
     def test_cap10_forces_vanguard_not_ranger(self) -> None:
         # pop1 → 容量 10，资源 10：必须产先锋（游侠要 12 存不下）。
@@ -331,7 +357,7 @@ class LightningModeTests(unittest.TestCase):
             units=(worker(WORKER_LOW, (601, 600)),),
             resources=10,
         )
-        SmartTactic(TacticMemory()).choose_actions(turn)
+        SmartTactic(self._isolated_lightning_memory()).choose_actions(turn)
 
         self.assertIsInstance(turn.plan.core_action, SpawnAction)
         self.assertEqual(turn.plan.core_action.unit_type, UnitType.VANGUARD)
@@ -346,7 +372,7 @@ class LightningModeTests(unittest.TestCase):
             ),
             resources=10,
         )
-        SmartTactic(TacticMemory()).choose_actions(turn)
+        SmartTactic(self._isolated_lightning_memory()).choose_actions(turn)
 
         self.assertIsInstance(turn.plan.core_action, SpawnAction)
         self.assertEqual(turn.plan.core_action.unit_type, UnitType.WORKER)
@@ -498,39 +524,28 @@ class LightningModeTests(unittest.TestCase):
         SmartTactic(TacticMemory()).choose_actions(turn)
         self.assertIsInstance(turn.plan.core_action, StartMoveAction)
 
-    def test_patrol_detours_around_combat_enemy(self) -> None:
-        # 敌方先锋在 Core 右侧 6 格（能 sweep 到接近的 Core）。Core 朝巡逻点
-        # (650,-650) 走应选不更靠近该先锋的方向绕开，而非直冲或原地停下。
+    def test_combat_anchor_holds_against_near_vanguard(self) -> None:
+        # 动态 R_commit 内的先锋不能再诱使 Core 启动四 Tick 迁移；迁移期间
+        # 无法治疗/造兵/补盾，会直接破坏内层防线。
         turn, _ = make_turn(
             own_core=core((535, -201)),
-            units=(worker(WORKER_LOW, (545, -180)),),  # 工人远处发现先锋
+            units=(worker(WORKER_LOW, (545, -180)),),
             enemies=(enemy_vanguard((541, -201)),),
         )
-        SmartTactic(TacticMemory()).choose_actions(turn)
-        self.assertIsInstance(turn.plan.core_action, StartMoveAction)
-        dest = _destination((535, -201), turn.plan.core_action.direction)
-        # 绕行：新位置不应比原位置更靠近那个先锋。
-        self.assertGreaterEqual(
-            _distance(dest, (541, -201)),
-            _distance((535, -201), (541, -201)),
-        )
+        summary = SmartTactic(TacticMemory()).choose_actions(turn)
+        self.assertIsNone(turn.plan.core_action)
+        self.assertTrue(any("core anchor_hold state=COMBAT_ANCHOR" in d for d in summary.decisions))
 
-    def test_patrol_flees_adjacent_combat_enemy(self) -> None:
-        # 敌方先锋紧贴 Core 相邻（sweep 可直接命中）。Core 应选逃离方向（远离先锋）
-        # 而非原地停留（留在 sweep 范围内会被持续打），也不朝先锋走。
+    def test_combat_anchor_holds_against_adjacent_vanguard(self) -> None:
+        # 相邻先锋本 Tick 就能 sweep；Core 必须服务战斗，而不是逃跑进入 4 Tick 锁定。
         turn, _ = make_turn(
             own_core=core((535, -201)),
             units=(worker(WORKER_LOW, (540, -201)),),
             enemies=(enemy_vanguard((536, -201)),),
         )
-        SmartTactic(TacticMemory()).choose_actions(turn)
-        self.assertIsInstance(turn.plan.core_action, StartMoveAction)
-        dest = _destination((535, -201), turn.plan.core_action.direction)
-        # 逃离：新位置比原位置更远离先锋。
-        self.assertGreater(
-            _distance(dest, (536, -201)),
-            _distance((535, -201), (536, -201)),
-        )
+        summary = SmartTactic(TacticMemory()).choose_actions(turn)
+        self.assertIsNone(turn.plan.core_action)
+        self.assertTrue(any("core anchor_hold state=COMBAT_ANCHOR" in d for d in summary.decisions))
 
 
     def test_sector_target_stays_near_units_quadrant(self) -> None:
@@ -548,8 +563,8 @@ class LightningModeTests(unittest.TestCase):
         self.assertLess(sector[1], 0, f"sector {sector} should stay in y<0 half")
         # 且在方环内。
         radius = max(abs(sector[0]), abs(sector[1]))
-        self.assertGreaterEqual(radius, 500)
-        self.assertLessEqual(radius, 700)
+        self.assertGreaterEqual(radius, 400)
+        self.assertLessEqual(radius, 600)
 
     def test_patrol_moves_toward_waypoint_not_origin(self) -> None:
         # Core 在 (535,-201)，最近巡逻角 (650,-650)。应朝巡逻点（远离原点）
@@ -686,21 +701,27 @@ class LightningModeTests(unittest.TestCase):
         )
 
     def test_vanguard_vee_outbound_target_orthogonal_to_heading(self) -> None:
-        # Core 在 (600,600),最近巡逻角 (650,650) → 行进方向 (+x,+y)。
-        # 先锋 OUTBOUND 目标应正交(perp=(-fwd_y,fwd_x)=(-1,+1)),
-        # 不沿行进方向延伸;深度 ~ LIGHTNING_VEE_DEPTH;clamp 在方环内。
+        # Core 在 (600,600),行进方向由最近巡逻角推出;先锋 OUTBOUND 目标应正交于
+        # 行进方向(perp=(-fwd_y,fwd_x)),不沿行进方向延伸;深度 ~ LIGHTNING_VEE_DEPTH;
+        # clamp 在方环内。
         from arena_hero_strategy import LIGHTNING_VEE_DEPTH
-        memory = TacticMemory()
+        memory = self._isolated_lightning_memory()
         tactic = SmartTactic(memory)
         turn, _ = make_turn(
             own_core=core((600, 600)),
             units=(vanguard((600, 605)),),
         )
-        target = tactic._lightning_vanguard_vee_target(turn, turn.vanguards[0])
+        vanguard_unit = turn.vanguards[0]
+        target = tactic._lightning_vanguard_vee_target(turn, vanguard_unit)
         self.assertIsNotNone(target)
-        # perp=(-1,+1):目标 x 减、y 增(沿 perp,不沿 fwd)。
-        self.assertLess(target[0], 600, "orthogonal: target x should decrease")
-        self.assertGreater(target[1], 605, "orthogonal: target y should increase")
+        fwd = tactic._lightning_core_heading_vector(turn)
+        perp = (-fwd[1], fwd[0])
+        # 沿 perp 方向延伸(不沿 fwd):origin→target 的位移与 perp 同向、与 fwd 正交。
+        dx = target[0] - vanguard_unit.position[0]
+        dy = target[1] - vanguard_unit.position[1]
+        # 与 perp 点积为正(同向),与 fwd 点积近零(正交)。
+        self.assertGreater(dx * perp[0] + dy * perp[1], 0, "target should move along perp")
+        self.assertEqual(dx * fwd[0] + dy * fwd[1], 0, "target should be orthogonal to fwd")
         # 深度 ~ VEE_DEPTH。
         self.assertGreater(_distance(target, (600, 605)), LIGHTNING_VEE_DEPTH - 5)
         # 在方环内。
@@ -905,11 +926,11 @@ class LightningModeTests(unittest.TestCase):
             enemies=(enemy_ranger((615, 600)),),
         )
         self.assertEqual(tactic._lightning_defense_tier(turn_mid), "MID")
-        # FAR:敌方游侠 30 格(20<d≤40) → 局部游击,不全撤
+        # FAR:落在动态 sensor 外沿、但未越过它的游侠 → 局部响应,不全撤。
         turn_far, _ = make_turn(
             own_core=core((600, 600)),
             units=(vanguard((601, 600)),),
-            enemies=(enemy_ranger((630, 600)),),
+            enemies=(enemy_ranger((625, 600)),),
         )
         self.assertEqual(tactic._lightning_defense_tier(turn_far), "FAR")
         # NONE:无战斗单位 → 正常绕轨道
@@ -1033,7 +1054,7 @@ class LightningModeTests(unittest.TestCase):
 
     def test_orbit_waypoint_skips_obstructed_corner(self) -> None:
         # 目标角周围 5x5 已知障碍 >10 → 距角尚远时提前推进下一角绕行。
-        memory = TacticMemory()
+        memory = self._isolated_lightning_memory()
         tactic = SmartTactic(memory)
         v_unit = vanguard((600, 590))
         turn, _ = make_turn(own_core=core((600, 600)), units=(v_unit,))
@@ -1058,6 +1079,111 @@ class LightningModeTests(unittest.TestCase):
         self.assertNotEqual(blocked_target, clean_target)
         # 相位已推进。
         self.assertEqual(memory.lightning_orbit_phase[uid], 1)
+
+    # ---- 轨道均匀分布软斥力(A: reason 白名单) ----
+
+    def test_orbit_spread_detours_away_from_adjacent_friendly(self) -> None:
+        # 软斥力只作用于 ORBIT_SPREAD_REASONS(纯巡逻)。两个游侠同层巡逻目标一致,
+        # 后方的友军在候选格脚下 → 候选那格因斥力被罚,单位改走更开阔的方向,
+        # 从而撑开扎堆。open-field(目标在 +x 大方向)时 target_distance 项几乎被
+        # +x/-x 两个方向的 diffs 抹平,斥力足以扭转选择。
+        from arena_hero_strategy import MovementPlanner
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        uid = str(UUID(int=0xB040))
+        friendly_uid = str(UUID(int=0xB041))
+        # 本单位的角点(最近角,半径 14 → (646,646));目标在 +x 远端。
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(
+                ranger((632, 600), UUID(int=0xB040)),
+                ranger((630, 600), UUID(int=0xB041)),
+            ),
+        )
+        decisions: list[str] = []
+        planner = MovementPlanner(turn, memory, decisions)
+        moved = tactic._lightning_step_toward(
+            turn, planner, turn.rangers[0], (700, 600), "mid_orbit_patrol"
+        )
+        self.assertTrue(moved)
+        move_line = next(d for d in decisions if "move" in d and f"ranger:{uid[:8]}" in d)
+        self.assertIn("to=(633, 600)", move_line, move_line)
+
+    def test_spread_does_not_apply_to_combat_reason(self) -> None:
+        # 战斗移动(拦截/狙击)用非白名单 reason → 零斥力,单位仍继续扑向目标,
+        # 不会被身边友军推开而各自为战。
+        from arena_hero_strategy import MovementPlanner
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        uid = str(UUID(int=0xB042))
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(
+                ranger((632, 600), UUID(int=0xB042)),
+                ranger((630, 600), UUID(int=0xB043)),
+            ),
+        )
+        decisions: list[str] = []
+        planner = MovementPlanner(turn, memory, decisions)
+        moved = tactic._lightning_step_toward(
+            turn, planner, turn.rangers[0], (606, 600), "vanguard_committed_intercept"
+        )
+        self.assertTrue(moved)
+        # 无视身后友军,径直朝目标 -x 走。
+        move_line = next(d for d in decisions if "move" in d and f"ranger:{uid[:8]}" in d)
+        self.assertIn("to=(631, 600)", move_line, move_line)
+
+    def test_spread_skipped_during_escape(self) -> None:
+        # 逃生(escaping)模式完全跳过斥力——脱困优先级最高,可无视均匀分布。
+
+        from arena_hero_strategy import MovementPlanner
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        uid = str(UUID(int=0xB044))
+        memory.lightning_unit_escape_until[uid] = 200  # 已在逃生期
+        # 口袋:上下两排墙 + 左端封底,开口朝右。逃生应向右出口袋,不被身后友军拦。
+        walls = (
+            (648, 600),
+            (649, 599), (650, 599), (651, 599),
+            (649, 601), (650, 601), (651, 601),
+        )
+        memory.known_obstacles = set(walls)
+        turn, _ = make_turn(
+            tick=100,
+            own_core=core((600, 600)),
+            units=(
+                ranger((650, 600), UUID(int=0xB044)),
+                ranger((649, 600), UUID(int=0xB045)),
+            ),
+        )
+        decisions: list[str] = []
+        planner = MovementPlanner(turn, memory, decisions)
+        moved = tactic._lightning_step_toward(
+            turn, planner, turn.rangers[0], (620, 600), "mid_orbit_patrol"
+        )
+        self.assertTrue(moved)
+        # 即便身后友军在候选 -y/+y 附近,逃生仍向右走出口袋(开阔度优先)。
+        move_line = next(d for d in decisions if "move" in d and ":escape" in d)
+        self.assertIn("to=(651, 600)", move_line, move_line)
+
+    def test_spread_does_not_affect_solo_unit(self) -> None:
+        # 无其他友军 → count_observed 缓存为空、spread_friends 为空,移动与原来完全一致。
+        from arena_hero_strategy import MovementPlanner
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(ranger((650, 600), UUID(int=0xB046)),),
+        )
+        turn.units = [turn.units[0]]  # 只有自己
+        decisions: list[str] = []
+        planner = MovementPlanner(turn, memory, decisions)
+        tactic._lightning_step_toward(
+            turn, planner, turn.rangers[0], (620, 600), "mid_orbit_patrol"
+        )
+        # 无其他友军 → spread_friends 为空,移动与原来完全一致:径直朝目标 +x 收缩。
+        move_line = next(d for d in decisions if "move" in d)
+        self.assertIn("to=(649, 600)", move_line)
 
     def test_core_patrol_waypoint_skips_obstructed_corner(self) -> None:
         # Core 巡逻角埋在乱石堆里 → 距角尚远时提前跳下一角。
@@ -1113,7 +1239,7 @@ class LightningModeTests(unittest.TestCase):
             units=units,
             resources=80,  # 容量 max(10, 20*5)=100, 80/100=80%
         )
-        SmartTactic(TacticMemory()).choose_actions(turn)
+        SmartTactic(self._isolated_lightning_memory()).choose_actions(turn)
         # 预期:造游侠(3:1 趋近),不是因满仓造工人。
         self.assertIsInstance(turn.plan.core_action, SpawnAction)
         self.assertEqual(turn.plan.core_action.unit_type, UnitType.RANGER)
@@ -1141,7 +1267,7 @@ class LightningModeTests(unittest.TestCase):
             units=units,
             resources=100,  # 远超成本,确保买得起
         )
-        SmartTactic(TacticMemory()).choose_actions(turn)
+        SmartTactic(self._isolated_lightning_memory()).choose_actions(turn)
         self.assertIsInstance(turn.plan.core_action, SpawnAction)
         self.assertEqual(turn.plan.core_action.unit_type, UnitType.RANGER)
 
@@ -1267,7 +1393,7 @@ class LightningModeTests(unittest.TestCase):
 
     def test_orbit_phase_offset_distributes_units(self) -> None:
         """验证同半径多单位通过 phase_offset 错开到不同角。"""
-        memory = TacticMemory()
+        memory = self._isolated_lightning_memory()
         tactic = SmartTactic(memory)
 
         # 构造场景：r=10 有 3 个游侠
@@ -1567,6 +1693,157 @@ class SpawnRatioTests(unittest.TestCase):
         # 阵亡游侠 → pop≥9 ratio 逻辑补游侠(died_rk>died_wk)。
         self.assertIs(pick1, UnitType.RANGER, "阵亡游侠应补游侠")
         self.assertIs(pick2, UnitType.RANGER, "第二次调用也应补游侠(died 不被消费)")
+
+
+class OrbitalRepulsionTests(unittest.TestCase):
+    """动态轨道排斥防御：测试边界、火控、医疗、漏斗和锚定的协同。"""
+
+    @staticmethod
+    def _squad(rangers: int, workers: int) -> tuple[UnitView, ...]:
+        units: list[UnitView] = []
+        for index in range(rangers):
+            units.append(ranger((600 + index, 600), UUID(int=0xA000 + index)))
+        for index in range(workers):
+            units.append(worker(UUID(int=0xB000 + index), (630 + index, 600)))
+        return tuple(units)
+
+    def test_dynamic_threat_geometry_grows_with_three_to_one_lanes(self) -> None:
+        # 3:1 编制增长会扩展最终 shared lane，因而外游侠/传感器边界随之扩展，
+        # 而不是继续复用一组 6/20/40 防线数字。
+        tactic = SmartTactic(TacticMemory())
+        small, _ = make_turn(own_core=core((600, 600)), units=self._squad(3, 1))
+        large, _ = make_turn(own_core=core((600, 600)), units=self._squad(9, 3))
+        small_geometry = tactic._lightning_orbit_geometry(small)
+        large_geometry = tactic._lightning_orbit_geometry(large)
+        self.assertGreater(large_geometry.r_ranger_outer, small_geometry.r_ranger_outer)
+        self.assertGreater(large_geometry.r_sensor_outer, small_geometry.r_sensor_outer)
+        self.assertEqual(large_geometry.r_screen, large_geometry.r_ranger_inner)
+        self.assertLess(large_geometry.r_commit, large_geometry.r_screen)
+
+    def test_sparse_outer_contact_gets_same_sector_ranger_eta_support(self) -> None:
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(
+                ranger((610, 600)),
+                ranger((590, 600), RANGER_TWO_ID),
+                worker(WORKER_LOW, (620, 600)),
+            ),
+            enemies=(enemy_vanguard((625, 600)),),
+        )
+        summary = SmartTactic(TacticMemory()).choose_actions(turn)
+        self.assertIsInstance(turn.plan.unit_actions[RANGER_ID], MoveAction)
+        self.assertEqual(turn.plan.unit_actions[RANGER_ID].direction, Direction.RIGHT)
+        self.assertTrue(any("ranger_eta_support" in line for line in summary.decisions))
+
+    def test_one_hp_ranger_medivac_gets_health_ranger_relief(self) -> None:
+        tactic = SmartTactic(TacticMemory())
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(ranger((610, 600), hp=1), ranger((620, 600), RANGER_TWO_ID)),
+        )
+        summary = tactic.choose_actions(turn)
+        plan = tactic._lightning_plan
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(len(plan.vacancies), 1)
+        self.assertEqual(plan.vacancies[0].ranger_id, RANGER_ID)
+        self.assertEqual(plan.vacancies[0].t_medical_gap, 21)
+        self.assertEqual(len(plan.reliefs), 1)
+        self.assertEqual(plan.reliefs[0].ranger_id, RANGER_TWO_ID)
+        self.assertEqual(turn.plan.unit_actions[RANGER_ID].direction, Direction.LEFT)
+        self.assertEqual(turn.plan.unit_actions[RANGER_TWO_ID].direction, Direction.LEFT)
+        self.assertTrue(any("MEDIVAC" in line for line in summary.decisions))
+        self.assertTrue(any("ranger_relief" in line for line in summary.decisions))
+
+    def test_shot_ledger_stops_overkill_on_stationary_target(self) -> None:
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(ranger((600, 600)), ranger((600, 602), RANGER_TWO_ID)),
+            enemies=(enemy_vanguard((602, 600), hp=1),),
+        )
+        SmartTactic(TacticMemory()).choose_actions(turn)
+        shots = [action for action in turn.plan.unit_actions.values() if isinstance(action, ShootAction)]
+        self.assertEqual(len(shots), 1)
+        self.assertEqual(shots[0].target_id, UUID(int=0x8002))
+
+    def test_t3_legal_shot_beats_ranger_movement(self) -> None:
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(ranger((606, 600)),),
+            enemies=(enemy_vanguard((609, 600)),),
+        )
+        SmartTactic(TacticMemory()).choose_actions(turn)
+        self.assertIsInstance(turn.plan.unit_actions[RANGER_ID], ShootAction)
+
+    def test_committed_vanguard_intercepts_without_moving_toward_core(self) -> None:
+        tactic = SmartTactic(TacticMemory())
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(vanguard((604, 600)),),
+            enemies=(enemy_vanguard((608, 600)),),
+        )
+        tactic.choose_actions(turn)
+        plan = tactic._lightning_plan
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertIn(VANGUARD_ID, plan.committed_vanguards)
+        action = turn.plan.unit_actions[VANGUARD_ID]
+        self.assertIsInstance(action, MoveAction)
+        self.assertEqual(action.direction, Direction.RIGHT)
+
+    def test_worker_funnel_uses_covered_gate_and_blocks_other_route(self) -> None:
+        tactic = SmartTactic(TacticMemory())
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(ranger((605, 602)), worker(WORKER_LOW, (608, 600))),
+            enemies=(enemy_vanguard((608, 602)),),
+        )
+        tactic.choose_actions(turn)
+        plan = tactic._lightning_plan
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan.funnel.gate_cell, (607, 602))
+        self.assertEqual(plan.funnel.block_cells, ((608, 601),))
+        self.assertEqual(plan.funnel.assignments, ((WORKER_LOW, (608, 601)),))
+        self.assertEqual(turn.plan.unit_actions[WORKER_LOW].direction, Direction.DOWN)
+
+    def test_medical_and_combat_core_anchor_states(self) -> None:
+        medical = SmartTactic(TacticMemory())
+        medical_turn, _ = make_turn(
+            own_core=core((600, 600)), units=(ranger((604, 600), hp=1),)
+        )
+        medical.choose_actions(medical_turn)
+        self.assertEqual(medical._lightning_plan.anchor.value, "MEDICAL_ANCHOR")  # type: ignore[union-attr]
+        self.assertIsNone(medical_turn.plan.core_action)
+
+        combat = SmartTactic(TacticMemory())
+        combat_turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(ranger((605, 602)),),
+            enemies=(enemy_vanguard((608, 602)),),
+        )
+        combat.choose_actions(combat_turn)
+        self.assertEqual(combat._lightning_plan.anchor.value, "COMBAT_ANCHOR")  # type: ignore[union-attr]
+        self.assertIsNone(combat_turn.plan.core_action)
+
+    def test_response_units_reset_to_orbit_after_contact_is_driven_off(self) -> None:
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        pressured, _ = make_turn(
+            tick=8,
+            own_core=core((600, 600)),
+            units=(ranger((606, 600)),),
+            enemies=(enemy_vanguard((609, 600)),),
+        )
+        tactic.choose_actions(pressured)
+        clear, _ = make_turn(
+            tick=9,
+            own_core=core((600, 600)),
+            units=(ranger((606, 600)),),
+        )
+        summary = tactic.choose_actions(clear)
+        self.assertTrue(any("mid_orbit_patrol" in line for line in summary.decisions))
+        self.assertFalse(any("ranger_eta_support" in line or "ranger_funnel_cover" in line for line in summary.decisions))
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ import os
 import time
 from collections import Counter
 from dataclasses import dataclass, field
+from enum import Enum
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -44,13 +45,14 @@ MODE_LIGHTNING = "lightning"
 MODE_VALUES = {
     MODE_LIGHTNING,
 }
-# 闪电模式：在远离高强度战区的贫瘠坐标方环（挖空方形甜甜圈，500 ≤
-# max(|x|,|y|) ≤ 700）内泊 Core，靠击杀刚复活、无护卫的敌方 Core（每杀 +5
+# 闪电模式：在远离高强度战区的贫瘠坐标方环（挖空方形甜甜圈，400 ≤
+# max(|x|,|y|) ≤ 600）内泊 Core，靠击杀刚复活、无护卫的敌方 Core（每杀 +5
 # 资源）加速发育。战斗单位各自独立路线扫场，不组队。
 # lightning_ring = (inner_radius, outer_radius)，默认方环；可经控制文件覆盖。
-LIGHTNING_DEFAULT_RING = (500, 700)
-# 巡逻半径偏外环（用户：内圈火力猛，Core 不深入）。0.75 → 半径 ≈650。
-LIGHTNING_PATROL_RADIUS_FRACTION = 0.75
+LIGHTNING_DEFAULT_RING = (400, 600)
+# 巡逻半径偏内环（Core 向原点收缩）。0.25 → 半径 ≈450；
+# 由原 0.75(≈550) 再向原点靠近 100 格而来。
+LIGHTNING_PATROL_RADIUS_FRACTION = 0.25
 # 巡逻点沿半径 pr 的方形周界四角轮转；到位（进入 CORE_BEACON_HYSTERESIS 死区）后换下一角。
 LIGHTNING_PATROL_COMPASS = (
     (1, 0), (1, 1), (0, 1), (-1, 1),
@@ -91,7 +93,7 @@ LIGHTNING_HUNT_MAX_DISTANCE = 900
 LIGHTNING_SIGHTING_MAX_AGE = 300
 
 # === 绕银河多层轨道体系 ===
-# Core 轨道（恒星绕银心）绕原点 (0,0) 转 pr≈650 方环，慢；游侠与工人共享中行星轨道
+# Core 轨道（恒星绕银心）绕原点 (0,0) 转 pr≈450 方环，慢；游侠与工人共享中行星轨道
 #   （绕 Core 转圈），不再有开路/远行星轨道。
 # 行星轨道层序(内→外):先锋(近行星,半径 LIGHTNING_NEAR_ORBIT_RADIUS=5，
 #   贴 Core 视野边缘) → 游侠+工人(中行星，单一有序队列，游侠占内层、工人接外层)。见
@@ -131,7 +133,17 @@ LIGHTNING_IDEAL_INTERVAL: dict[UnitType, int] = {
 }
 # 每层轨道最少单位数（铺开领土阶段）：从2提到3，减少外层稀疏盲区。
 LIGHTNING_MIN_UNITS_PER_ORBIT = 3
-# 行星轨道叠格死区（到角多久推下一角）沿用 CORE_BEACON_HYSTERESIS=8。
+# 行星轨道叠格死区（到点位多久推下一点位）沿用 CORE_BEACON_HYSTERESIS=8。
+# === 轨道点位环（替代软斥力，防同层扎堆）===
+# 同层扎堆的根源：目标只有 4 个角，同层 >4 时必有单位共享角点且同节奏推进 → 永远
+# 贴在一起绕圈。改为给每层铺设"点位环"——沿方形周界均匀放 M 个点位（M=next_pow2(层
+# 单位数)，至少 4 个角），每单位按 bit-reversal 序认领一个**互不相同**的角/中点作起点
+# （2 单位→对角、4 单位→四角、5+→补边中点，正好是用户要的"对角落位→逐级细分"）。
+# 单位沿环同向逐点位扫过去；到点死区推进、乱石堆提前跳点位、"目标点位附近有同环友军
+# → 跳过（反扎堆超车）"。点位间距（≈周长/M）远大于 2*ALLY_RADIUS，故一跳之内必找到
+# 空位，追上瞬间变成干净超车而非粘住。战斗移动（拦截/狙击/布防/撤退）priority 完全
+# 不动——点位只是纯巡逻 fallback 目标，敌人进攻时该集结还是集结。
+LIGHTNING_ORBIT_WAYPOINT_ALLY_RADIUS = 3   # 目标点位距同环友军此格内 → 跳过
 # === 鬼打墙逃生（战斗单位/工人轨道巡逻共用）===
 # 卡住检测：最近 ESCAPE_DETECT_WINDOW 个位置的活动范围（max-norm 直径）≤
 # ESCAPE_DETECT_SPAN 视为一次"小范围震荡"命中；连续命中 ESCAPE_TRIGGER_HITS
@@ -150,21 +162,20 @@ LIGHTNING_ESCAPE_DURATION_TICKS = 20  # 延长到 20，给足时间走出复杂�
 # density 用对数曲线：visited 饱和后仍保持区分度，不会被巨大数值淹没。
 LIGHTNING_ESCAPE_EXIT_WEIGHT = 5.0  # 从 3.0 提到 5.0，强化开阔度引导
 LIGHTNING_ESCAPE_VISITED_WEIGHT = 3.0  # 逃生期单格 visited 直接惩罚，替代原 3×3 求和
+# 逃生期朝 goal 的弱偏置：逃生本质是脱出死胡同，仍以"开阔度优先 + 避开走烂区"为绝对
+# 主导(EXIT 5.0/出口、VISITED 3.0)。但在两候选格 exits/visited 相近时，逃生方向常一路
+# 往内圈钻(goal_r=30 的单位逃生后 pos_r 反而 12→3，离轨道越来越远)。加一项"走此格是否
+# 更靠近 goal"的弱打分(权重 1.0，远小于上述两项)：朝 goal 走 -1、背向 +1。脱困后自然把
+# 单位往自己巡逻半径的方环上弯，而不压过脱困主导项。goal 仍是 _lightning_orbit_waypoint
+# 的巡逻点位，"朝 goal"="朝自己轨道"，不破坏逃生的"完全忽略目标"语义(目标方向从未
+# 进入触发/结束判定，只在评分并列时作决胜)。
+LIGHTNING_ESCAPE_GOAL_BIAS_WEIGHT = 1.0
 # 巡逻角障碍密度跳角：目标角周围 5x5（25 格）内已知障碍 > 此值（40%）时，
 # 且单位距角尚远（> 死区*2），视为"角在乱石堆里"，提前推进下一角绕行。
 LIGHTNING_CORNER_OBSTACLE_LIMIT = 10
-# 回防分级——按 visible 敌方战斗单位到我 Core 最近距离 d_min 分档触发反应强度：
-LIGHTNING_DEFENSE_RING_NEAR = 6   # 近环/Core 贴身：全体含工人回防线卡位肉盾
-                                  # （沿用 _core_emergency 6 格阈值；仅用于回防分档，
-                                  #  不是先锋轨道半径——先锋轨道半径用下方
-                                  #  LIGHTNING_NEAR_ORBIT_RADIUS，两者解耦）。
-# 先锋（近行星）轨道半径：贴 Core 视野边缘转。Core 视野=5 是 Manhattan 半径；
-# 轨道是 max-norm 方环，半径 5 的方环对角格 max-norm=5、恰在 Core 视野对角边缘，
-# 正方向格在视野内、对角格贴视野外沿——"贴着 core 视野边缘转、增加保护力"。
+# 先锋近轨是队形的种子半径；实际动态防线在 _lightning_orbit_geometry
+# 中从 Ranger/Worker 的最终 shared lanes 推导，绝不使用固定 NEAR/MID/FAR 边界。
 LIGHTNING_NEAR_ORBIT_RADIUS = 5
-# MID/FAR 起步值待覆盖铺开后按实际近/中/远总展宽调（见 STRATEGY.md §12 验证段）。
-LIGHTNING_DEFENSE_RING_MID = 20   # 中环：全体游侠回防（工人继续经济或就地卡位）。
-LIGHTNING_DEFENSE_RING_FAR = 40   # 外环：仅那个方位附近游侠游击警告，不全撤。
 DEVELOP_TARGET_WORKERS = 12
 DEVELOP_TARGET_VANGUARDS = 3
 DEVELOP_TARGET_RANGERS = 3
@@ -309,6 +320,106 @@ MIGRATION_MIN_ESCORTS = 4
 
 
 @dataclass(frozen=True)
+class CoreAnchorState(str, Enum):
+    """Core movement state for the current Tick, derived from actual defensive work."""
+
+    MOBILE_EVADE = "MOBILE_EVADE"
+    MEDICAL_ANCHOR = "MEDICAL_ANCHOR"
+    COMBAT_ANCHOR = "COMBAT_ANCHOR"
+
+
+@dataclass(frozen=True)
+class OrbitGeometry:
+    """The locally assigned square-orbit geometry, never a fixed defensive ring."""
+
+    r_vanguard: int
+    r_ranger_inner: int
+    r_ranger_outer: int
+    r_sensor_outer: int
+    gap: int
+    r_commit: int
+    r_screen: int
+    lane_by_unit: dict[str, tuple[int, int]]
+
+
+@dataclass(frozen=True)
+class ThreatContact:
+    enemy: UnitView
+    tier: str
+    square_radius: int
+    core_eta: int
+    next_layer_eta: int
+    sector: str
+
+
+@dataclass(frozen=True)
+class Vacancy:
+    ranger_id: UUID
+    sector: str
+    t_home: int
+    t_queue: int
+    t_heal: int
+    t_return: int
+    t_medical_gap: int
+    fire_position: Position
+
+
+@dataclass(frozen=True)
+class ReliefAssignment:
+    ranger_id: UUID
+    vacancy_ranger_id: UUID
+    t_relief: int
+    fire_position: Position
+
+
+@dataclass(frozen=True)
+class FunnelPlan:
+    gate_cell: Position | None = None
+    block_cells: tuple[Position, ...] = ()
+    assignments: tuple[tuple[UUID, Position], ...] = ()
+    shortfall: int = 0
+
+
+@dataclass(frozen=True)
+class ShotIntent:
+    ranger_id: UUID
+    target_id: UUID
+    expected_cell: Position
+    predicted: bool
+
+
+@dataclass
+class ShotLedger:
+    """Per-Tick expected damage accounting shared by every Ranger."""
+
+    assigned_damage: Counter[UUID] = field(default_factory=Counter)
+    intents: list[ShotIntent] = field(default_factory=list)
+
+    def can_assign(self, enemy: UnitView | CoreView, *, predicted: bool) -> bool:
+        # A stationary visible target has an exact HP budget.  A moving target gets
+        # one backup shot because the simultaneous move prediction is uncertain.
+        budget = _effective_hp(enemy) + (1 if predicted else 0)
+        return self.assigned_damage[enemy.id] < budget
+
+    def assign(self, ranger: Ranger, enemy: UnitView | CoreView, cell: Position) -> None:
+        self.assigned_damage[enemy.id] += 1
+        self.intents.append(
+            ShotIntent(ranger.id, enemy.id, cell, cell != enemy.position)
+        )
+
+
+@dataclass
+class LightningPlan:
+    geometry: OrbitGeometry
+    threats: tuple[ThreatContact, ...]
+    vacancies: tuple[Vacancy, ...]
+    reliefs: tuple[ReliefAssignment, ...]
+    funnel: FunnelPlan
+    anchor: CoreAnchorState
+    committed_vanguards: set[UUID] = field(default_factory=set)
+
+
+@dataclass(frozen=True)
 class WorkerGoal:
     kind: str
     position: Position
@@ -371,6 +482,9 @@ class DecisionSummary:
     population: int
     visible_enemies: int
     decisions: tuple[str, ...]
+    # Dispatch is intentionally fixed: expose it to callers without restoring
+    # the retired runtime mode switch.
+    mode: str = MODE_LIGHTNING
 
 
 @dataclass
@@ -440,9 +554,14 @@ class TacticMemory:
     lightning_scout_phase: dict[str, int] = field(default_factory=dict)
     # 先锋 V 字纵深状态机：UUID → {phase: "OUT"/"IN", leg: 0/1, origin: (x,y), target: (x,y)}。
     lightning_vee_state: dict[str, dict] = field(default_factory=dict)
-    # 绕 Core 转的行星轨道（近/中/远）每单位周界角序号(0..3)，到角死区后推进。
-    # 与绕原点的 scout 区分：圆心是 core.position 而非 (0,0)。
+    # 绕 Core 转的行星轨道点位环：每单位相对自己 anchor 的推进步数 offset(0..M-1)，
+    # 到点死区后推进。圆心是 core.position；M=next_pow2(层内单位数) 的动态点位网格。
     lightning_orbit_phase: dict[str, int] = field(default_factory=dict)
+    # 点位环 anchor 缓存：uid → bit-reversal(group_index) 得到的角/中点序号。
+    # offset 只在 anchor 不变时有效；旧系统(4 角 phase 0..3)迁移或网格重排导致
+    # anchor 变化时，_lightning_orbit_waypoint 会据此把 offset 重置回 0（到自己的
+    # anchor 重新锚定），避免存量单位起点撞车、同一点位扎堆。
+    lightning_orbit_anchor: dict[str, int] = field(default_factory=dict)
     # 已废弃(开路轨道删除后运行时无人读写):仅保留 save/load 以兼容旧 memory 文件。
     lightning_breakthrough_phase: dict[str, int] = field(default_factory=dict)
     # 行星轨道 lane 分配缓存：role(str) → UUID → (radius, group_idx)。
@@ -776,8 +895,12 @@ class TacticMemory:
                         "target": (int(target[0]), int(target[1])),
                     }
             memory.lightning_orbit_phase = {
-                str(unit_id): int(phase) % 4
+                str(unit_id): int(phase)
                 for unit_id, phase in data.get("lightning_orbit_phase", {}).items()
+            }
+            memory.lightning_orbit_anchor = {
+                str(unit_id): int(anchor)
+                for unit_id, anchor in data.get("lightning_orbit_anchor", {}).items()
             }
             memory.lightning_breakthrough_phase = {
                 str(unit_id): int(phase) % 4
@@ -979,6 +1102,7 @@ class TacticMemory:
                 for unit_id, state in sorted(self.lightning_vee_state.items())
             },
             "lightning_orbit_phase": dict(sorted(self.lightning_orbit_phase.items())),
+            "lightning_orbit_anchor": dict(sorted(self.lightning_orbit_anchor.items())),
             "lightning_breakthrough_phase": dict(
                 sorted(self.lightning_breakthrough_phase.items())
             ),
@@ -1802,6 +1926,9 @@ class TacticMemory:
                 else 0
             )
             payload = {
+                # Lightning is force-dispatched; report that truth rather than
+                # exposing retired control-file modes in operational telemetry.
+                "mode": MODE_LIGHTNING,
                 "tick": turn.tick,
                 "recall": self.recall,
                 "raid_enabled": self.raid_enabled,
@@ -2508,6 +2635,23 @@ class MovementPlanner:
             for direction in candidates
         )
 
+    def eta(self, unit: Unit, goal: Position, *, avoid: Iterable[Position] = ()) -> int:
+        """Return an occupancy/obstacle-aware movement ETA without reserving a move.
+
+        Dynamic orbital boundaries tell us *which* ring matters; this estimate
+        tells relief and funnel planners whether a unit can physically reach it.
+        """
+        if unit.position == goal:
+            return 0
+        path = _find_path(
+            unit.position,
+            goal,
+            blocked=self._blocked(unit, goal, frozenset(avoid)),
+            threat=self.threat,
+            visited=self.memory.visited,
+        )
+        return len(path) if path else _distance(unit.position, goal)
+
     def flee(self, unit: Unit, threats: Iterable[Position], reason: str) -> bool:
         threat_cells = tuple(threats)
         candidates = sorted(
@@ -2631,6 +2775,9 @@ class SmartTactic:
         self.control_path = control_path or Path(
             os.environ.get("ARENA_HERO_CONTROL_FILE", CONTROL_FILENAME)
         )
+        # Ephemeral Tick plan: it is recomputed from the authoritative Turn and is
+        # deliberately not persisted with long-lived route memory.
+        self._lightning_plan: LightningPlan | None = None
 
     def choose_actions(self, turn: Turn) -> DecisionSummary:
         self.memory.load_control(self.control_path)
@@ -2648,11 +2795,15 @@ class SmartTactic:
         planner = MovementPlanner(turn, self.memory, decisions)
         acted_units: set[UUID] = set()
 
-        # 闪电模式：工人采集 → 治疗 → 战斗单位移动/攻击 → Core 巡逻
+        # Lightning is the only live branch.  Build one shared threat/medical/
+        # funnel plan before actions so Units do not independently undo each other.
+        self._lightning_plan = self._lightning_prepare_plan(turn, planner, decisions)
         incoming_deposit = self._choose_workers(turn, planner, acted_units, decisions)
-        self._choose_healing(turn, planner, acted_units, decisions)
         self._choose_vanguards(turn, planner, acted_units, decisions)
         self._choose_rangers(turn, planner, acted_units, decisions)
+        # Ranger MEDIVAC actions are already reserved above; generic healing serves
+        # the remaining wounded units and patients that arrived at the Core.
+        self._choose_healing(turn, planner, acted_units, decisions)
         self._choose_core(turn, planner, False, incoming_deposit, decisions)
         return self._summary(turn, previous_events, decisions)
 
@@ -3220,62 +3371,14 @@ class SmartTactic:
             else turn.core.position
         )
 
-        # Phase 2: 工人肉盾逻辑 - 检测MID/NEAR威胁
-        near_threat_radius = 6  # NEAR tier
-        mid_threat_radius = 20  # MID tier
-
-        # 统计Core附近的敌方战斗单位距离
-        combat_enemies = [
-            enemy for enemy in turn.visible_enemies
-            if isinstance(enemy, UnitView)
-            and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
-        ]
-
-        nearest_enemy_dist = float('inf')
-        if combat_enemies:
-            nearest_enemy_dist = min(
-                _distance(turn.core.position, enemy.position)
-                for enemy in combat_enemies
-            )
-
-        # NEAR威胁：所有空闲工人立即回防近轨道当肉盾
-        workers_need_defend = (
-            nearest_enemy_dist <= near_threat_radius
-            or nearest_enemy_dist <= mid_threat_radius
-        )
+        # Funnel assignments below replace the former fixed 6/20 all-worker
+        # meatshield rule.  Economy workers are only diverted for a concrete,
+        # ETA-reachable block cell selected from the current threat geometry.
+        self._lightning_execute_funnel_workers(turn, planner, acted_units, decisions)
 
         for worker in sorted(turn.workers, key=_uuid_key):
             if worker.id in acted_units:
                 continue
-
-            # Phase 2: 工人肉盾行为优先级最高
-            if workers_need_defend and not worker.cargo:
-                # 空手工人回到近轨道（r=5）当肉盾
-                near_orbit_radius = 5
-                core_pos = turn.core.position
-
-                # 计算最近的近轨道点
-                current_dist = _distance(worker.position, core_pos)
-                if current_dist > near_orbit_radius + 2:  # 距离近轨道较远
-                    # 向Core方向移动
-                    if planner.toward(worker, core_pos, "worker_meatshield_defend"):
-                        decisions.append(
-                            f"worker:{_short_id(worker.id)} meatshield_defend "
-                            f"enemy_dist={nearest_enemy_dist} moving_to_core"
-                        )
-                        self.memory.decision_totals["worker:meatshield_defend"] += 1
-                        acted_units.add(worker.id)
-                        continue
-                # 已在近轨道附近，保持位置或微调
-                elif current_dist <= near_orbit_radius + 2:
-                    decisions.append(
-                        f"worker:{_short_id(worker.id)} meatshield_hold "
-                        f"enemy_dist={nearest_enemy_dist} pos={worker.position}"
-                    )
-                    self.memory.decision_totals["worker:meatshield_hold"] += 1
-                    acted_units.add(worker.id)
-                    continue
-
             if worker.cargo:
                 self.memory.clear_worker_goal(worker)
                 if worker.position == turn.core.position:
@@ -6186,6 +6289,17 @@ class SmartTactic:
         waypoint = self.memory.lightning_patrol_waypoint
         phase = self.memory.lightning_patrol_phase % 4
 
+        # The waypoint survives process restarts in TacticMemory.  Reproject it
+        # when a live control/default ring changes: otherwise a Core that was
+        # already heading to an old outer corner keeps flying the stale radius
+        # until it arrives.  Choosing the nearest new corner retains its orbit
+        # direction while applying the new geometry on the very next Tick.
+        if waypoint is not None and waypoint not in corners:
+            phase = min(range(4), key=lambda i: _distance(waypoint, corners[i]))
+            waypoint = corners[phase]
+            self.memory.lightning_patrol_phase = phase
+            self.memory.lightning_patrol_waypoint = waypoint
+
         def _in_quadrant(pos: Position, corner: Position) -> bool:
             """判断pos是否在corner所在象限（以原点为中心）。"""
             cx, cy = corner
@@ -6411,36 +6525,22 @@ class SmartTactic:
         return core_id
 
     def _lightning_defense_tier(self, turn: Turn) -> str:
-        """按 visible 敌方战斗单位到我 Core 最近距离分档:NEAR|MID|FAR|NONE。
-
-        替换原 _core_emergency_threats 单层判断,实现"反应强度按敌方深入系统深度而定":
-          NEAR(≤6)  → 全员含工人回防线卡位肉盾(沿用 _core_emergency 阈值)。
-          MID(≤20)  → 全体游侠回防,工人继续经济或就地卡位。
-          FAR(≤40)  → 仅那个方位附近游侠游击警告,不全撤;余者照常绕圈。
-          NONE      → 无人侵,正常绕轨道。
-        _core_recently_damaged 兜底强制 NEAR(已受伤不等再判距)。
-        """
-        if turn.core is None:
-            return "NONE"
-        if self._core_recently_damaged(turn):
+        """Compatibility label over T0-T4, calculated from current lane geometry."""
+        geometry = self._lightning_orbit_geometry(turn)
+        threats = self._lightning_analyze_threats(turn, geometry)
+        if self._core_recently_damaged(turn) or any(contact.tier == "T4" for contact in threats):
             return "NEAR"
-        d_min: int | None = None
-        for enemy in turn.visible_enemies:
-            if not (
-                isinstance(enemy, UnitView)
-                and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
-            ):
-                continue
-            d = _distance(enemy.position, turn.core.position)
-            if d_min is None or d < d_min:
-                d_min = d
-        if d_min is None:
-            return "NONE"
-        if d_min <= LIGHTNING_DEFENSE_RING_NEAR:
-            return "NEAR"
-        if d_min <= LIGHTNING_DEFENSE_RING_MID:
+        if any(contact.tier in {"T3", "T2"} for contact in threats):
             return "MID"
-        if d_min <= LIGHTNING_DEFENSE_RING_FAR:
+        # Compatibility callers still expose NEAR/MID/FAR, but the split is
+        # derived from the final lane gap rather than legacy 6/20/40 rings.
+        if any(
+            contact.tier == "T1"
+            and contact.square_radius <= geometry.r_ranger_outer + geometry.gap
+            for contact in threats
+        ):
+            return "MID"
+        if any(contact.tier == "T1" for contact in threats):
             return "FAR"
         return "NONE"
 
@@ -6899,6 +6999,10 @@ class SmartTactic:
         self.memory.lightning_orbit_lanes[UnitType.RANGER.value] = ranger_lanes
         self.memory.lightning_orbit_lanes[UnitType.WORKER.value] = worker_lanes
         self.memory.lightning_shared_orbit_seq = new_seq
+        # 剪枝阵亡单位在点位环里的残留 phase/anchor（防 memory 无限膨胀）。
+        for stale in [k for k in self.memory.lightning_orbit_phase if k not in merged]:
+            self.memory.lightning_orbit_phase.pop(stale, None)
+            self.memory.lightning_orbit_anchor.pop(stale, None)
 
         logging.info(
             f"[orbit_assign] shared: rk={rk} wk={wk} total={total}, "
@@ -6918,7 +7022,8 @@ class SmartTactic:
         RANGER/WORKER:由 _lightning_assign_shared_middle_lanes 统一分配(游侠占内层、
         工人接外层,共享同一组同心半径),本方法返回该 role 对应的 lanes。
 
-        同一半径的单位通过 group_index 错开 phase(phase_offset = group_index * 4 // group_size)。
+        同一半径的单位通过 group_index 错开——_lightning_orbit_waypoint 按
+        bit-reversal 序把 group_index 映射到点位环上互不相同的角/中点作起点。
         返回 {uid: (radius, group_index)}。缓存到 memory.lightning_orbit_lanes[role.value]。
         """
         if role is UnitType.VANGUARD:
@@ -6929,6 +7034,7 @@ class SmartTactic:
             for dead in [k for k in stored if k not in live]:
                 stored.pop(dead, None)
                 self.memory.lightning_orbit_phase.pop(dead, None)
+                self.memory.lightning_orbit_anchor.pop(dead, None)
 
             radius = LIGHTNING_NEAR_ORBIT_RADIUS
             sorted_units = sorted(units, key=lambda u: _uuid_key(u))
@@ -6943,6 +7049,43 @@ class SmartTactic:
         role_key = role.value
         return self.memory.lightning_orbit_lanes.get(role_key, {})
 
+    @staticmethod
+    def _bit_reverse(value: int, bits: int) -> int:
+        """把 value 的低 bits 位逐位反转。bit-reversal 序 = 最远优先(van der Corput)。"""
+        result = 0
+        for _ in range(bits):
+            result = (result << 1) | (value & 1)
+            value >>= 1
+        return result
+
+    @staticmethod
+    def _lightning_ring_waypoints(
+        center: Position, radius: int, count: int
+    ) -> tuple[Position, ...]:
+        """方形周界上 count 个均匀点位，index 0 在右下角，按原 corners 角序绕行。
+
+        点位沿周长(8r)均匀铺设：index k 在弧长 k*(8r/count) 处。count=4 → 四角
+        (右下→右上→左上→左下，与原 _lightning_orbit_waypoint 的 corners 一致)；
+        count=8 → 四角+四边中点；count=16 → 再逐级细分。index 0 与 count/2 互为对角。
+        """
+        if count <= 0:
+            return ()
+        cx, cy = center
+        radius = max(1, radius)
+        perimeter = 8 * radius
+        pts: list[Position] = []
+        for k in range(count):
+            arc = k * perimeter // count  # 0..8r-1，自右下角 (r,r) 起逆时针绕方环
+            if arc < 2 * radius:
+                pts.append((cx + radius, cy + radius - arc))
+            elif arc < 4 * radius:
+                pts.append((cx + radius - (arc - 2 * radius), cy - radius))
+            elif arc < 6 * radius:
+                pts.append((cx - radius, cy - radius + (arc - 4 * radius)))
+            else:
+                pts.append((cx - radius + (arc - 6 * radius), cy + radius))
+        return tuple(pts)
+
     def _lightning_orbit_waypoint(
         self,
         turn: Turn,
@@ -6950,10 +7093,12 @@ class SmartTactic:
         role: UnitType,
         lane: int | None = None,
     ) -> Position | None:
-        """绕 Core 转的行星轨道下一目标点。外圈优先分配，同半径单位phase错开。
+        """绕 Core 转的行星轨道下一目标点：点位环 + 反扎堆跳过。
 
-        圆心 = core.position。半径由 _lightning_assign_orbit_lanes 分配。
-        同一半径的多个单位通过 phase_offset 错开（0/1/2/3 对应四个角）。
+        圆心 = core.position。半径由 _lightning_assign_orbit_lanes 分配。同一半径的
+        N 个单位铺 M=max(4, next_pow2(N)) 个均匀点位，每单位按 bit-reversal 序认领一个
+        互不相同的角/中点作 anchor（2 单位→对角、4→四角、5+→补边中点），并沿环同向
+        逐点位扫过去。到点死区推进、乱石堆提前跳点位、目标点位附近有同环友军→跳过。
         """
         core = turn.core
         if core is None:
@@ -6974,52 +7119,89 @@ class SmartTactic:
 
         radius, group_index = lanes[uid]
 
-        # 计算该半径上的总单位数（用于phase_offset）
-        units_at_radius = sum(1 for (r, _) in lanes.values() if r == radius)
-        phase_offset = (group_index * 4) // max(1, units_at_radius)
+        # 点位环：同半径 N 个单位铺 M=max(4, next_pow2(N)) 个均匀点位。
+        # (旧实现只有 4 个角，同层 >4 时 phase_offset 同余 -> 必共享角点、永远贴圈。)
+        N = max(1, sum(1 for (r, _) in lanes.values() if r == radius))
+        M = max(4, 1 << (N - 1).bit_length())
+        bits = M.bit_length() - 1
+        anchor = self._bit_reverse(group_index, bits) % M
+        waypoints = self._lightning_ring_waypoints(core.position, radius, M)
 
-        # 生成四角目标
-        cx, cy = core.position
-        corners = (
-            (cx + radius, cy + radius),
-            (cx + radius, cy - radius),
-            (cx - radius, cy - radius),
-            (cx - radius, cy + radius),
-        )
+        # offset = 相对 anchor 的推进步数(0..M-1)，持久化。anchor 变化(旧系统迁移、
+        # 网格重排/人数变化)时 offset 失去意义 → 重置回 0，让单位回自己 anchor 重新
+        # 锚定，避免存量单位起点撞车、同一点位扎堆。
+        offset = self.memory.lightning_orbit_phase.get(uid, 0) % M
+        if self.memory.lightning_orbit_anchor.get(uid) != anchor:
+            offset = 0
+            self.memory.lightning_orbit_anchor[uid] = anchor
+        target = waypoints[(anchor + offset) % M]
 
-        # 读取/初始化 base_phase
-        base_phase = self.memory.lightning_orbit_phase.get(uid)
-        if base_phase is None:
-            base_phase = self.memory.lightning_patrol_phase % 4
-            self.memory.lightning_orbit_phase[uid] = base_phase
+        # 同环友军(反扎堆依据)：同半径的其他单位当前位置 + 当前目标点位序号。
+        # VANGUARD 用单 role lanes；RANGER/WORKER 用合并 lanes，两层都从 lanes 按 radius
+        # 匹配。**只统计"正在赶路"的友军**（距自己目标点位 > reach，本 tick 不会推进）：
+        # 已停驻(到位即走)的友军不占用点位、不挡道——否则满员环(N=M)会死锁：每个单位
+        # 都停在各自点位等下一个空位、而空位又被停驻单位占着，谁也无法推进、永远驻停。
+        reach = max(2, min(CORE_BEACON_HYSTERESIS, radius // 2))
+        en_route: dict[str, tuple[int, Position]] = {}
+        for u in turn.units:
+            if u.id == unit.id:
+                continue
+            lane = lanes.get(str(u.id))
+            if lane is None or lane[0] != radius:
+                continue
+            uid2 = str(u.id)
+            o_idx = ((self._bit_reverse(lane[1], bits) % M)
+                     + (self.memory.lightning_orbit_phase.get(uid2, 0) % M)) % M
+            if _distance(u.position, waypoints[o_idx]) > reach:
+                en_route[uid2] = (o_idx, u.position)
+        claimed = {o_idx for (o_idx, _) in en_route.values()}
+        same_ring_blockers = frozenset(pos for (_, pos) in en_route.values())
 
-        target = corners[(base_phase + phase_offset) % 4]
+        # 逐点位推进/跳过：到达死区→推进；乱石堆→提前跳；同环友军占位→跳过；
+        # 目标点位已被同环其他单位占用→跳过；访问饱和→提前放弃。循环上限取 M（点位
+        # 数）保证只要存在空位就一定能跳过到（同环最多 N-1 个单位占走 N-1 个点位，M≥N
+        # 恒有 ≥1 个空位）。点位间距(≈周长/M) 远大于 2*ALLY_RADIUS，追上瞬间干净超车。
+        for _ in range(M):
+            advanced = False
+            if _distance(unit.position, target) <= reach:
+                offset = (offset + 1) % M
+                advanced = True
+            elif (
+                _distance(unit.position, target) > CORE_BEACON_HYSTERESIS * 2
+                and self._lightning_corner_obstructed(target)
+            ):
+                offset = (offset + 1) % M
+                advanced = True
+            elif (
+                _distance(unit.position, target) < CORE_BEACON_HYSTERESIS * 2
+                and self.memory.visited.get(target, 0) > 10
+                and self._lightning_corner_obstructed(target)
+            ):
+                offset = (offset + 1) % M
+                advanced = True
+            elif (
+                any(
+                    _distance(target, fpos) <= LIGHTNING_ORBIT_WAYPOINT_ALLY_RADIUS
+                    for fpos in same_ring_blockers
+                )
+                or (anchor + offset) % M in claimed
+            ):
+                offset = (offset + 1) % M
+                advanced = True
+            if not advanced:
+                break
+            target = waypoints[(anchor + offset) % M]
 
-        # 动态跳角:目标角尚远却已知埋在乱石堆里 → 提前推下一角绕行。
-        if (
-            _distance(unit.position, target) > CORE_BEACON_HYSTERESIS * 2
-            and self._lightning_corner_obstructed(target)
-        ):
-            base_phase = (base_phase + 1) % 4
-            self.memory.lightning_orbit_phase[uid] = base_phase
-            target = corners[(base_phase + phase_offset) % 4]
+        self.memory.lightning_orbit_phase[uid] = offset
 
-        if _distance(unit.position, target) <= CORE_BEACON_HYSTERESIS:
-            base_phase = (base_phase + 1) % 4
-            self.memory.lightning_orbit_phase[uid] = base_phase
-            target = corners[(base_phase + phase_offset) % 4]
-
-        # 新增：目标区域访问饱和时强制跳角（提前放弃不可达目标）
-        elif (
-            _distance(unit.position, target) < CORE_BEACON_HYSTERESIS * 2
-            and self.memory.visited.get(target, 0) > 10
-            and self._lightning_corner_obstructed(target)
-        ):
-            base_phase = (base_phase + 1) % 4
-            self.memory.lightning_orbit_phase[uid] = base_phase
-            target = corners[(base_phase + phase_offset) % 4]
-
-        target = self._lightning_clamp_to_donut(target)
+        # 不对方环 clamp:target 此刻是“core 相对角”(cx±radius,cy±radius),
+        # 而 _lightning_clamp_to_donut 是按“相对原点”的 max-norm 投影。当 core
+        # 还在迁移途中、停在方环边缘(如 max-norm>outer_r)时,这个相对角会被
+        # 当成绝对坐标硬拽回 [inner,outer] 方环——目标点和 core 脱钩,外层角色
+        # 一窝蜂冲向方环边缘,core 反被甩在外侧孤立。行星轨道本就应全程跟着
+        # core,外层离 core 的距离已由 lane 半径(5/10/15…)控制,无需地图方环
+        # 二次约束。见 _lightning_orbit_waypoint 注释。
+        # (原: target = self._lightning_clamp_to_donut(target))
 
         if target == unit.position:
             return None
@@ -7115,11 +7297,18 @@ class SmartTactic:
                     self.memory.visited.get(destination, 0)
                     * LIGHTNING_ESCAPE_VISITED_WEIGHT
                 )
+                # 朝 goal 的弱偏置：走此格后距 goal 的距离 vs 当前距 goal 的距离。
+                # 朝 goal 走 → goal_delta<0(奖励)；背向 → >0(轻罚)。权重 1.0，只在
+                # exits/visited 并列时起决胜，把脱困后的单位轻轻往自己巡逻半径弯，
+                # 防止逃生一路往内圈钻。goal 是巡逻点位(在轨道方环上)，故"朝 goal"
+                # 即"朝轨道"，不改变"逃生以开阔度/visited 为主导"的语义。
+                goal_delta = _distance(destination, goal) - _distance(unit.position, goal)
                 score = (
                     -exits * LIGHTNING_ESCAPE_EXIT_WEIGHT
                     + visited_penalty
                     + planner.threat.get(destination, 0) * 4.0
                     + heading_penalty
+                    + goal_delta * LIGHTNING_ESCAPE_GOAL_BIAS_WEIGHT
                 )
             else:
                 # 方向惯性:掉头反向重罚,保持当前方向无罚,转弯轻罚。单位 1格/tick
@@ -10049,41 +10238,295 @@ class SmartTactic:
             if turn.core is not None and _distance(ranger.position, turn.core.position) > 3:
                 planner.toward(ranger, turn.core.position, "ranger_screen")
 
-    def _choose_vanguards_lightning(
-        self,
-        turn: Turn,
-        planner: MovementPlanner,
-        acted_units: set[UUID],
-        decisions: list[str],
-    ) -> None:
-        """闪电模式先锋：近行星轨道绕 Core 转圈护卫，猎杀无护卫敌方 Core。
+    def _lightning_orbit_geometry(self, turn: Turn) -> OrbitGeometry:
+        """Derive every defensive boundary from the final shared lane assignment."""
+        lanes = self._lightning_assign_shared_middle_lanes(turn)
+        ranger_lanes = [lane[0] for uid, lane in lanes.items()
+                        if uid in {str(r.id) for r in turn.rangers}]
+        all_lanes = [lane[0] for lane in lanes.values()]
+        # The shared Ranger/Worker lanes are the source of truth.  The Vanguard
+        # orbit sits one lane gap inside the first shared lane, so it expands or
+        # contracts with the assigned formation rather than a defense constant.
+        provisional_gap = max(1, LIGHTNING_ORBIT_LANE_GAP_RADIUS[UnitType.RANGER])
+        first_lane = min(all_lanes, default=LIGHTNING_NEAR_ORBIT_RADIUS + provisional_gap)
+        r_vanguard = max(1, first_lane - provisional_gap)
+        radii = sorted(set([r_vanguard, *all_lanes]))
+        gaps = [right - left for left, right in zip(radii, radii[1:]) if right > left]
+        gap = min(gaps) if gaps else provisional_gap
+        r_ranger_inner = min(ranger_lanes, default=r_vanguard + gap)
+        r_ranger_outer = max(ranger_lanes, default=r_ranger_inner)
+        occupied_outer = max(all_lanes, default=r_ranger_outer)
+        # Keep the threat envelopes strictly ordered: committed melee space, an
+        # inner screen, the complete Ranger lane, then sensor warning space.
+        r_commit = max(r_vanguard + 1, r_ranger_inner - max(1, gap // 2))
+        r_screen = max(r_commit + 1, r_ranger_inner)
+        r_sensor_outer = max(occupied_outer, r_ranger_outer + gap * (2 + math.isqrt(max(1, len(lanes) + len(turn.vanguards)))))
+        return OrbitGeometry(r_vanguard, r_ranger_inner, r_ranger_outer,
+                             r_sensor_outer, gap, r_commit, r_screen, lanes)
 
-        轨迹改造（绕银河体系）：先锋是 Core 的"近行星"——绕 core.position 转方环，
-        不再 V 字外插。无猎杀/无近中环警报时全体在近轨 patrol（半径
-        LIGHTNING_NEAR_ORBIT_RADIUS=5，贴 Core 视野边缘转、增加保护力）；多先锋按 UUID 序
-        错开 phase 实现第一/第三象限对位。仅 NEAR/MID 勤王或猎杀可打目标时离轨。
-        """
+    @staticmethod
+    def _lightning_sector(origin: Position, position: Position) -> str:
+        dx, dy = position[0] - origin[0], position[1] - origin[1]
+        if abs(dx) >= abs(dy):
+            return "E" if dx >= 0 else "W"
+        return "S" if dy >= 0 else "N"
+
+    @staticmethod
+    def _lightning_square_radius(origin: Position, position: Position) -> int:
+        return max(abs(position[0] - origin[0]), abs(position[1] - origin[1]))
+
+    def _lightning_analyze_threats(self, turn: Turn, geometry: OrbitGeometry) -> tuple[ThreatContact, ...]:
+        if turn.core is None:
+            return ()
+        contacts: list[ThreatContact] = []
+        for enemy in turn.visible_enemies:
+            if not isinstance(enemy, UnitView) or enemy.unit_type not in {UnitType.VANGUARD, UnitType.RANGER}:
+                continue
+            radius = self._lightning_square_radius(turn.core.position, enemy.position)
+            attack_range = 1 if enemy.unit_type is UnitType.VANGUARD else 3
+            core_eta = max(0, _distance(enemy.position, turn.core.position) - attack_range)
+            if core_eta <= 1 or radius <= geometry.r_commit:
+                tier, next_boundary = "T4", 0
+            elif radius <= geometry.r_screen:
+                tier, next_boundary = "T3", geometry.r_commit
+            elif radius <= geometry.r_ranger_outer:
+                tier, next_boundary = "T2", geometry.r_screen
+            elif radius <= geometry.r_sensor_outer:
+                tier, next_boundary = "T1", geometry.r_ranger_outer
+            else:
+                tier, next_boundary = "T0", geometry.r_sensor_outer
+            # r_inf measures ring penetration; reducing it one step per move is
+            # the conservative ETA to the next defensive layer.
+            next_layer_eta = max(0, radius - next_boundary)
+            contacts.append(ThreatContact(
+                enemy, tier, radius, core_eta, next_layer_eta,
+                self._lightning_sector(turn.core.position, enemy.position),
+            ))
+        return tuple(sorted(contacts, key=lambda c: (c.core_eta, c.square_radius, _uuid_key(c.enemy))))
+
+    def _lightning_sector_fire_position(self, core: Position, sector: str, radius: int) -> Position:
+        offsets = {"E": (radius, 0), "W": (-radius, 0), "N": (0, -radius), "S": (0, radius)}
+        dx, dy = offsets[sector]
+        return core[0] + dx, core[1] + dy
+
+    def _lightning_plan_triage(
+        self, turn: Turn, planner: MovementPlanner, geometry: OrbitGeometry,
+        threats: tuple[ThreatContact, ...],
+    ) -> tuple[tuple[Vacancy, ...], tuple[ReliefAssignment, ...]]:
+        if turn.core is None:
+            return (), ()
+        # The vacancy lasts until the patient can queue at home, heal, and return
+        # to its sector.  A relief must beat both that medical gap and the next
+        # layer ETA of the attackers; Manhattan alone misses detours around walls.
+        pressure = min(
+            (max(1, contact.next_layer_eta) for contact in threats if contact.tier in {"T3", "T4"}),
+            default=10 ** 6,
+        )
+        core_queue = max(0, sum(unit.position == turn.core.position for unit in turn.units) - 1)
+        vacancies: list[Vacancy] = []
+        for ranger in turn.rangers:
+            if ranger.hp != 1:
+                continue
+            sector = self._lightning_sector(turn.core.position, ranger.position)
+            fire = self._lightning_sector_fire_position(turn.core.position, sector, geometry.r_ranger_inner)
+            t_home = planner.eta(ranger, turn.core.position)
+            t_queue = core_queue
+            t_heal = 1
+            t_return = _distance(turn.core.position, fire)
+            vacancies.append(Vacancy(
+                ranger.id, sector, t_home, t_queue, t_heal, t_return,
+                t_home + t_queue + t_heal + t_return, fire,
+            ))
+        healthy = [r for r in turn.rangers if r.hp >= 2]
+        reliefs: list[ReliefAssignment] = []
+        reserved: set[UUID] = set()
+        for vacancy in sorted(vacancies, key=lambda v: (v.t_medical_gap, v.ranger_id.bytes)):
+            candidates: list[tuple[int, bytes, Ranger]] = []
+            for ranger in healthy:
+                if ranger.id in reserved:
+                    continue
+                own_radius = self._lightning_square_radius(turn.core.position, ranger.position)
+                own_sector = self._lightning_sector(turn.core.position, ranger.position)
+                # Do not peel the final committed inner guard from another sector.
+                if own_sector != vacancy.sector and own_radius <= geometry.r_commit:
+                    continue
+                eta = planner.eta(ranger, vacancy.fire_position)
+                candidates.append((eta, ranger.id.bytes, ranger))
+            if not candidates:
+                continue
+            eta, _, ranger = min(candidates)
+            if eta < vacancy.t_medical_gap and eta <= pressure:
+                reserved.add(ranger.id)
+                reliefs.append(ReliefAssignment(ranger.id, vacancy.ranger_id, eta, vacancy.fire_position))
+        return tuple(vacancies), tuple(reliefs)
+
+    def _lightning_plan_funnel(self, turn: Turn, planner: MovementPlanner,
+                               geometry: OrbitGeometry, threats: tuple[ThreatContact, ...]) -> FunnelPlan:
+        if turn.core is None or not any(c.tier in {"T3", "T4"} for c in threats):
+            return FunnelPlan()
+        core = turn.core.position
+        candidates: list[Position] = []
+        for contact in threats:
+            if contact.tier not in {"T3", "T4"}:
+                continue
+            for direction in DIRECTION_ORDER:
+                cell = _destination(contact.enemy.position, direction)
+                if cell in planner.obstacles or _distance(cell, core) >= _distance(contact.enemy.position, core):
+                    continue
+                if cell not in candidates:
+                    candidates.append(cell)
+        candidates = [cell for cell in candidates if cell not in planner.obstacles and _distance(cell, core) > 0]
+        if not candidates:
+            return FunnelPlan()
+        ready_rangers = [r for r in turn.rangers if r.hp >= 2]
+        def covered(cell: Position) -> int:
+            return sum(_is_legal_ranger_shot(r.position, cell, planner.obstacles) for r in ready_rangers)
+        # A gate is deliberately left open only when a healthy Ranger can cover it.
+        # Without that shot, keeping an arbitrary path open is worse than closing
+        # every immediately reachable Core route with the available Workers.
+        coverage = {cell: covered(cell) for cell in candidates}
+        gate = max(candidates, key=lambda c: (coverage[c], -_distance(c, core), c))
+        if coverage[gate] <= 0:
+            gate = None
+            blocks = tuple(candidates)
+        else:
+            blocks = tuple(cell for cell in candidates if cell != gate)
+        worker_pool = [w for w in turn.workers if not w.cargo]
+        if any(c.tier == "T4" for c in threats):
+            worker_pool = list(turn.workers)
+        assignments: list[tuple[UUID, Position]] = []
+        available = list(worker_pool)
+        for cell in blocks:
+            choices = [(planner.eta(worker, cell), worker.id.bytes, worker)
+                       for worker in available]
+            if not choices:
+                break
+            eta, _, worker = min(choices)
+            if eta <= max(1, min(c.core_eta for c in threats if c.tier in {"T3", "T4"})):
+                assignments.append((worker.id, cell))
+                available.remove(worker)
+        return FunnelPlan(gate, blocks, tuple(assignments), max(0, len(blocks) - len(assignments)))
+
+    def _lightning_anchor_state(self, turn: Turn, threats: tuple[ThreatContact, ...],
+                                vacancies: tuple[Vacancy, ...], funnel: FunnelPlan) -> CoreAnchorState:
+        if any(c.tier in {"T3", "T4"} or c.core_eta <= 2 for c in threats) or funnel.block_cells or funnel.shortfall:
+            return CoreAnchorState.COMBAT_ANCHOR
+        # A Core step takes four Ticks; do not strand a Ranger which will arrive during it.
+        if any(v.t_home <= 4 for v in vacancies):
+            return CoreAnchorState.MEDICAL_ANCHOR
+        return CoreAnchorState.MOBILE_EVADE
+
+    def _lightning_prepare_plan(self, turn: Turn, planner: MovementPlanner, decisions: list[str]) -> LightningPlan:
+        geometry = self._lightning_orbit_geometry(turn)
+        threats = self._lightning_analyze_threats(turn, geometry)
+        vacancies, reliefs = self._lightning_plan_triage(turn, planner, geometry, threats)
+        funnel = self._lightning_plan_funnel(turn, planner, geometry, threats)
+        anchor = self._lightning_anchor_state(turn, threats, vacancies, funnel)
+        decisions.append(f"orbital geometry v={geometry.r_vanguard} r={geometry.r_ranger_inner}-{geometry.r_ranger_outer} sensor={geometry.r_sensor_outer} commit={geometry.r_commit} screen={geometry.r_screen} threats={','.join(c.tier for c in threats) or 'T0'} anchor={anchor.value}")
+        self.memory.decision_totals[f"lightning:anchor:{anchor.value}"] += 1
+        return LightningPlan(geometry, threats, vacancies, reliefs, funnel, anchor)
+
+    def _lightning_execute_funnel_workers(self, turn: Turn, planner: MovementPlanner,
+                                          acted_units: set[UUID], decisions: list[str]) -> None:
+        plan = self._lightning_plan
+        if plan is None:
+            return
+        for worker_id, cell in plan.funnel.assignments:
+            worker = next((w for w in turn.workers if w.id == worker_id), None)
+            if worker is None or worker.id in acted_units:
+                continue
+            if worker.position != cell and not planner.toward(worker, cell, "worker_funnel_block"):
+                worker.wait()
+            acted_units.add(worker.id)
+            decisions.append(f"worker:{_short_id(worker.id)} funnel_block cell={cell} gate={plan.funnel.gate_cell}")
+            self.memory.decision_totals["worker:funnel_block"] += 1
+
+    def _lightning_safe_firing_position(self, turn: Turn, planner: MovementPlanner,
+                                        ranger: Ranger, target: Position, sector: str,
+                                        gate: Position | None) -> Position:
+        # Candidate firing squares preserve a 2-3 cell ray, avoid melee adjacency,
+        # visible enemy Ranger rays, and select cells which allied Rangers can cross-cover.
+        candidates: list[Position] = []
+        focus = gate or target
+        for dx, dy in RANGER_LINE_DELTAS:
+            for distance in (2, 3):
+                cell = (focus[0] - dx * distance, focus[1] - dy * distance)
+                if cell in planner.obstacles or cell in planner.enemy_cells:
+                    continue
+                if any(_distance(cell, enemy.position) <= 1 for enemy in turn.visible_enemies
+                       if isinstance(enemy, UnitView) and enemy.unit_type is UnitType.VANGUARD):
+                    continue
+                if any(_is_legal_ranger_shot(enemy.position, cell, planner.obstacles)
+                       for enemy in turn.visible_enemies
+                       if isinstance(enemy, UnitView) and enemy.unit_type is UnitType.RANGER):
+                    continue
+                support = sum(_is_legal_ranger_shot(other.position, focus, planner.obstacles)
+                              for other in turn.rangers if other.id != ranger.id)
+                candidates.append((cell, support))
+        if not candidates:
+            return self._lightning_sector_fire_position(turn.core.position, sector, self._lightning_plan.geometry.r_ranger_inner)  # type: ignore[union-attr]
+        return min(candidates, key=lambda item: (_distance(ranger.position, item[0]), -item[1], item[0]))[0]
+
+    def _choose_vanguards_lightning(
+        self, turn: Turn, planner: MovementPlanner, acted_units: set[UUID], decisions: list[str],
+    ) -> None:
         if turn.core is None:
             return
-        # 回防分级：NEAR/MID 才全员回防；FAR 仅局部(由游侠处理),先锋照常近轨。
-        tier = self._lightning_defense_tier(turn)
-        if tier in ("NEAR", "MID"):
-            self._choose_vanguards_recall(turn, planner, acted_units, decisions)
-            return
+        plan = self._lightning_plan or self._lightning_prepare_plan(turn, planner, decisions)
+        urgent = [c for c in plan.threats if c.tier in {"T3", "T4"}]
         for vanguard in sorted(turn.vanguards, key=_uuid_key):
             if vanguard.id in acted_units:
                 continue
+            sweep = self._sweep_targets(vanguard, turn)
+            if sweep is not None:
+                vanguard.sweep(sweep)
+                decisions.append(f"vanguard:{_short_id(vanguard.id)} sweep priority=adjacent")
+                self.memory.decision_totals["lightning:vanguard_sweep"] += 1
+                acted_units.add(vanguard.id)
+                continue
+            if urgent:
+                contact = min(urgent, key=lambda c: (_distance(vanguard.position, c.enemy.position), c.core_eta, c.enemy.id.bytes))
+                own_sector = self._lightning_sector(turn.core.position, vanguard.position)
+                sector_has_guard = any(
+                    other.id != vanguard.id
+                    and self._lightning_sector(turn.core.position, other.position) == contact.sector
+                    for other in turn.vanguards
+                )
+                # Keep an opposite patrol in place whenever its own sector has
+                # not been abandoned; cross-sector response is the fallback.
+                if own_sector != contact.sector and sector_has_guard:
+                    orbit = self._lightning_orbit_waypoint(turn, vanguard, UnitType.VANGUARD)
+                    if orbit is not None and not self._lightning_step_toward(turn, planner, vanguard, orbit, "vanguard_hold_opposite_sector"):
+                        vanguard.wait()
+                    decisions.append(f"vanguard:{_short_id(vanguard.id)} hold sector={own_sector} threat_sector={contact.sector}")
+                    acted_units.add(vanguard.id)
+                    continue
+                # COMMITTED Vanguards move to the enemy-Core intercept/funnel, never
+                # retreat behind Core while the contact can still breach.
+                goal = plan.funnel.gate_cell or self._lightning_sector_fire_position(turn.core.position, contact.sector, plan.geometry.r_vanguard)
+                if _distance(contact.enemy.position, turn.core.position) <= plan.geometry.r_commit:
+                    plan.committed_vanguards.add(vanguard.id)
+                    if _distance(vanguard.position, goal) > 0:
+                        self._lightning_step_toward(turn, planner, vanguard, goal, "vanguard_committed_intercept")
+                    else:
+                        vanguard.wait()
+                    decisions.append(f"vanguard:{_short_id(vanguard.id)} COMMITTED sector={contact.sector} goal={goal}")
+                else:
+                    self._lightning_step_toward(turn, planner, vanguard, goal, "vanguard_screen_intercept")
+                acted_units.add(vanguard.id)
+                continue
+            # With no inner-orbit emergency, retain the lightning branch's
+            # existing opportunistic Core hunt. This is deliberately below
+            # the T3/T4 intercept gate so a remote claim cannot drain the
+            # sector that currently has to screen the home Core.
             uid = str(vanguard.id)
             core_id = self._lightning_claim_for(uid)
             target_position: Position | None = None
             visible_core: CoreView | None = None
             if core_id is not None:
-                target_position, visible_core = self._lightning_target_position(
-                    turn, core_id
-                )
+                target_position, visible_core = self._lightning_target_position(turn, core_id)
                 if self._lightning_target_attended(turn, target_position) or (
-                    visible_core is None
-                    and self._lightning_target_crowded(target_position)
+                    visible_core is None and self._lightning_target_crowded(target_position)
                 ):
                     self._lightning_blacklist_core(core_id)
                     core_id = None
@@ -10092,224 +10535,111 @@ class SmartTactic:
             if core_id is None:
                 core_id = self._lightning_acquire_target(turn, vanguard)
                 if core_id is not None:
-                    target_position, visible_core = self._lightning_target_position(
-                        turn, core_id
-                    )
+                    target_position, visible_core = self._lightning_target_position(turn, core_id)
             if core_id is not None and target_position is not None:
-                # 兵种细分：先锋近战。SKIP(有游侠守卫) → 拉黑回避;
-                # CHICKEN(无护卫)与 PRESS(只先锋守卫) → 先锋照常进(近战对先锋公平,
-                #   guard_cells 把守卫格当障碍让先锋侧面包抄,即"绕开 distant guard
-                #   保留 claim"的旧行为)。先锋不掺和游击——那是游侠的事。
-                assessment = self._lightning_engage_assessment(turn, target_position)
-                if assessment == "SKIP":
+                if self._lightning_engage_assessment(turn, target_position) == "SKIP":
                     self._lightning_blacklist_core(core_id)
                     core_id = None
                     target_position = None
                     visible_core = None
             if core_id is not None and target_position is not None:
-                direction = next(
-                    (
-                        candidate
-                        for candidate in DIRECTION_ORDER
-                        if _destination(vanguard.position, candidate)
-                        == target_position
-                    ),
-                    None,
-                )
+                direction = next((candidate for candidate in DIRECTION_ORDER
+                                  if _destination(vanguard.position, candidate) == target_position), None)
                 if visible_core is not None and direction is not None:
                     vanguard.sweep(direction)
-                    decisions.append(
-                        f"lightning:{_short_id(vanguard.id)} sweep "
-                        f"target={target_position}"
-                    )
+                    decisions.append(f"lightning:{_short_id(vanguard.id)} sweep target={target_position}")
                     self.memory.decision_totals["lightning:vanguard_sweep"] += 1
-                else:
-                    # 朝目标走。守卫格在威胁图里已标记，step_toward 会自然绕开。
-                    # 不再用 planner.toward(A*)，改用 _lightning_step_toward 防横跳。
-                    if not self._lightning_step_toward(
-                        turn, planner, vanguard, target_position, "lightning_hunt"
-                    ):
-                        vanguard.wait()
+                elif not self._lightning_step_toward(turn, planner, vanguard, target_position, "lightning_hunt"):
+                    vanguard.wait()
                 acted_units.add(vanguard.id)
                 continue
-            # 无猎杀/不进猎杀 → 绕 Core 近行星轨道转圈护卫（不走 A*，Core 风格四邻打分）。
-            # 局部威胁检测：先锋周围有敌方战斗单位且无猎杀目标时，撤向 Core 避战。
             if self._lightning_has_local_threat(turn, vanguard):
-                retreat_target = turn.core.position
-                if not self._lightning_step_toward(
-                    turn, planner, vanguard, retreat_target, "lightning_retreat_local_threat"
-                ):
+                if not self._lightning_step_toward(turn, planner, vanguard, turn.core.position, "lightning_retreat_local_threat"):
                     vanguard.wait()
                 acted_units.add(vanguard.id)
                 continue
             orbit = self._lightning_orbit_waypoint(turn, vanguard, UnitType.VANGUARD)
-            if orbit is not None and not self._lightning_step_toward(
-                turn, planner, vanguard, orbit, "lightning_vanguard_orbit"
-            ):
+            if orbit is not None and not self._lightning_step_toward(turn, planner, vanguard, orbit, "lightning_vanguard_orbit"):
                 vanguard.wait()
             acted_units.add(vanguard.id)
 
     def _choose_rangers_lightning(
-        self,
-        turn: Turn,
-        planner: MovementPlanner,
-        acted_units: set[UUID],
-        decisions: list[str],
+        self, turn: Turn, planner: MovementPlanner, acted_units: set[UUID], decisions: list[str],
     ) -> None:
-        """闪电模式游侠：四层轨道职责 + 分层防御。
-
-        四层轨道职责：
-        - 开路轨道（4游侠，绕原点）：探索资源 + 侦察无守卫Core + 选择性交战
-          - 只有1v1先锋时游击（利用射程优势）
-          - 见游侠/多敌立即绕路
-          - 不能离开开路轨道范围
-        - 近轨道（先锋，r=5）：绝对不离开，守卫Core内层
-        - 中轨道（剩余游侠）：正常巡逻 + 分层应敌
-        - 远轨道（工人）：可离开采集，防御时回近轨道当肉盾
-
-        分层防御（按敌方深入程度）：
-        - 敌入远轨道 → 狙击驱离（不贴脸，最远追到外轨道边界）
-        - 敌入中轨道 → 集结所有中轨游侠围攻，工人回近轨道当肉盾
-        - 敌入近轨道 → 游侠退入工人包围圈阻击 + 召回开路游侠勤王（沿途绕过敌人）
-
-        总原则：
-        - 非必要不进攻（除非压倒性优势）
-        - 资源靠采集，不掠夺
-        - 禁止千里追击
-        """
         if turn.core is None:
             return
-
-        # Step 1: 威胁分级
-        tier = self._lightning_defense_tier(turn)
-
-        # Step 2: NEAR威胁 → 所有游侠回防（召回开路游侠勤王）
-        if tier == "NEAR":
-            for ranger in sorted(turn.rangers, key=_uuid_key):
-                if ranger.id in acted_units:
-                    continue
-                # 游侠退入工人包围圈阻击（近轨道r=5附近）
-                retreat_target = turn.core.position
-                if not self._lightning_step_toward(
-                    turn, planner, ranger, retreat_target, "lightning_defend_NEAR"
-                ):
-                    ranger.wait()
-                decisions.append(
-                    f"ranger:{_short_id(ranger.id)} defend_NEAR retreat_to_core"
-                )
-                self.memory.decision_totals["ranger:defend_NEAR"] += 1
-                acted_units.add(ranger.id)
-            return
-
-        # Step 3: MID威胁 → 集结所有中轨游侠围攻
-        if tier == "MID":
-            nearest_threat = self._lightning_find_nearest_threat(turn)
-            if nearest_threat is None:
-                # 找不到威胁，降级为正常巡逻
-                tier = "NONE"
-            else:
-                for ranger in sorted(turn.rangers, key=_uuid_key):
-                    if ranger.id in acted_units:
-                        continue
-                    # 所有游侠集结到威胁位置，保持射程（2-3）狙击
-                    intercept_pos = self._lightning_intercept_position(
-                        turn, ranger, nearest_threat
-                    )
-                    if not self._lightning_step_toward(
-                        turn, planner, ranger, intercept_pos, "lightning_defend_MID"
-                    ):
-                        ranger.wait()
-                    decisions.append(
-                        f"ranger:{_short_id(ranger.id)} defend_MID intercept "
-                        f"threat={nearest_threat.position}"
-                    )
-                    self.memory.decision_totals["ranger:defend_MID"] += 1
-                    acted_units.add(ranger.id)
-                return
-
-        # Step 4: FAR威胁或无威胁 → 所有游侠走中行星轨道（取消开路/突破轨）。
-        ordered_rangers = sorted(turn.rangers, key=_uuid_key)
-
-        for index, ranger in enumerate(ordered_rangers):
+        plan = self._lightning_plan or self._lightning_prepare_plan(turn, planner, decisions)
+        vacancy_by_id = {vacancy.ranger_id: vacancy for vacancy in plan.vacancies}
+        relief_by_id = {relief.ranger_id: relief for relief in plan.reliefs}
+        ledger = ShotLedger()
+        contacts_by_id = {contact.enemy.id: contact for contact in plan.threats}
+        for ranger in sorted(turn.rangers, key=_uuid_key):
             if ranger.id in acted_units:
                 continue
-
-            # 中轨游侠：先尝试射击（无论威胁等级）
-            shots = [
-                (enemy, cell)
-                for enemy, cell in self._ranger_shot_candidates(
-                    turn, ranger, planner
-                )
-            ]
-            if shots:
-                # 优先射击敌方战斗单位（RANGER > VANGUARD > WORKER > Core）
-                def shot_priority(pair):
-                    enemy, cell = pair
-                    if isinstance(enemy, UnitView):
-                        if enemy.unit_type == UnitType.RANGER:
-                            return (0, enemy.hp, cell)
-                        elif enemy.unit_type == UnitType.VANGUARD:
-                            return (1, enemy.hp, cell)
-                        else:  # WORKER
-                            return (2, enemy.hp, cell)
-                    else:  # CoreView
-                        return (3, enemy.hp, cell)
-
-                enemy, cell = min(shots, key=shot_priority)
-                ranger.shoot(enemy, expected_cell=cell)
-                self._mark_ranger_shot(enemy, cell)
-
-                target_type = (
-                    f"{enemy.unit_type.name.lower()}"
-                    if isinstance(enemy, UnitView)
-                    else "core"
-                )
-                decisions.append(
-                    f"ranger:{_short_id(ranger.id)} shoot_{target_type} "
-                    f"hp={enemy.hp}"
-                )
-                self.memory.decision_totals["ranger:shoot"] += 1
+            candidates = self._ranger_shot_candidates(turn, ranger, planner)
+            # MEDIVAC is default at 1 HP.  LAST_STAND is intentionally narrow:
+            # a legal shot against T4 that prevents an immediate Core attack.
+            medivac = vacancy_by_id.get(ranger.id)
+            legal = []
+            for enemy, cell in candidates:
+                predicted = cell != enemy.position
+                contact = contacts_by_id.get(enemy.id)
+                if ledger.can_assign(enemy, predicted=predicted):
+                    legal.append((enemy, cell, contact, predicted))
+            if medivac is not None:
+                last_stand = [item for item in legal if item[2] is not None and item[2].tier == "T4" and item[2].core_eta <= 1]
+                if last_stand:
+                    enemy, cell, _, _ = min(last_stand, key=lambda item: (_effective_hp(item[0]), item[0].id.bytes, item[1]))
+                    ranger.shoot(enemy, expected_cell=cell); ledger.assign(ranger, enemy, cell); self._mark_ranger_shot(enemy, cell)
+                    decisions.append(f"ranger:{_short_id(ranger.id)} LAST_STAND shot target={_short_id(enemy.id)}")
+                    self.memory.decision_totals["ranger:last_stand"] += 1
+                else:
+                    at_home = ranger.position == turn.core.position
+                    if not at_home and not planner.toward(ranger, turn.core.position, "ranger_medivac"):
+                        ranger.wait()
+                    decisions.append(f"ranger:{_short_id(ranger.id)} MEDIVAC home={medivac.t_home} gap={medivac.t_medical_gap}")
+                    self.memory.decision_totals["ranger:medivac"] += 1
+                    # At the Core the unit must remain unreserved so the later
+                    # healing phase can spend a resource on it this Tick.
+                    if at_home:
+                        continue
                 acted_units.add(ranger.id)
                 continue
-
-            # FAR威胁 → 就近游侠狙击驱离（不贴脸，最远追到外轨道边界）
-            if tier == "FAR":
-                nearest_threat = self._lightning_find_nearest_threat(turn)
-                if nearest_threat:
-                    # 检查该游侠是否靠近威胁（视野范围内）
-                    dist_to_threat = _distance(ranger.position, nearest_threat.position)
-                    ranger_vision = 5  # 游侠视野半径
-
-                    if dist_to_threat <= ranger_vision * 2:  # 视野范围内才参与狙击
-                        # 保持射程（2-3）狙击
-                        kite_pos = self._lightning_kiting_position(
-                            turn, ranger, nearest_threat
-                        )
-                        if not self._lightning_step_toward(
-                            turn, planner, ranger, kite_pos, "mid_orbit_snipe_FAR"
-                        ):
-                            ranger.wait()
-                        decisions.append(
-                            f"ranger:{_short_id(ranger.id)} mid_orbit_snipe_FAR "
-                            f"threat_dist={dist_to_threat}"
-                        )
-                        self.memory.decision_totals["mid_orbit:snipe_FAR"] += 1
-                        acted_units.add(ranger.id)
-                        continue
-
-            # 无威胁或不在狙击范围 → 正常中轨巡逻
-            scout = self._lightning_orbit_waypoint(
-                turn, ranger, UnitType.RANGER, lane=index
-            )
-            if scout and not self._lightning_step_toward(
-                turn, planner, ranger, scout, "mid_orbit_patrol"
-            ):
+            if legal:
+                def priority(item: tuple[UnitView | CoreView, Position, ThreatContact | None, bool]) -> tuple:
+                    enemy, cell, contact, predicted = item
+                    return (0 if contact and contact.tier in {"T4", "T3"} else 1,
+                            contact.core_eta if contact else 99, _enemy_role_priority(enemy),
+                            _effective_hp(enemy), 1 if predicted else 0, enemy.id.bytes, cell)
+                enemy, cell, _, _ = min(legal, key=priority)
+                ranger.shoot(enemy, expected_cell=cell); ledger.assign(ranger, enemy, cell); self._mark_ranger_shot(enemy, cell)
+                decisions.append(f"ranger:{_short_id(ranger.id)} ShotLedger shoot target={_short_id(enemy.id)} assigned={ledger.assigned_damage[enemy.id]}")
+                self.memory.decision_totals["ranger:shot"] += 1
+                acted_units.add(ranger.id)
+                continue
+            relief = relief_by_id.get(ranger.id)
+            if relief is not None:
+                goal = relief.fire_position
+                reason = "ranger_relief"
+            else:
+                same_sector = [contact for contact in plan.threats if contact.sector == self._lightning_sector(turn.core.position, ranger.position) and contact.tier != "T0"]
+                if same_sector:
+                    contact = min(same_sector, key=lambda c: (c.core_eta, c.square_radius))
+                    goal = self._lightning_safe_firing_position(turn, planner, ranger, contact.enemy.position, contact.sector, plan.funnel.gate_cell)
+                    reason = "ranger_eta_support"
+                elif plan.funnel.gate_cell is not None:
+                    goal = self._lightning_safe_firing_position(turn, planner, ranger, plan.funnel.gate_cell, self._lightning_sector(turn.core.position, plan.funnel.gate_cell), plan.funnel.gate_cell)
+                    reason = "ranger_funnel_cover"
+                else:
+                    goal = self._lightning_orbit_waypoint(turn, ranger, UnitType.RANGER) or ranger.position
+                    reason = "mid_orbit_patrol"
+            if ranger.position != goal and not self._lightning_step_toward(turn, planner, ranger, goal, reason):
                 ranger.wait()
-            decisions.append(
-                f"ranger:{_short_id(ranger.id)} mid_orbit_patrol lane={index}"
-            )
-            self.memory.decision_totals["mid_orbit:patrol"] += 1
+            decisions.append(f"ranger:{_short_id(ranger.id)} {reason} goal={goal}")
+            self.memory.decision_totals[f"{reason}"] += 1
             acted_units.add(ranger.id)
+        if ledger.intents:
+            decisions.append(f"ShotLedger intents={len(ledger.intents)} targets={len(ledger.assigned_damage)}")
 
 
     def _core_patrol_slots(
@@ -10642,9 +10972,8 @@ class SmartTactic:
         )
         shield_cap = 10 if owns_beacon else 5
         projected_resources = turn.resources + min(incoming_deposit, turn.resource_space)
-        near_threat = any(_distance(core.position, enemy.position) <= 5 for enemy in turn.visible_enemies)
-        auto_mobility_ready = self._core_auto_mobility_ready(turn)
-
+        plan = self._lightning_plan
+        near_threat = bool(plan and any(contact.tier in {"T3", "T4"} for contact in plan.threats))
         if (
             projected_resources >= 1
             and core.hp < 5
@@ -10674,11 +11003,28 @@ class SmartTactic:
             planner.final_occupancy(core.position) < 2
             and True
         )
-        spawn = (
-            self._select_spawn(turn, projected_resources)
-            if can_spawn
-            else None
-        )
+        spawn = None
+        if can_spawn:
+            # An unfilled physical funnel is more urgent than the nominal 3:1
+            # roster.  Conversely, an unrelieved medical vacancy asks for a Ranger.
+            if (
+                plan is not None
+                and plan.anchor is CoreAnchorState.COMBAT_ANCHOR
+                and plan.funnel.shortfall > 0
+                and projected_resources >= unit_cost(UnitType.WORKER, turn.state.population)
+            ):
+                spawn = UnitType.WORKER
+                self.memory.decision_totals["lightning:spawn_funnel_worker"] += 1
+            elif (
+                plan is not None
+                and plan.vacancies
+                and len(plan.reliefs) < len(plan.vacancies)
+                and projected_resources >= unit_cost(UnitType.RANGER, turn.state.population)
+            ):
+                spawn = UnitType.RANGER
+                self.memory.decision_totals["lightning:spawn_medical_ranger"] += 1
+            else:
+                spawn = self._select_spawn(turn, projected_resources)
 
         if spawn is not None:
             core.spawn(spawn)
@@ -10693,10 +11039,12 @@ class SmartTactic:
             decisions.append(f"core repair_shield reason=spare_resources shield={core.shield}")
             self.memory.decision_totals["core:repair"] += 1
         else:
-            # 闪电模式：Core 在方环内绕半径 pr 的周界转圈巡逻。安全方环里
-            # 不需要战斗护卫才动——巡逻本身帮工人找资源、帮猎手发现 Core。
-            # _choose_core_migration 内部已有 8 格内有敌中止 + hp/盾低中止，
-            # 上游 _choose_core 已先处理治疗/修盾/产兵，故不设 auto_mobility 门槛。
+            if plan is not None and plan.anchor is not CoreAnchorState.MOBILE_EVADE:
+                decisions.append(f"core anchor_hold state={plan.anchor.value} funnel_shortfall={plan.funnel.shortfall}")
+                self.memory.decision_totals[f"core:anchor_hold:{plan.anchor.value}"] += 1
+                return
+            # In the absence of medical/combat service, patrol keeps avoiding the
+            # visible combat direction through _choose_core_migration scoring.
             waypoint = self._lightning_patrol_waypoint(turn)
             decisions.append(
                 f"lightning patrol waypoint={waypoint} "
