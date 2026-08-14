@@ -74,6 +74,10 @@ LIGHTNING_SECTOR_STEP = 6
 LIGHTNING_MAX_POPULATION = 100
 # 绝对人口硬上限(兜底):比软顶多 5,防意外溢出。到此后不再产兵。
 ABSOLUTE_MAX_POPULATION = 105
+# Core 战备资源存底(用户定稿 2026-08-14):和平期保底 150 资源,留给战时给
+# 受伤士兵回血与阵亡补兵。仅当 资源上限-150 ≥ 当前游侠价 时生效(人口 ≥ ~40);
+# 爬坡期上限装不下"150+一个游侠",无视存底继续造兵抬上限,避免永久卡死。
+CORE_WARTIME_RESOURCE_FLOOR = 150
 # 游侠同心周界 lane 间距：相邻游侠的方环半径错开 6 格（游侠视野 5，6>直径 10/2
 # 不重叠），径向铺开多条同心周界，N 游侠沿各自周界同向绕圈共同覆盖 Core 轨道。
 LIGHTNING_SCOUT_LANE_GAP = 6
@@ -611,8 +615,17 @@ class TacticMemory:
     recent_positions: dict[str, list[Position]] = field(default_factory=dict, repr=False)
     enemy_positions: dict[str, Position] = field(default_factory=dict, repr=False)
     enemy_prev: dict[str, Position] = field(default_factory=dict, repr=False)
+    # 敌方轨迹库：每个敌方单位最近 7 帧的位置序列（用于识别 ZIGZAG/LINEAR/CIRCLE
+    # 运动规律，替代单帧速度外推）。不持久化——session 内瞬态。
+    enemy_trails: dict[str, list[Position]] = field(default_factory=dict, repr=False)
+    ENEMY_TRAIL_WINDOW = 7
     shot_miss_counts: Counter[str] = field(default_factory=Counter, repr=False)
     shot_miss_ticks: dict[str, int] = field(default_factory=dict, repr=False)
+    # 按轴脱靶聚合：key = f"{target_id}|{x|y}"，射击时按 expected_cell 相对敌人
+    # 当前格的主轴记录。ZIGZAG 围猎时，连续在同一轴脱靶会惩罚该轴、导向对轴，
+    # 破解"永远瞄错方向"的僵持。命中即清零该目标全部轴计数。
+    axis_miss_counts: Counter[str] = field(default_factory=Counter, repr=False)
+    axis_miss_ticks: dict[str, int] = field(default_factory=dict, repr=False)
     current_shot_cells: set[tuple[str, Position]] = field(
         default_factory=set,
         repr=False,
@@ -1345,6 +1358,11 @@ class TacticMemory:
                     if shot_key.startswith(target_prefix):
                         self.shot_miss_counts.pop(shot_key, None)
                         self.shot_miss_ticks.pop(shot_key, None)
+                # 命中即清零该目标的按轴脱靶计数（这一轴被验证有效）。
+                for axis_key in tuple(self.axis_miss_counts):
+                    if axis_key.startswith(target_prefix):
+                        self.axis_miss_counts.pop(axis_key, None)
+                        self.axis_miss_ticks.pop(axis_key, None)
             actor_key = str(event.actor_id) if event.actor_id is not None else None
             if event.event_type == "UNIT_MOVE_FAILED" and actor_key is not None:
                 planned = self.planned_moves.pop(actor_key, None)
@@ -1423,6 +1441,10 @@ class TacticMemory:
             if turn.tick - last_tick > RANGER_SHOT_MISS_MEMORY_TICKS:
                 self.shot_miss_ticks.pop(shot_key, None)
                 self.shot_miss_counts.pop(shot_key, None)
+        for axis_key, last_tick in tuple(self.axis_miss_ticks.items()):
+            if turn.tick - last_tick > RANGER_SHOT_MISS_MEMORY_TICKS:
+                self.axis_miss_ticks.pop(axis_key, None)
+                self.axis_miss_counts.pop(axis_key, None)
         visible_enemy_ids = {str(enemy.id) for enemy in turn.visible_enemies}
         if visible_enemy_ids:
             self.last_enemy_visible_tick = turn.tick
@@ -1587,6 +1609,13 @@ class TacticMemory:
             if eid in self.enemy_positions:
                 self.enemy_prev[eid] = self.enemy_positions[eid]
             self.enemy_positions[eid] = enemy.position
+            # 维护敌方 7 帧轨迹库（仅战斗单位有意义；Core 不入库）。
+            if isinstance(enemy, UnitView):
+                trail = self.enemy_trails.setdefault(eid, [])
+                if not trail or trail[-1] != enemy.position:
+                    trail.append(enemy.position)
+                if len(trail) > self.ENEMY_TRAIL_WINDOW:
+                    del trail[: len(trail) - self.ENEMY_TRAIL_WINDOW]
             if isinstance(enemy, CoreView):
                 self.enemy_prev.pop(eid, None)
             if isinstance(enemy, UnitView):
@@ -1609,6 +1638,7 @@ class TacticMemory:
             if eid not in {str(e.id) for e in turn.visible_enemies}:
                 self.enemy_positions.pop(eid, None)
                 self.enemy_prev.pop(eid, None)
+                self.enemy_trails.pop(eid, None)
         visible_motion_ids = {
             str(enemy.id)
             for enemy in turn.visible_enemies
@@ -2110,6 +2140,20 @@ def _shot_cell_key(target_id: UUID, cell: Position) -> str:
     return f"{target_id}|{cell[0]}|{cell[1]}"
 
 
+def _shot_axis_key(target_id: UUID | str, target_pos: Position, expected_cell: Position) -> str | None:
+    """射击格相对敌人当前格的主轴：dx 主导记 "x"，dy 主导记 "y"。
+
+    敌人若卡格未动（dx=dy=0）返回 None——此时无法用轴区分，跳过聚合。
+    """
+    dx = expected_cell[0] - target_pos[0]
+    dy = expected_cell[1] - target_pos[1]
+    if abs(dx) >= abs(dy) and dx != 0:
+        return f"{target_id}|x"
+    if abs(dy) > abs(dx) and dy != 0:
+        return f"{target_id}|y"
+    return None
+
+
 def _core_attack_surface_profile(
     anchor: Position,
     obstacles: set[Position],
@@ -2350,6 +2394,33 @@ def _currently_visible(turn: Turn, position: Position, obstacles: set[Position])
         _distance(origin, position) <= radius
         and _vision_line_clear(origin, position, obstacles)
         for origin, radius in observers
+    )
+
+
+def _enemy_watchers(turn: Turn) -> tuple[tuple[Position, int], ...]:
+    """敌方视角观察者：仅游侠(R5)与先锋(R4)。敌方工人与敌方 Core 不参与。
+
+    我方是全图视野，敌方视野有限；站在这些观察者看不见的格子里开火，
+    敌方不会预瞄我方——可能无伤命中（用户拍板：只算敌方游侠+先锋）。
+    """
+    return tuple(
+        (enemy.position, UNIT_VISION_RADIUS[enemy.unit_type])
+        for enemy in turn.visible_enemies
+        if isinstance(enemy, UnitView)
+        and enemy.unit_type in {UnitType.RANGER, UnitType.VANGUARD}
+    )
+
+
+def _enemy_can_see_cell(
+    watchers: tuple[tuple[Position, int], ...],
+    cell: Position,
+    obstacles: set[Position],
+) -> bool:
+    """该格是否在敌方任一游侠/先锋视野内（半径+障碍视线遮挡）。"""
+    return any(
+        _distance(origin, cell) <= radius
+        and _vision_line_clear(origin, cell, obstacles)
+        for origin, radius in watchers
     )
 
 
@@ -8000,21 +8071,103 @@ class SmartTactic:
             return self._assault_frontier_target(turn, planner)
         return target
 
+    def _enemy_motion_pattern(self, enemy: UnitView | CoreView) -> str:
+        """从敌方 7 帧轨迹库识别运动规律：ZIGZAG / LINEAR / CIRCLE / UNKNOWN。
+
+        - ZIGZAG：相邻帧方向频繁翻转（包围圈里来回绕）。
+        - LINEAR：方向连续 ≥2 帧不回弹（直线逃离/推进）。
+        - CIRCLE：位置绕某锚点形成闭合弧（风筝）。
+        - UNKNOWN：轨迹不足或静止。
+        轨迹库不足 3 帧时回退 UNKNOWN，调用方自行走原外推。
+        """
+        if isinstance(enemy, CoreView):
+            return "UNKNOWN"
+        trail = self.memory.enemy_trails.get(str(enemy.id), [])
+        if len(trail) < 3:
+            return "UNKNOWN"
+        # 步进方向序列（每对相邻帧的 dx,dy）。
+        steps: list[tuple[int, int]] = []
+        for a, b in zip(trail, trail[1:]):
+            dx, dy = b[0] - a[0], b[1] - a[1]
+            steps.append((dx, dy))
+        moves = [s for s in steps if s != (0, 0)]
+        if len(moves) < 2:
+            return "UNKNOWN"
+        # 方向翻转次数。
+        flips = 0
+        for a, b in zip(moves, moves[1:]):
+            if a[0] == -b[0] and a[1] == -b[1]:
+                flips += 1
+        if flips >= 2 and flips / max(1, len(moves) - 1) >= 0.5:
+            return "ZIGZAG"
+        # 方向连续不翻转 → 直线。
+        straight_run = 1
+        for a, b in zip(moves, moves[1:]):
+            if a == b:
+                straight_run += 1
+            else:
+                break
+        if straight_run >= 3:
+            return "LINEAR"
+        # CIRCLE：围绕轨迹质心转向一致性高（叉积同号）。
+        cx = sum(p[0] for p in trail) / len(trail)
+        cy = sum(p[1] for p in trail) / len(trail)
+        cross_signs = set()
+        for i in range(1, len(trail) - 1):
+            rx0, ry0 = trail[i - 1][0] - cx, trail[i - 1][1] - cy
+            rx1, ry1 = trail[i + 1][0] - cx, trail[i + 1][1] - cy
+            cross = rx0 * ry1 - ry0 * rx1
+            if cross > 0:
+                cross_signs.add(1)
+            elif cross < 0:
+                cross_signs.add(-1)
+        if len(cross_signs) == 1 and len(trail) >= 4:
+            return "CIRCLE"
+        return "UNKNOWN"
+
     def _predicted_enemy_cell(
         self,
         turn: Turn,
         enemy: UnitView | CoreView,
     ) -> Position:
-        """预判敌人下一 tick 位置：沿最近一次移动方向外推一格。"""
+        """预判敌人下一 tick 位置：优先用 7 帧轨迹库识别规律，回退一阶外推。
+
+        - ZIGZAG：先锋在包围圈里来回绕——外推永远指向它刚离开的格，
+          这是"永远瞄错方向"的根因。改为外推到对轴（它正在绕向的一侧）。
+        - LINEAR：沿原方向外推 1 格（逃命/推进）。
+        - CIRCLE/UNKNOWN：回退一阶速度外推。
+        """
         current = enemy.position
         if isinstance(enemy, CoreView):
             return current
+        pattern = self._enemy_motion_pattern(enemy)
         prev = self.memory.enemy_prev.get(str(enemy.id))
-        if prev is None:
+        if prev is None or prev == current:
             return current
         dx = current[0] - prev[0]
         dy = current[1] - prev[1]
-        if abs(dx) > 1 or abs(dy) > 1 or (dx != 0 and dy != 0):
+        cardinal = abs(dx) <= 1 and abs(dy) <= 1 and (dx == 0 or dy == 0) and (dx or dy)
+        if pattern == "ZIGZAG":
+            # 对轴外推：若最近一帧沿 x 轴移动，下一格大概率切到 y 轴方向。
+            # 朝当前到锚点（Core/最近友方）的主轴投影方向走一格，而非继续 x。
+            anchor = self._enemy_movement_anchor(turn, enemy)
+            if anchor is not None:
+                adx = anchor[0] - current[0]
+                ady = anchor[1] - current[1]
+                if abs(adx) >= abs(ady) and ady != 0:
+                    step = 1 if ady > 0 else -1
+                    return (current[0], current[1] + step)
+                if abs(ady) > abs(adx) and adx != 0:
+                    step = 1 if adx > 0 else -1
+                    return (current[0] + step, current[1])
+            # 无锚点时取垂直于最近移动方向的任一轴（先 y）。
+            if dx != 0:
+                return (current[0], current[1] + 1)
+            if dy != 0:
+                return (current[0] + 1, current[1])
+        if pattern == "LINEAR" and cardinal:
+            return (current[0] + dx, current[1] + dy)
+        if not cardinal:
             return current
         return (current[0] + dx, current[1] + dy)
 
@@ -8132,6 +8285,12 @@ class SmartTactic:
                             if coverage_active
                             and (target_key, cell) in self.memory.current_shot_cells
                             else 0,
+                            # 按轴脱靶惩罚：ZIGZAG 围猎时把火力导向脱靶少的对轴，
+                            # 破解"永远瞄错方向"的僵持。非 ZIGZAG 时多为 0、无副作用。
+                            self.memory.axis_miss_counts.get(
+                                _shot_axis_key(enemy.id, enemy.position, cell) or "",
+                                0,
+                            ),
                             self.memory.shot_miss_counts.get(
                                 _shot_cell_key(enemy.id, cell),
                                 0,
@@ -8156,6 +8315,12 @@ class SmartTactic:
         ):
             self.memory.decision_totals["ranger:shot_coverage"] += 1
         self.memory.current_shot_cells.add((target_key, cell))
+        # 按轴记录本次射击：射击格相对敌人当前格的主轴。ZIGZAG 围猎里，
+        # 同一轴连续开枪却打不中，下一帧候选会偏向对轴（见 _ranger_shot_candidates）。
+        axis_key = _shot_axis_key(target.id, target.position, cell)
+        if axis_key is not None:
+            self.memory.axis_miss_counts[axis_key] += 1
+            self.memory.axis_miss_ticks[axis_key] = self.memory.last_tick
 
     def _choose_vanguards_beacon(
         self,
@@ -10563,6 +10728,61 @@ class SmartTactic:
                 vanguard.wait()
             acted_units.add(vanguard.id)
 
+    def _lightning_standoff_enemy(self, turn: Turn) -> UnitView | None:
+        """对峙僵局中的敌方游侠：近几帧几乎原地（等我方先动）且在我方游侠
+        交战距离内。双方互相预测对方、都不先动时——调另一游侠从对角远位
+        换血：敌方未预瞄该新方向，动则中枪、不动则挨打；我方换血游侠
+        中枪后由既有 MEDIVAC 回 Core 回血、下一名接力。
+        """
+        for enemy in sorted(turn.visible_enemies, key=lambda e: e.id.bytes):
+            if not isinstance(enemy, UnitView) or enemy.unit_type is not UnitType.RANGER:
+                continue
+            trail = self.memory.enemy_trails.get(str(enemy.id), [])
+            if not trail:
+                continue
+            recent = trail[-4:]
+            xs = [p[0] for p in recent]
+            ys = [p[1] for p in recent]
+            if max(xs) - min(xs) > 2 or max(ys) - min(ys) > 2:
+                continue  # 位移超出 2x2 盒 → 在机动，不是僵持
+            if any(
+                _distance(unit.position, enemy.position) <= 4
+                for unit in turn.rangers
+            ):
+                return enemy
+        return None
+
+    def _standoff_relay_cell(
+        self,
+        turn: Turn,
+        standoff: UnitView,
+        planner: MovementPlanner,
+    ) -> Position | None:
+        """换血位：敌游侠盲区中距离 3 对角格优先；无盲区回退距离 3 直线格。
+
+        无盲区时换血依然成立（用户原则）：站在对方弹道上，对方也不能动
+        ——其他位置已被我方瞄准，它动一下就会被射。
+        """
+        target = standoff.position
+        obstacles = planner.obstacles
+        blind = self._enemy_blind_firing_cells(turn, target, obstacles)
+        pool = blind or self._firing_cells(target, obstacles)
+        diagonal_far = [
+            cell
+            for cell in pool
+            if abs(cell[0] - target[0]) == 3 and abs(cell[1] - target[1]) == 3
+        ]
+        if diagonal_far:
+            return min(diagonal_far, key=lambda cell: cell)
+        straight_far = [
+            cell
+            for cell in pool
+            if max(abs(cell[0] - target[0]), abs(cell[1] - target[1])) == 3
+        ]
+        if straight_far:
+            return min(straight_far, key=lambda cell: cell)
+        return None
+
     def _choose_rangers_lightning(
         self, turn: Turn, planner: MovementPlanner, acted_units: set[UUID], decisions: list[str],
     ) -> None:
@@ -10573,6 +10793,33 @@ class SmartTactic:
         relief_by_id = {relief.ranger_id: relief for relief in plan.reliefs}
         ledger = ShotLedger()
         contacts_by_id = {contact.enemy.id: contact for contact in plan.threats}
+        # 对峙僵局换血：敌游侠原地不动等我方先动时，指派一名未参战的满血
+        # 游侠走到它盲区里的对角远位。到位后由上方 legal 分支自动开火；
+        # 中枪掉 1 HP 由既有 MEDIVAC 接管回血、下一名接力。
+        standoff = self._lightning_standoff_enemy(turn)
+        standoff_relay_cell = (
+            self._standoff_relay_cell(turn, standoff, planner) if standoff is not None else None
+        )
+        standoff_relay_ranger_id: UUID | None = None
+        if standoff is not None and standoff_relay_cell is not None:
+            candidates_relay = [
+                ranger
+                for ranger in turn.rangers
+                if ranger.id not in acted_units
+                and ranger.id not in vacancy_by_id
+                and ranger.hp == 2
+                and _distance(ranger.position, standoff.position) > 3  # 未参战方向
+                and ranger.position != standoff_relay_cell
+            ]
+            if candidates_relay:
+                relay_ranger = min(
+                    candidates_relay,
+                    key=lambda unit: (
+                        _distance(unit.position, standoff_relay_cell),
+                        unit.id.bytes,
+                    ),
+                )
+                standoff_relay_ranger_id = relay_ranger.id
         for ranger in sorted(turn.rangers, key=_uuid_key):
             if ranger.id in acted_units:
                 continue
@@ -10617,6 +10864,25 @@ class SmartTactic:
                 self.memory.decision_totals["ranger:shot"] += 1
                 acted_units.add(ranger.id)
                 continue
+            # 对峙僵局换血位推进：优先于巡逻/支援移动，但不抢占已有合法射击
+            # （上一分支已 continue）与 MEDIVAC（更早分支已 continue）。
+            if (
+                standoff_relay_ranger_id == ranger.id
+                and standoff_relay_cell is not None
+                and ranger.position != standoff_relay_cell
+            ):
+                if self._lightning_step_toward(
+                    turn, planner, ranger, standoff_relay_cell, "standoff_relay_advance"
+                ):
+                    decisions.append(
+                        f"ranger:{_short_id(ranger.id)} standoff_relay_advance "
+                        f"target={_short_id(standoff.id) if standoff else '?'} "
+                        f"cell={standoff_relay_cell}"
+                    )
+                    self.memory.decision_totals["ranger:standoff_relay"] += 1
+                    acted_units.add(ranger.id)
+                    continue
+                # 走不动（被卡）→ 放弃本 tick 指派，回落常规分支。
             relief = relief_by_id.get(ranger.id)
             if relief is not None:
                 goal = relief.fire_position
@@ -10726,6 +10992,27 @@ class SmartTactic:
                 if _line_clear(cell, target, obstacles):
                     cells.add(cell)
         return cells
+
+    def _enemy_blind_firing_cells(
+        self,
+        turn: Turn,
+        target: Position,
+        obstacles: set[Position],
+    ) -> set[Position]:
+        """对 target 的合法射击格中，敌方游侠/先锋看不见的子集（盲区火力位）。
+
+        复用 _firing_cells 的射线枚举（1-3 距离、横/竖/45°对角、无障碍），
+        再过滤掉敌方观察者视野内的格。站在盲区格的游侠不会被敌方预瞄，
+        可能无伤命中。
+        """
+        watchers = _enemy_watchers(turn)
+        if not watchers:
+            return set()
+        return {
+            cell
+            for cell in self._firing_cells(target, obstacles)
+            if not _enemy_can_see_cell(watchers, cell, obstacles)
+        }
 
     def _find_core_shelter(
         self,
@@ -10923,8 +11210,25 @@ class SmartTactic:
             and turn.beacon.carrier_id in owned_ids
         )
         shield_cap = 10 if owns_beacon else 5
-        reserve = 2 if near_threat or core.shield < shield_cap else 0
-        budget = projected_resources - reserve
+        # 战时保留：近敌或补盾期留 2 资源应急（原有行为）。
+        wartime_reserve = 2 if near_threat or core.shield < shield_cap else 0
+        # 资源存底（用户定稿）：和平期存 150 给战时医疗/补兵。
+        #   规则②产能兜底：capacity-150 不足以造一个游侠时（人口 ≤ ~40 的爬坡期）
+        #     无视存底继续造兵抬上限——否则"存 150 → 造不出兵 → 人口不涨 →
+        #     上限不涨 → 永久卡死"。每 tick 现场算，不硬编码人口阈值。
+        #   规则①存底：capacity-150 装得下一个游侠时，只有超出 150 的部分可
+        #     用于造兵。
+        #   战时（near_threat/补盾）存底让位给原有威胁分支。
+        hold_floor = (
+            CORE_WARTIME_RESOURCE_FLOOR
+            if (
+                not near_threat
+                and core.shield >= shield_cap
+                and turn.resource_capacity - CORE_WARTIME_RESOURCE_FLOOR >= ranger_cost
+            )
+            else 0
+        )
+        budget = projected_resources - wartime_reserve - hold_floor
 
         # 闪电模式产兵:
         #   pop 1-8: 固定阶梯 LIGHTNING_BUILD_ORDER(撤一个补一个,自然补回同槽位)。

@@ -43,10 +43,13 @@ from arena_hero_tactic import choose_actions
 from arena_hero_strategy import (
     LIGHTNING_DEFAULT_RING,
     MODE_LIGHTNING,
+    MovementPlanner,
     SmartTactic,
     TacticMemory,
     _destination,
     _distance,
+    _enemy_can_see_cell,
+    _enemy_watchers,
 )
 
 _test_control_directory: TemporaryDirectory[str] | None = None
@@ -1844,6 +1847,353 @@ class OrbitalRepulsionTests(unittest.TestCase):
         summary = tactic.choose_actions(clear)
         self.assertTrue(any("mid_orbit_patrol" in line for line in summary.decisions))
         self.assertFalse(any("ranger_eta_support" in line or "ranger_funnel_cover" in line for line in summary.decisions))
+
+
+class StandoffRelayAndBlindSpotTests(unittest.TestCase):
+    """机制二：对峙僵局换血 + 敌方（游侠/先锋）视野盲区火力位。"""
+
+    def test_enemy_watchers_only_ranger_and_vanguard(self) -> None:
+        # 敌方工人与 Core 不参与盲区计算（用户拍板）。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        turn, _ = make_turn(
+            own_core=core((560, 600)),
+            units=(ranger((600, 600)),),
+            enemies=(
+                enemy_ranger((620, 600)),
+                enemy_vanguard((618, 602)),
+                enemy_worker((610, 604)),
+                enemy_core((640, 600)),
+            ),
+        )
+        watchers = _enemy_watchers(turn)
+        positions = {origin for origin, _ in watchers}
+        self.assertEqual(positions, {(620, 600), (618, 602)})
+
+    def test_blind_cell_behind_obstacle(self) -> None:
+        # 石墙挡住敌游侠到 (600,597) 的对角视线 → 该格是盲区火力位。
+        # (600,603) 曼哈顿 6 > R5 同为盲格；(601,602) 曼哈顿 4 且视线无阻 → 可见。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        turn, _ = make_turn(
+            own_core=core((560, 600)),
+            units=(ranger((570, 590)),),
+            enemies=(enemy_ranger((603, 600)),),
+            obstacle_cells=((602, 598),),
+        )
+        watchers = _enemy_watchers(turn)
+        self.assertFalse(_enemy_can_see_cell(watchers, (600, 597), {(602, 598)}))
+        self.assertTrue(_enemy_can_see_cell(watchers, (601, 602), {(602, 598)}))
+
+    def test_standoff_detected_for_stationary_enemy_ranger(self) -> None:
+        # 敌游侠近 4 帧原地（等我方先动）且我方游侠在 4 格内 → 判对峙。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        for tick in range(4):
+            turn, _ = make_turn(
+                tick=tick + 1,
+                own_core=core((560, 600)),
+                units=(ranger((600, 600)),),
+                enemies=(enemy_ranger((603, 600)),),
+            )
+            tactic.memory.observe(turn)
+        standoff = tactic._lightning_standoff_enemy(turn)
+        self.assertIsNotNone(standoff)
+        self.assertEqual(standoff.position, (603, 600))
+
+    def test_standoff_relay_picks_blind_diagonal_cell(self) -> None:
+        # 对峙时换血位优先选盲区对角远位（石墙背后），而非明处对角。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        obstacles = {(602, 598)}
+        turn, _ = make_turn(
+            tick=4,
+            own_core=core((560, 600)),
+            units=(ranger((570, 590), UUID(int=0xB030)),),
+            enemies=(enemy_ranger((603, 600)),),
+            obstacle_cells=obstacles,
+        )
+        planner = MovementPlanner(turn, memory, [])
+        standoff = enemy_ranger((603, 600))
+        cell = tactic._standoff_relay_cell(turn, standoff, planner)
+        self.assertIsNotNone(cell)
+        self.assertEqual(cell, (600, 597))
+
+    def test_standoff_relay_falls_back_without_blind_cell(self) -> None:
+        # 无障碍 → 无盲区 → 回退普通距离 3 对角格（换血仍成立）。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        turn, _ = make_turn(
+            tick=4,
+            own_core=core((560, 600)),
+            units=(ranger((570, 590), UUID(int=0xB030)),),
+            enemies=(enemy_ranger((603, 600)),),
+        )
+        planner = MovementPlanner(turn, memory, [])
+        standoff = enemy_ranger((603, 600))
+        cell = tactic._standoff_relay_cell(turn, standoff, planner)
+        self.assertIsNotNone(cell)
+        self.assertEqual(cell, (600, 597))
+
+    def test_choose_actions_assigns_relay_ranger_to_standoff(self) -> None:
+        # 端到端：对峙僵局 + 未参战游侠 → 它被指派走向盲区换血位，而不是巡逻。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        # 先用 4 帧建立敌游侠"原地僵持"的轨迹。
+        for tick in range(4):
+            warm, _ = make_turn(
+                tick=tick + 1,
+                own_core=core((560, 600)),
+                units=(ranger((600, 600)),),
+                enemies=(enemy_ranger((603, 600)),),
+                obstacle_cells=((602, 598),),
+            )
+            tactic.memory.observe(warm)
+        relay_view = ranger((570, 590), UUID(int=0xB030))
+        turn, _ = make_turn(
+            tick=5,
+            own_core=core((560, 600)),
+            units=(ranger((600, 600)), relay_view),
+            enemies=(enemy_ranger((603, 600)),),
+            obstacle_cells=((602, 598),),
+        )
+        summary = tactic.choose_actions(turn)
+        self.assertTrue(
+            any("standoff_relay_advance" in line for line in summary.decisions),
+            summary.decisions,
+        )
+        # 换血游侠的动作是移动而非射击。
+        relay_action = turn.plan.unit_actions.get(relay_view.id)
+        self.assertIsNotNone(relay_action)
+        self.assertIsInstance(relay_action, MoveAction)
+
+
+class CoreReserveFloorTests(unittest.TestCase):
+    """机制三：Core 战备存底 150 + 产能兜底（每 tick 现场算，不硬编码人口）。"""
+
+    @staticmethod
+    def _turn_with(rk: int, wk: int, vg: int, resources: int, enemies=()):
+        units = []
+        for i in range(vg):
+            units.append(vanguard((700 + i, 700), UUID(int=0xF000 + i)))
+        for i in range(rk):
+            units.append(ranger((610 + i, 600), UUID(int=0xF100 + i)))
+        for i in range(wk):
+            units.append(worker(UUID(int=0xF200 + i), (590 - i, 600)))
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=tuple(units),
+            resources=resources,
+            enemies=tuple(enemies),
+        )
+        return turn
+
+    def test_growth_phase_ignores_floor(self) -> None:
+        # pop=20:capacity=100,100-150<游侠价16(第21个单位起涨1.3倍) → 兜底
+        # 规则生效,无视存底。resources=17(>16)即造兵,不为 150 攒钱——否则
+        # 人口卡死在爬坡期。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        turn = self._turn_with(rk=14, wk=5, vg=1, resources=17)
+        pick = tactic._select_spawn(turn, 17)
+        self.assertIsNotNone(pick)
+
+    def test_growth_phase_cap30_still_builds(self) -> None:
+        # pop=30:capacity=150,150-150=0 < 游侠价26 → 兜底继续造,不死锁。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        turn = self._turn_with(rk=21, wk=8, vg=1, resources=30)
+        pick = tactic._select_spawn(turn, 30)
+        self.assertIsNotNone(pick)
+
+    def test_mature_phase_holds_floor_when_poor(self) -> None:
+        # pop=45:capacity=225,225-150=75 ≥ 游侠价58 → 存底生效。
+        # resources=180 → budget=30 < 58 → 攒钱不造(保住 150 医疗预算)。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        turn = self._turn_with(rk=33, wk=11, vg=1, resources=180)
+        pick = tactic._select_spawn(turn, 180)
+        self.assertIsNone(pick)
+
+    def test_mature_phase_builds_above_floor(self) -> None:
+        # pop=45:resources=220 → budget=70 ≥ 58 → 超出存底的部分造兵。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        turn = self._turn_with(rk=33, wk=11, vg=1, resources=220)
+        pick = tactic._select_spawn(turn, 220)
+        self.assertIsNotNone(pick)
+
+    def test_combat_yields_floor(self) -> None:
+        # 存底期但近敌(T4 战时):存底让位,只留 2 战时保留。
+        # resources=60:预算 58 ≥ 58 → 造兵,不为 150 攒钱。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        turn = self._turn_with(
+            rk=33, wk=11, vg=1, resources=60, enemies=(enemy_vanguard((604, 600)),)
+        )
+        pick = tactic._select_spawn(turn, 60)
+        self.assertIsNotNone(pick)
+
+
+class EnemyTrailAndAxisMissTests(unittest.TestCase):
+    """机制一：敌方 7 帧轨迹库 + ZIGZAG 识别 + 按轴脱靶聚合。"""
+
+    def test_trail_records_only_positions_on_move(self) -> None:
+        # 轨迹库只在敌方换格时追加；卡格不动不重复记。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        positions = [(600, 600), (600, 600), (601, 600)]
+        for tick, pos in enumerate(positions, start=1):
+            turn, _ = make_turn(
+                tick=tick,
+                own_core=core((560, 600)),
+                enemies=(enemy_vanguard(pos),),
+            )
+            tactic.memory.observe(turn)
+        (trail,) = tactic.memory.enemy_trails.values()
+        self.assertEqual(trail, [(600, 600), (601, 600)])
+
+    def test_trail_window_caps_at_seven(self) -> None:
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        for tick in range(10):
+            turn, _ = make_turn(
+                tick=tick + 1,
+                own_core=core((560, 600)),
+                enemies=(enemy_vanguard((600 + tick, 600)),),
+            )
+            tactic.memory.observe(turn)
+        (trail,) = tactic.memory.enemy_trails.values()
+        self.assertEqual(len(trail), 7)
+
+    def test_trail_cleared_when_enemy_leaves_vision(self) -> None:
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        seen, _ = make_turn(
+            tick=1,
+            own_core=core((560, 600)),
+            enemies=(enemy_vanguard((600, 600)),),
+        )
+        tactic.memory.observe(seen)
+        self.assertEqual(len(tactic.memory.enemy_trails), 1)
+        gone, _ = make_turn(
+            tick=2,
+            own_core=core((560, 600)),
+        )
+        tactic.memory.observe(gone)
+        self.assertEqual(tactic.memory.enemy_trails, {})
+
+    def test_zigzag_pattern_detected_for_oscillating_vanguard(self) -> None:
+        # 上下往返：(600,600)(600,601)(600,600)(600,601)(600,600) → ZIGZAG。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        path = [(600, 600), (600, 601), (600, 600), (600, 601), (600, 600)]
+        for tick, pos in enumerate(path, start=1):
+            turn, _ = make_turn(
+                tick=tick,
+                own_core=core((560, 600)),
+                enemies=(enemy_vanguard(pos),),
+            )
+            tactic.memory.observe(turn)
+        enemy = enemy_vanguard((600, 600))
+        self.assertEqual(tactic._enemy_motion_pattern(enemy), "ZIGZAG")
+
+    def test_linear_pattern_detected_for_straight_flight(self) -> None:
+        # 连续同向 ≥3 步 → LINEAR。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        path = [
+            (600, 600),
+            (601, 600),
+            (602, 600),
+            (603, 600),
+            (604, 600),
+        ]
+        for tick, pos in enumerate(path, start=1):
+            turn, _ = make_turn(
+                tick=tick,
+                own_core=core((560, 600)),
+                enemies=(enemy_vanguard(pos),),
+            )
+            tactic.memory.observe(turn)
+        enemy = enemy_vanguard((604, 600))
+        self.assertEqual(tactic._enemy_motion_pattern(enemy), "LINEAR")
+
+    def test_unknown_pattern_for_short_trail(self) -> None:
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        enemy = enemy_vanguard((600, 600))
+        self.assertEqual(tactic._enemy_motion_pattern(enemy), "UNKNOWN")
+
+    def test_predicted_cell_switches_axis_under_zigzag(self) -> None:
+        # ZIGZAG 时不再沿最近移动方向外推（那正是"永远瞄错方向"的根因），
+        # 而是切到对轴。敌人在 (600,601)→(600,600) 之间上下往返，当前在
+        # (600,600)：外推切向 x 轴。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        path = [(600, 600), (600, 601), (600, 600), (600, 601), (600, 600)]
+        for tick, pos in enumerate(path, start=1):
+            turn, _ = make_turn(
+                tick=tick,
+                own_core=core((560, 600)),
+                enemies=(enemy_vanguard(pos),),
+            )
+            tactic.memory.observe(turn)
+        enemy = enemy_vanguard((600, 600))
+        predicted = tactic._predicted_enemy_cell(turn, enemy)
+        self.assertEqual(predicted[0], 601)
+        self.assertEqual(predicted[1], 600)
+
+    def test_axis_miss_penalizes_repeated_axis(self) -> None:
+        # 同一轴连开两枪（未中）后，候选应偏向另一轴的格子。
+        from arena_hero_strategy import _shot_axis_key, _shot_cell_key
+
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        enemy = enemy_vanguard((600, 600))
+        # 游侠在西南对角 (598,599)：到 x 轴格 (599,600) 是 1 格对角线、
+        # 到 y 轴格 (600,601) 是 2 格对角线，两条轴的格子都合法可射。
+        own = ranger((598, 599), UUID(int=0xB020))
+        turn, _ = make_turn(
+            tick=1,
+            own_core=core((560, 600)),
+            units=(own,),
+            enemies=(enemy,),
+        )
+        # 对 x 轴（东西向）连记两次脱靶，并让 cell 级脱靶激活 coverage。
+        memory.axis_miss_counts[_shot_axis_key(enemy.id, enemy.position, (599, 600))] += 1
+        memory.axis_miss_counts[_shot_axis_key(enemy.id, enemy.position, (601, 600))] += 1
+        memory.shot_miss_counts[_shot_cell_key(enemy.id, enemy.position)] = 1
+        planner = MovementPlanner(turn, memory, [])
+        candidates = tactic._ranger_shot_candidates(turn, turn.unit(own.id), planner)
+        self.assertTrue(candidates)
+        _, chosen_cell = candidates[0]
+        chosen_axis = _shot_axis_key(enemy.id, enemy.position, chosen_cell)
+        self.assertEqual(chosen_axis, f"{enemy.id}|y")
+
+    def test_axis_miss_cleared_on_hit(self) -> None:
+        # SHOT_HIT 清零该目标的按轴计数。
+        hit = ResolutionEvent(
+            event_id=UUID(int=1),
+            tick=9,
+            event_type="SHOT_HIT",
+            reason_code=None,
+            actor_id=RANGER_ID,
+            target_id=ENEMY_RANGER_ID,
+            position=(600, 600),
+            values=None,
+        )
+        memory = TacticMemory()
+        memory.axis_miss_counts[f"{ENEMY_RANGER_ID}|x"] = 3
+        memory.axis_miss_counts[f"{ENEMY_RANGER_ID}|y"] = 1
+        turn, _ = make_turn(
+            tick=10,
+            own_core=core((560, 600)),
+            events=(hit,),
+        )
+        memory.observe(turn)
+        self.assertEqual(memory.axis_miss_counts[f"{ENEMY_RANGER_ID}|x"], 0)
+        self.assertEqual(memory.axis_miss_counts[f"{ENEMY_RANGER_ID}|y"], 0)
 
 
 if __name__ == "__main__":
