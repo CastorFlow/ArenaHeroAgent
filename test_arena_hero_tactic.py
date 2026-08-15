@@ -2195,6 +2195,312 @@ class EnemyTrailAndAxisMissTests(unittest.TestCase):
         self.assertEqual(memory.axis_miss_counts[f"{ENEMY_RANGER_ID}|x"], 0)
         self.assertEqual(memory.axis_miss_counts[f"{ENEMY_RANGER_ID}|y"], 0)
 
+    def test_write_stats_exposes_attack_counters(self) -> None:
+        # 真实 write_stats 顶层暴露 shots_fired / shots_hit / standoff_engagements
+        # / blind_fires，取值来自 decision_totals / event_totals（已持久化）。
+        import json
+        import tempfile
+
+        hit = ResolutionEvent(
+            event_id=UUID(int=1),
+            tick=9,
+            event_type="SHOT_HIT",
+            reason_code=None,
+            actor_id=RANGER_ID,
+            target_id=ENEMY_RANGER_ID,
+            position=(600, 600),
+            values=None,
+        )
+        memory = TacticMemory()
+        memory.decision_totals["ranger:shot"] = 7
+        memory.decision_totals["ranger:standoff_engaged"] = 3
+        memory.decision_totals["ranger:blind_fire"] = 2
+        turn, _ = make_turn(
+            tick=10,
+            own_core=core((560, 600)),
+            events=(hit,),
+        )
+        memory.observe(turn)  # 累加 SHOT_HIT 进 event_totals
+        with tempfile.TemporaryDirectory() as d:
+            stats_path = Path(d) / "stats.json"
+            memory.write_stats(stats_path, turn)
+            payload = json.loads(stats_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["shots_fired"], 7)
+        self.assertEqual(payload["shoot_count"], 7)  # 旧字段保留
+        self.assertEqual(payload["shots_hit"], 1)
+        self.assertEqual(payload["standoff_engagements"], 3)
+        self.assertEqual(payload["blind_fires"], 2)
+
+
+class ScoringPreaimAndSoloKillTests(unittest.TestCase):
+    """打分制预瞄 + 泛化相持检测 + 游侠单杀先锋舞步。"""
+
+    def _observe_standoff_warmup(
+        self, tactic: SmartTactic, enemy_pos=(603, 600), own_ranger_pos=(600, 600),
+        obstacle=(602, 598),
+    ) -> None:
+        """用 4 帧建立敌游侠"原地僵持"轨迹。"""
+        for tick in range(4):
+            warm, _ = make_turn(
+                tick=tick + 1,
+                own_core=core((560, 600)),
+                units=(ranger(own_ranger_pos),),
+                enemies=(enemy_ranger(enemy_pos),),
+                obstacle_cells=(obstacle,) if obstacle else (),
+            )
+            tactic.memory.observe(warm)
+
+    def test_score_aim_cells_low_hp_enemy_prefers_backward(self) -> None:
+        # 敌游侠 hp1 上一步 RIGHT → BACKWARD(LEFT) 分最高。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        enemy = enemy_ranger((600, 600), hp=1)
+        own = ranger((598, 600), UUID(int=0xB020))
+        turn, _ = make_turn(
+            tick=1, own_core=core((560, 600)),
+            units=(own,), enemies=(enemy,),
+        )
+        tactic.memory.observe(turn)
+        # 再观察一帧让敌游侠"上一步向右"(把 prev 设成(599,600),current(600,600)=向右一步)。
+        enemy2 = enemy_ranger((601, 600), hp=1)
+        turn2, _ = make_turn(
+            tick=2, own_core=core((560, 600)),
+            units=(ranger((598, 600), UUID(int=0xB020)),), enemies=(enemy2,),
+        )
+        tactic.memory.observe(turn2)
+        planner = MovementPlanner(turn2, memory, [])
+        scored = tactic._score_aim_cells(turn2, enemy2, planner)
+        score_by_cell = {cell: s for cell, s in scored}
+        # 上一步向右(+x),BACKWARD = 向左格(600,600)。
+        backward_cell = (600, 600)
+        # 比 FORWARD(602,600)、LATERAL(601,599/601,601) 都高。
+        self.assertIn(backward_cell, score_by_cell)
+        for cell, s in scored:
+            if cell != backward_cell:
+                self.assertGreater(
+                    score_by_cell[backward_cell], s,
+                    f"backward {backward_cell} 应最高,但 {cell}={s} 更高",
+                )
+
+    def test_score_aim_cells_ambush_ranger_locks_current_cell(self) -> None:
+        # 满血敌游侠(hp2)主动步入我射线 → STAY=原位 分最高 → 换血。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        # prev(603,600) → current(602,600):向左一步,且靠近我游侠(599,600)(距4→3)。
+        enemy_prev_turn, _ = make_turn(
+            tick=1, own_core=core((560, 600)),
+            units=(ranger((599, 600), UUID(int=0xB020)),),
+            enemies=(enemy_ranger((603, 600), hp=2),),
+        )
+        tactic.memory.observe(enemy_prev_turn)
+        enemy = enemy_ranger((602, 600), hp=2)
+        turn, _ = make_turn(
+            tick=2, own_core=core((560, 600)),
+            units=(ranger((599, 600), UUID(int=0xB020)),),
+            enemies=(enemy,),
+        )
+        tactic.memory.observe(turn)
+        planner = MovementPlanner(turn, memory, [])
+        scored = tactic._score_aim_cells(turn, enemy, planner)
+        score_by_cell = {cell: s for cell, s in scored}
+        stay_cell = enemy.position  # (602,600)
+        self.assertIn(stay_cell, score_by_cell)
+        for cell, s in scored:
+            if cell != stay_cell:
+                self.assertGreaterEqual(
+                    score_by_cell[stay_cell], s,
+                    f"ambush STAY {stay_cell} 应最高(平手也过)",
+                )
+
+    def test_score_aim_cells_dampening_lowers_missed_direction(self) -> None:
+        # x 轴连记脱靶 → x 轴格分低于 y 轴格。
+        from arena_hero_strategy import _shot_axis_key, _shot_cell_key
+
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        enemy = enemy_vanguard((600, 600))
+        own = ranger((598, 599), UUID(int=0xB020))
+        turn, _ = make_turn(
+            tick=1, own_core=core((560, 600)),
+            units=(own,), enemies=(enemy,),
+        )
+        memory.axis_miss_counts[_shot_axis_key(enemy.id, enemy.position, (599, 600))] += 1
+        memory.axis_miss_counts[_shot_axis_key(enemy.id, enemy.position, (601, 600))] += 1
+        memory.shot_miss_counts[_shot_cell_key(enemy.id, enemy.position)] = 1
+        planner = MovementPlanner(turn, memory, [])
+        scored = tactic._score_aim_cells(turn, enemy, planner)
+        score_by_cell = {cell: s for cell, s in scored}
+        x_cell = (599, 600)
+        y_cell = (600, 601)
+        if x_cell in score_by_cell and y_cell in score_by_cell:
+            self.assertGreater(
+                score_by_cell[y_cell], score_by_cell[x_cell],
+                "y 轴格应因 x 轴脱靶降分而更高",
+            )
+
+    def test_detect_standoff_vanguard_cornered(self) -> None:
+        # 敌先锋 hp2 + 两友游侠 ≤2 格 → kind=vanguard_cornered。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        turn, _ = make_turn(
+            tick=1, own_core=core((560, 600)),
+            units=(
+                ranger((601, 600), UUID(int=0xB030)),
+                ranger((600, 601), UUID(int=0xB031)),
+            ),
+            enemies=(enemy_vanguard((600, 600), hp=2),),
+        )
+        standoff = tactic._detect_strategic_standoff(turn)
+        self.assertIsNotNone(standoff)
+        self.assertEqual(standoff.kind, "vanguard_cornered")
+        self.assertEqual(standoff.original_cell, (600, 600))
+
+    def test_detect_standoff_worker_fleeing(self) -> None:
+        # 敌工人 + 障碍堵 2 cardinal + 友游侠 ≤3 → kind=worker_fleeing。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        # 工人轨迹:上一步(600,600) → 当前(601,600) 远离 Core(560,600)。
+        warm, _ = make_turn(
+            tick=1, own_core=core((560, 600)),
+            units=(ranger((602, 600), UUID(int=0xB030)),),
+            enemies=(enemy_worker((600, 600)),),
+            obstacle_cells=((600, 601), (601, 601)),  # 堵 2 个 cardinal
+        )
+        tactic.memory.observe(warm)
+        turn, _ = make_turn(
+            tick=2, own_core=core((560, 600)),
+            units=(ranger((602, 600), UUID(int=0xB030)),),
+            enemies=(enemy_worker((601, 600)),),
+            obstacle_cells=((600, 601), (601, 601)),
+        )
+        tactic.memory.observe(turn)
+        standoff = tactic._detect_strategic_standoff(turn)
+        self.assertIsNotNone(standoff)
+        self.assertEqual(standoff.kind, "worker_fleeing")
+
+    def test_diagonal_support_ranger_fires_at_original_cell(self) -> None:
+        # 建 4 帧相持 + 第三满血游侠站盲区对角格 → 射敌原位 + 计数。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        self._observe_standoff_warmup(tactic)
+        # 第三游侠站在盲区对角格(600,597):warmup 用 obstacle (602,598) 造盲区。
+        relay_view = ranger((600, 597), UUID(int=0xB040))
+        turn, _ = make_turn(
+            tick=5, own_core=core((560, 600)),
+            units=(ranger((600, 600)), relay_view),
+            enemies=(enemy_ranger((603, 600)),),
+            obstacle_cells=((602, 598),),
+        )
+        summary = tactic.choose_actions(turn)
+        action = turn.plan.unit_actions.get(relay_view.id)
+        self.assertIsNotNone(action, summary.decisions)
+        self.assertIsInstance(action, ShootAction)
+        assert isinstance(action, ShootAction)
+        # 支援游侠射敌原位(603,600),非预测格。
+        self.assertEqual(action.expected_cell, (603, 600))
+        self.assertEqual(
+            memory.decision_totals["ranger:diagonal_support"], 1
+        )
+
+    def test_vanguard_dance_approach_gap_aims_gap_cell(self) -> None:
+        # 我游侠(600,600) 敌先锋 hp4(602,600) 上一步朝我 → APPROACH_GAP 射 gap(601,600)。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        # 先观察 warmup 帧让先锋 prev=(603,600);choose_actions 会 observe 当前帧。
+        warm, _ = make_turn(
+            tick=1, own_core=core((560, 600)),
+            units=(ranger((600, 600), RANGER_ID),),
+            enemies=(enemy_vanguard((603, 600), hp=4),),
+        )
+        tactic.memory.observe(warm)
+        turn, _ = make_turn(
+            tick=2, own_core=core((560, 600)),
+            units=(ranger((600, 600), RANGER_ID),),
+            enemies=(enemy_vanguard((602, 600), hp=4),),
+        )
+        # 不预 observe(turn):choose_actions 内部会 observe,保留 warmup 的 prev。
+        summary = tactic.choose_actions(turn)
+        own = turn.unit(RANGER_ID)
+        action = turn.plan.unit_actions.get(own.id)
+        self.assertIsNotNone(action, summary.decisions)
+        self.assertIsInstance(action, ShootAction)
+        assert isinstance(action, ShootAction)
+        self.assertEqual(action.expected_cell, (601, 600))
+        self.assertGreaterEqual(memory.decision_totals["ranger:vanguard_dance"], 1)
+        # phase 推进到 ADJACENT_BACK。
+        pair_key = f"{RANGER_ID}|{enemy_vanguard((602, 600)).id}"
+        self.assertEqual(
+            memory.vanguard_dance_phase[pair_key]["phase"], "ADJACENT_BACK"
+        )
+
+    def test_vanguard_dance_adjacent_back_steps_away(self) -> None:
+        # seed phase=ADJACENT_BACK、贴脸 hp4 → action 为朝先锋反方向的 MoveAction。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        own = ranger((600, 600), RANGER_ID)
+        enemy = enemy_vanguard((601, 600), hp=4)
+        pair_key = f"{RANGER_ID}|{enemy.id}"
+        memory.vanguard_dance_phase[pair_key] = {"phase": "ADJACENT_BACK"}
+        turn, _ = make_turn(
+            tick=1, own_core=core((560, 600)),
+            units=(own,), enemies=(enemy,),
+        )
+        # 不预 observe:phase 已 seed,choose_actions 内部 observe 即可。
+        summary = tactic.choose_actions(turn)
+        action = turn.plan.unit_actions.get(own.id)
+        # 先锋在我游侠右侧(601,600)→游侠后退向 LEFT。
+        self.assertIsNotNone(action, summary.decisions)
+        self.assertIsInstance(action, MoveAction)
+        assert isinstance(action, MoveAction)
+        self.assertEqual(action.direction, Direction.LEFT)
+        self.assertGreaterEqual(memory.decision_totals["ranger:vanguard_dance"], 1)
+
+    def test_vanguard_dance_hp2_preaims_retreat(self) -> None:
+        # phase=REAIM_GAP_HP2、先锋 hp2 → 射击 expected_cell 为撤退方向格。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        own = ranger((600, 600), RANGER_ID)
+        # 先锋在(601,600)贴脸 hp2,prev=(602,600)(上一步朝我,撤退方向=向右)。
+        enemy = enemy_vanguard((601, 600), hp=2)
+        pair_key = f"{RANGER_ID}|{enemy.id}"
+        memory.vanguard_dance_phase[pair_key] = {"phase": "REAIM_GAP_HP2"}
+        warm, _ = make_turn(
+            tick=1, own_core=core((560, 600)),
+            units=(own,), enemies=(enemy_vanguard((602, 600), hp=2),),
+        )
+        tactic.memory.observe(warm)
+        turn, _ = make_turn(
+            tick=2, own_core=core((560, 600)),
+            units=(own,), enemies=(enemy,),
+        )
+        # 不预 observe(turn):choose_actions 内部 observe 会把 prev 设成 warm 的 (602,600)。
+        summary = tactic.choose_actions(turn)
+        action = turn.plan.unit_actions.get(own.id)
+        self.assertIsNotNone(action, summary.decisions)
+        self.assertIsInstance(action, ShootAction)
+        assert isinstance(action, ShootAction)
+        # 撤退方向(向右,远离我游侠)= (602,600)。
+        self.assertEqual(action.expected_cell, (602, 600))
+
+    def test_vanguard_dance_flee_ambush_triggers_cluster_preaim(self) -> None:
+        # 游侠 hp1(先锋反攻) → FLEE_AMBUSH 预标记 + 第二游侠射追兵 + ambush_trade≥1。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        own_injured = ranger((600, 600), RANGER_ID, hp=1)
+        enemy = enemy_vanguard((601, 600), hp=2)
+        pair_key = f"{RANGER_ID}|{enemy.id}"
+        memory.vanguard_dance_phase[pair_key] = {"phase": "REAIM_GAP_HP2"}
+        # 第二游侠站能射先锋追兵的位置:(601,599) 竖距1 射 (601,600)。
+        support = ranger((601, 599), UUID(int=0xB050))
+        turn, _ = make_turn(
+            tick=1, own_core=core((560, 600)),
+            units=(own_injured, support), enemies=(enemy,),
+        )
+        # 不预 observe:choose_actions 内部 observe + FLEE_AMBUSH 预标记会读 hp。
+        summary = tactic.choose_actions(turn)
+        # FLEE_AMBUSH 预标记 + 第二游侠射追兵 + ambush_trade≥1。
+        self.assertGreaterEqual(memory.decision_totals["ranger:ambush_trade"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

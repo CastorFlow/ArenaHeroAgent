@@ -40,11 +40,22 @@ CONTROL_FILENAME = ".arena_hero_control.json"
 STATS_FILENAME = ".arena_hero_stats.json"
 BROWSER_INTEL_FILENAME = ".arena_hero_browser_intel.json"
 ROUTE_OVERLAY_VERSION = 2
+# 战况历史 / Core 轨迹 JSONL 滚动上限（行）。tick≈15s，10 万行 ≈ 17 天战况；
+# Core 轨迹 1 万行 ≈ 41 天。
+BATTLE_HISTORY_MAX_LINES = 100_000
+CORE_TRAIL_MAX_LINES = 10_000
 
 MODE_LIGHTNING = "lightning"
 MODE_VALUES = {
     MODE_LIGHTNING,
 }
+# === 网页控制台控制字段（与 arena_hero_route_overlay_server 的 schema 保持一致）===
+# Core 转移模式：star=恒星(边采集边交付), march=急行军(停止采集随 Core 推进),
+# fortify=坚壁清野(采集但不提交,到达目标后集中提交)。
+TRANSFER_MODES = {"star", "march", "fortify"}
+CONTROL_UNIT_TYPES = ("WORKER", "VANGUARD", "RANGER")
+MAX_BUILD_QUEUE_LENGTH = 20
+
 # 闪电模式：在远离高强度战区的贫瘠坐标方环（挖空方形甜甜圈，400 ≤
 # max(|x|,|y|) ≤ 600）内泊 Core，靠击杀刚复活、无护卫的敌方 Core（每杀 +5
 # 资源）加速发育。战斗单位各自独立路线扫场，不组队。
@@ -283,6 +294,32 @@ OPPOSITE_DIRECTION = {
     Direction.DOWN: Direction.UP,
     Direction.LEFT: Direction.RIGHT,
 }
+# === 打分制预瞄方向权重基线（用户原则的数值化）===
+# 敌方 agent 控制,原地概率小,STAY 基线最低。一般情形 BACKWARD>LATERAL>FORWARD>STAY。
+# 各场景在 _score_aim_cells 里按 context 加性叠加覆盖。
+AIM_DIRECTION_WEIGHTS: dict[str, float] = {
+    "BACKWARD": 40.0,
+    "LATERAL": 25.0,
+    "FORWARD": 15.0,
+    "STAY": 5.0,
+}
+# 脱靶降分系数 + 封顶（连续打不中某方向→降分,但有上限防永久放弃）。
+AIM_MISS_CELL_PENALTY = 8.0
+AIM_MISS_AXIS_PENALTY = 4.0
+AIM_MISS_PENALTY_CAP = 50.0
+# 重复覆盖格偏好（保留 ranger:shot_coverage 语义）。
+AIM_COVERAGE_BONUS = 6.0
+# 满血敌游侠主动入弹道(偷袭)→ STAY 锁原位换血的最高分。
+AIM_AMBUSH_STAY_SCORE = 90.0
+# 游侠单杀先锋舞步 kiting 接战距离(单位:格)。
+VANGUARD_DANCE_ENGAGE_RADIUS = 3
+# Mode B 各 phase 名。
+VANGUARD_DANCE_PHASES = (
+    "APPROACH_GAP",
+    "ADJACENT_BACK",
+    "REAIM_GAP_HP2",
+    "FLEE_AMBUSH",
+)
 CORE_DIRECTION_COMMIT_TICKS = 8
 RANGER_DEFENSE_LEASH_RADIUS = 8
 CORE_PATROL_RANGER_COUNT = 2
@@ -412,6 +449,19 @@ class ShotLedger:
         )
 
 
+@dataclass(frozen=True)
+class StrategicStandoff:
+    """泛化战略相持:游侠互瞄死锁 / 被围残血先锋 / 被堵逃命工人。
+
+    任一检出即触发 45°支援游侠从对角最远位换血(用户原则:主动触发、低限制、常用)。
+    original_cell = 敌当前格 = 支援游侠要瞄的格(相持时双方都在预瞄对方下一步,原位恰好无人瞄)。
+    """
+
+    enemy: UnitView
+    kind: str  # "ranger_ranger" | "vanguard_cornered" | "worker_fleeing"
+    original_cell: Position
+
+
 @dataclass
 class LightningPlan:
     geometry: OrbitGeometry
@@ -435,6 +485,7 @@ class EnemySighting:
     position: Position
     seen_tick: int
     is_core: bool
+    unit_type: str | None = None  # "WORKER"/"VANGUARD"/"RANGER"/"CORE"，用于击杀记录分兵种
 
 
 @dataclass(frozen=True)
@@ -546,6 +597,19 @@ class TacticMemory:
     lightning_ring: tuple = field(default_factory=lambda: tuple(LIGHTNING_DEFAULT_RING))
     lightning_patrol_waypoint: tuple[int, int] | None = None
     lightning_patrol_phase: int = 0
+    # === 网页控制台新增控制字段（load_control 写入，save/load 持久化）===
+    core_orbit_radius: int = 0  # 0 = 自动按 ring 推导（LIGHTNING_PATROL_RADIUS_FRACTION）
+    core_hold: bool = False  # 驻扎：Core 停在当前位置，行星照常巡逻
+    core_target: tuple[int, int] | None = None  # 目标坐标，null = 无目标
+    core_transfer_mode: str = "star"  # star|march|fortify
+    build_queue: list[str] = field(default_factory=list)  # 造兵预定队列（顺序=优先级）
+    spawn_ratio: dict[str, int] = field(
+        default_factory=lambda: {"ranger": 3, "worker": 1}
+    )  # 默认产兵比例（无队列时 pop≥9 用）
+    unit_caps: dict[str, int] = field(
+        default_factory=lambda: {"worker": 0, "vanguard": 0, "ranger": 0}
+    )  # 各兵种独立上限，0 = 无上限
+    wartime_reserve: int = 150  # Core 战备资源存底（原硬编码 CORE_WARTIME_RESOURCE_FLOOR）
     lightning_claims: dict[str, str] = field(default_factory=dict)
     # 判定为重兵把守而永久放弃的敌方 Core UUID 集合。世界很大、复活磁铁会不断
     # 送来新的无护卫 Core，没必要死磕被围住的。acquire 永久跳过这些 ID。
@@ -596,6 +660,8 @@ class TacticMemory:
     total_resources_deposited: int = 0
     total_resources_captured: int = 0
     enemy_cores_destroyed: int = 0
+    # 敌核击杀去重：记录已计入击杀的敌方 Core id，避免同一敌核多次计数。
+    battle_enemy_cores_seen: set[str] = field(default_factory=set)
     first_observed_tick: int = 0
     observed_turns: int = 0
     units_lost: int = 0
@@ -630,6 +696,13 @@ class TacticMemory:
         default_factory=set,
         repr=False,
     )
+    # 游侠单杀先锋舞步状态机: key=f"{ranger_id}|{enemy_vanguard_id}" → phase dict。
+    # 瞬态、不持久化(session 内),repr=False。load/save 不处理(同 enemy_trails 先例)。
+    # phase: "APPROACH_GAP"|"ADJACENT_BACK"|"REAIM_GAP_HP2"|"FLEE_AMBUSH"。
+    vanguard_dance_phase: dict[str, dict] = field(default_factory=dict, repr=False)
+    # 本 tick 45°支援指派的游侠 id(瞬态,每 tick choose_actions 开头清空)。
+    # 防同一相持一 tick 挑两名支援游侠。
+    standoff_support_assigned: set[str] = field(default_factory=set, repr=False)
 
     @classmethod
     def load(cls, path: Path) -> TacticMemory:
@@ -694,9 +767,12 @@ class TacticMemory:
                     position=(int(value[0]), int(value[1])),
                     seen_tick=int(value[2]),
                     is_core=bool(value[3]),
+                    unit_type=(
+                        str(value[4]) if len(value) >= 5 and value[4] else None
+                    ),
                 )
                 for object_id, value in data.get("enemy_sightings", {}).items()
-                if isinstance(value, list) and len(value) == 4
+                if isinstance(value, list) and len(value) >= 4
             }
             memory.planned_moves = {
                 unit_id: PlannedMove(
@@ -851,6 +927,9 @@ class TacticMemory:
                 data.get("total_resources_captured", 0)
             )
             memory.enemy_cores_destroyed = int(data.get("enemy_cores_destroyed", 0))
+            memory.battle_enemy_cores_seen = {
+                str(core_id) for core_id in data.get("battle_enemy_cores_seen", ())
+            }
             memory.first_observed_tick = int(data.get("first_observed_tick", 0))
             memory.observed_turns = int(data.get("observed_turns", 0))
             memory.units_lost = int(data.get("units_lost", 0))
@@ -867,6 +946,52 @@ class TacticMemory:
                 )
             memory.lightning_patrol_phase = int(
                 data.get("lightning_patrol_phase", 0)
+            )
+            # 网页控制台控制字段反序列化
+            memory.core_orbit_radius = max(
+                0,
+                int(data.get("core_orbit_radius", 0)),
+            )
+            memory.core_hold = bool(data.get("core_hold", False))
+            raw_core_target = data.get("core_target")
+            if isinstance(raw_core_target, list) and len(raw_core_target) == 2:
+                memory.core_target = (
+                    int(raw_core_target[0]),
+                    int(raw_core_target[1]),
+                )
+            raw_transfer_mode = data.get("core_transfer_mode", "star")
+            if raw_transfer_mode in TRANSFER_MODES:
+                memory.core_transfer_mode = raw_transfer_mode
+            raw_queue = data.get("build_queue", ())
+            memory.build_queue = [
+                str(item)
+                for item in raw_queue
+                if isinstance(item, str) and item in CONTROL_UNIT_TYPES
+            ][:MAX_BUILD_QUEUE_LENGTH]
+            raw_ratio = data.get("spawn_ratio", {})
+            if isinstance(raw_ratio, dict):
+                ranger = raw_ratio.get("ranger", 3)
+                worker = raw_ratio.get("worker", 1)
+                if (
+                    isinstance(ranger, int)
+                    and not isinstance(ranger, bool)
+                    and ranger >= 0
+                    and isinstance(worker, int)
+                    and not isinstance(worker, bool)
+                    and worker >= 0
+                    and (ranger > 0 or worker > 0)
+                ):
+                    memory.spawn_ratio = {"ranger": ranger, "worker": worker}
+            raw_caps = data.get("unit_caps", {})
+            if isinstance(raw_caps, dict):
+                caps = {
+                    key: max(0, int(raw_caps.get(key, 0)))
+                    for key in ("worker", "vanguard", "ranger")
+                }
+                memory.unit_caps = caps
+            memory.wartime_reserve = max(
+                0,
+                int(data.get("wartime_reserve", CORE_WARTIME_RESOURCE_FLOOR)),
             )
             memory.lightning_claims = {
                 str(unit_id): str(core_id)
@@ -986,6 +1111,7 @@ class TacticMemory:
                     sighting.position[1],
                     sighting.seen_tick,
                     sighting.is_core,
+                    sighting.unit_type,
                 ]
                 for object_id, sighting in sorted(self.enemy_sightings.items())
             },
@@ -1081,6 +1207,7 @@ class TacticMemory:
             "total_resources_deposited": self.total_resources_deposited,
             "total_resources_captured": self.total_resources_captured,
             "enemy_cores_destroyed": self.enemy_cores_destroyed,
+            "battle_enemy_cores_seen": sorted(self.battle_enemy_cores_seen),
             "first_observed_tick": self.first_observed_tick,
             "observed_turns": self.observed_turns,
             "units_lost": self.units_lost,
@@ -1097,6 +1224,19 @@ class TacticMemory:
                 else None
             ),
             "lightning_patrol_phase": self.lightning_patrol_phase,
+            # 网页控制台控制字段持久化
+            "core_orbit_radius": self.core_orbit_radius,
+            "core_hold": self.core_hold,
+            "core_target": (
+                [self.core_target[0], self.core_target[1]]
+                if self.core_target is not None
+                else None
+            ),
+            "core_transfer_mode": self.core_transfer_mode,
+            "build_queue": list(self.build_queue),
+            "spawn_ratio": dict(self.spawn_ratio),
+            "unit_caps": dict(self.unit_caps),
+            "wartime_reserve": self.wartime_reserve,
             "lightning_claims": dict(sorted(self.lightning_claims.items())),
             "lightning_blacklist": sorted(self.lightning_blacklist),
             "lightning_sectors": {
@@ -1453,6 +1593,11 @@ class TacticMemory:
                 position=enemy.position,
                 seen_tick=turn.tick,
                 is_core=isinstance(enemy, CoreView),
+                unit_type=(
+                    "CORE"
+                    if isinstance(enemy, CoreView)
+                    else enemy.unit_type.value
+                ),
             )
         # 清理 enemy_sightings：(1)非 Core 且超过 ASSAULT_SIGHTING_MAX_AGE，
         # (2)当前可见位置但物体不在（确认消失），(3)Core sighting 超过
@@ -1639,6 +1784,13 @@ class TacticMemory:
                 self.enemy_positions.pop(eid, None)
                 self.enemy_prev.pop(eid, None)
                 self.enemy_trails.pop(eid, None)
+                # 舞步状态机随敌离视野清掉,防幽灵 phase 锁游侠(配对键含 eid)。
+                stale_dance_keys = [
+                    key for key in self.vanguard_dance_phase
+                    if key.split("|", 1)[1] == eid
+                ]
+                for key in stale_dance_keys:
+                    self.vanguard_dance_phase.pop(key, None)
         visible_motion_ids = {
             str(enemy.id)
             for enemy in turn.visible_enemies
@@ -1827,6 +1979,74 @@ class TacticMemory:
                 outer_r = int(raw_ring[1])
                 if outer_r >= inner_r > 0:
                     self.lightning_ring = (inner_r, outer_r)
+            # === 网页控制台新增控制字段（旧代理忽略未知 key，向后兼容）===
+            raw_orbit = data.get("core_orbit_radius", 0)
+            if (
+                isinstance(raw_orbit, (int, float))
+                and not isinstance(raw_orbit, bool)
+                and raw_orbit >= 0
+            ):
+                self.core_orbit_radius = int(raw_orbit)
+            self.core_hold = bool(data.get("core_hold", self.core_hold))
+            raw_target = data.get("core_target")
+            if raw_target is None:
+                self.core_target = None
+            elif (
+                isinstance(raw_target, list)
+                and len(raw_target) == 2
+                and all(
+                    isinstance(v, (int, float)) and not isinstance(v, bool)
+                    for v in raw_target
+                )
+            ):
+                self.core_target = (int(raw_target[0]), int(raw_target[1]))
+            raw_mode = data.get("core_transfer_mode", "star")
+            if raw_mode in TRANSFER_MODES:
+                self.core_transfer_mode = raw_mode
+            raw_queue = data.get("build_queue")
+            if isinstance(raw_queue, list):
+                queue: list[str] = []
+                for item in raw_queue[:MAX_BUILD_QUEUE_LENGTH]:
+                    if isinstance(item, str) and item in CONTROL_UNIT_TYPES:
+                        queue.append(item)
+                self.build_queue = queue
+            raw_ratio = data.get("spawn_ratio")
+            if isinstance(raw_ratio, dict):
+                ranger = raw_ratio.get("ranger")
+                worker = raw_ratio.get("worker")
+                if (
+                    isinstance(ranger, int)
+                    and not isinstance(ranger, bool)
+                    and ranger >= 0
+                    and isinstance(worker, int)
+                    and not isinstance(worker, bool)
+                    and worker >= 0
+                    and (ranger > 0 or worker > 0)
+                ):
+                    self.spawn_ratio = {"ranger": ranger, "worker": worker}
+            raw_caps = data.get("unit_caps")
+            if isinstance(raw_caps, dict):
+                caps: dict[str, int] = {}
+                for key in ("worker", "vanguard", "ranger"):
+                    raw_value = raw_caps.get(key, 0)
+                    if (
+                        isinstance(raw_value, int)
+                        and not isinstance(raw_value, bool)
+                        and raw_value >= 0
+                    ):
+                        caps[key] = raw_value
+                if caps:
+                    self.unit_caps = {
+                        key: caps.get(key, 0)
+                        for key in ("worker", "vanguard", "ranger")
+                    }
+            raw_reserve = data.get("wartime_reserve")
+            if (
+                isinstance(raw_reserve, (int, float))
+                and not isinstance(raw_reserve, bool)
+                and raw_reserve >= 0
+            ):
+                self.wartime_reserve = int(raw_reserve)
             self.control_mtime = mtime
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             pass
@@ -2092,7 +2312,14 @@ class TacticMemory:
                 ),
                 "harvest_count": self.decision_totals.get("worker:harvest", 0),
                 "deposit_count": self.decision_totals.get("worker:deposit", 0),
-                "shoot_count": self.decision_totals.get("ranger:shoot", 0),
+                "shoot_count": self.decision_totals.get("ranger:shot", 0),
+                "shots_fired": self.decision_totals.get("ranger:shot", 0),
+                "shots_hit": self.event_totals.get("SHOT_HIT", 0),
+                "standoff_engagements": self.decision_totals.get("ranger:standoff_engaged", 0),
+                "blind_fires": self.decision_totals.get("ranger:blind_fire", 0),
+                "diagonal_supports": self.decision_totals.get("ranger:diagonal_support", 0),
+                "vanguard_dance_steps": self.decision_totals.get("ranger:vanguard_dance", 0),
+                "ambush_trades": self.decision_totals.get("ranger:ambush_trade", 0),
                 "move_failures": self.event_totals.get("UNIT_MOVE_FAILED", 0),
                 "manual_overrides": self.decision_totals.get(
                     "manual_override:move", 0
@@ -2121,6 +2348,35 @@ class TacticMemory:
                         ),
                     )
                 ],
+                # 可见敌方单位（地图红点），上限 64。
+                "enemy_units": [
+                    {
+                        "id": str(enemy.id)[:8],
+                        "type": (
+                            "CORE"
+                            if isinstance(enemy, CoreView)
+                            else enemy.unit_type.value
+                        ),
+                        "position": [enemy.position[0], enemy.position[1]],
+                        "hp": enemy.hp,
+                    }
+                    for enemy in turn.visible_enemies[:64]
+                ],
+                # 生效配置回显（前端显示"已生效值"）。
+                "effective_control": {
+                    "core_orbit_radius": self.core_orbit_radius,
+                    "core_hold": self.core_hold,
+                    "core_target": (
+                        list(self.core_target)
+                        if self.core_target is not None
+                        else None
+                    ),
+                    "core_transfer_mode": self.core_transfer_mode,
+                    "build_queue": list(self.build_queue),
+                    "spawn_ratio": dict(self.spawn_ratio),
+                    "unit_caps": dict(self.unit_caps),
+                    "wartime_reserve": self.wartime_reserve,
+                },
             }
             temporary = path.with_suffix(path.suffix + ".tmp")
             temporary.write_text(
@@ -2134,6 +2390,14 @@ class TacticMemory:
 
 def _distance(left: Position, right: Position) -> int:
     return abs(left[0] - right[0]) + abs(left[1] - right[1])
+
+
+def _unit_type_from_name(name: str) -> UnitType | None:
+    """控制文件里兵种字符串("WORKER"/"VANGUARD"/"RANGER") → UnitType，非法返回 None。"""
+    try:
+        return UnitType(name)
+    except (ValueError, TypeError):
+        return None
 
 
 def _shot_cell_key(target_id: UUID, cell: Position) -> str:
@@ -2152,6 +2416,11 @@ def _shot_axis_key(target_id: UUID | str, target_pos: Position, expected_cell: P
     if abs(dy) > abs(dx) and dy != 0:
         return f"{target_id}|y"
     return None
+
+
+def _cell_sort_key(cell: Position) -> tuple[int, int]:
+    """格的确定性排序键(供打分平手决胜用)。"""
+    return (cell[0], cell[1])
 
 
 def _core_attack_surface_profile(
@@ -2846,6 +3115,14 @@ class SmartTactic:
         self.control_path = control_path or Path(
             os.environ.get("ARENA_HERO_CONTROL_FILE", CONTROL_FILENAME)
         )
+        # 战况历史 / Core 轨迹 JSONL 路径（环境变量可覆盖；默认 None=不落盘，
+        # 测试构造 SmartTactic() 不设 env 时零副作用）。
+        raw_battle_path = os.environ.get("ARENA_HERO_BATTLE_HISTORY_FILE")
+        self.battle_history_path = (
+            Path(raw_battle_path) if raw_battle_path else None
+        )
+        raw_trail_path = os.environ.get("ARENA_HERO_CORE_TRAIL_FILE")
+        self.core_trail_path = Path(raw_trail_path) if raw_trail_path else None
         # Ephemeral Tick plan: it is recomputed from the authoritative Turn and is
         # deliberately not persisted with long-lived route memory.
         self._lightning_plan: LightningPlan | None = None
@@ -2857,11 +3134,15 @@ class SmartTactic:
         self.memory.observe(turn)
         # 只在本 Tick 内协调多名游侠的覆盖格，不把未来 Tick 的动作带入。
         self.memory.current_shot_cells.clear()
+        # 45°支援指派瞬态集每 tick 清空(防跨 tick 残留锁死指派)。
+        self.memory.standoff_support_assigned.clear()
         previous_events = Counter(event.event_type for event in turn.events)
         decisions = list(self.memory.observations)
 
         if turn.core is None:
-            return self._summary(turn, previous_events, decisions)
+            summary = self._summary(turn, previous_events, decisions)
+            self._append_battle_history(turn)
+            return summary
 
         planner = MovementPlanner(turn, self.memory, decisions)
         acted_units: set[UUID] = set()
@@ -2876,7 +3157,146 @@ class SmartTactic:
         # the remaining wounded units and patients that arrived at the Core.
         self._choose_healing(turn, planner, acted_units, decisions)
         self._choose_core(turn, planner, False, incoming_deposit, decisions)
-        return self._summary(turn, previous_events, decisions)
+        summary = self._summary(turn, previous_events, decisions)
+        self._append_battle_history(turn)
+        self._append_core_trail(turn)
+        return summary
+
+    def _append_battle_history(self, turn: Turn) -> None:
+        """每 tick 追加一行战况增量到 arena_hero_battle_history.jsonl。
+
+        滚动保留最近 BATTLE_HISTORY_MAX_LINES 行。路径为空时（测试）不落盘。
+        """
+        path = self.battle_history_path
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            kills = {
+                "enemy_core": 0,
+                "enemy_ranger": 0,
+                "enemy_vanguard": 0,
+                "enemy_worker": 0,
+                "enemy_unknown": 0,
+            }
+            losses = {"worker": 0, "vanguard": 0, "ranger": 0}
+            shots = {"hit": 0, "miss": 0}
+            core_destroyed = False
+            killed_this_tick: set[str] = set()
+            for event in turn.events:
+                event_type = event.event_type
+                if event_type == "SHOT_HIT":
+                    shots["hit"] += 1
+                elif event_type == "SHOT_MISSED":
+                    shots["miss"] += 1
+                elif event_type == "CORE_DESTROYED":
+                    core_destroyed = True
+                if event_type != "UNIT_DAMAGED":
+                    continue
+                if event.values is None:
+                    continue
+                if int(event.values.get("hp", -1)) != 0:
+                    continue  # 非致命伤害不记
+                target_id = str(event.target_id) if event.target_id else None
+                if target_id is None or target_id in killed_this_tick:
+                    continue
+                # 我方阵亡一律以 lightning_recent_deaths 为准（observe 用删除前后编制
+                # 差集算，防 UNIT_DAMAGED 与 roster 移除不同步导致的漏计/双计）。
+                # 这里只计敌方单位击杀：目标既不在本 tick 阵亡名单、也不在我方编制。
+                if target_id in self.memory.lightning_recent_deaths:
+                    killed_this_tick.add(target_id)
+                    continue
+                if target_id in self.memory.unit_labels:
+                    killed_this_tick.add(target_id)
+                    continue
+                # 敌方单位被击杀：兵种从 enemy_sightings 查，查不到记 unknown
+                sighting = self.memory.enemy_sightings.get(target_id)
+                unit_type = sighting.unit_type if sighting else None
+                key = (
+                    f"enemy_{unit_type.lower()}"
+                    if unit_type and f"enemy_{unit_type.lower()}" in kills
+                    else "enemy_unknown"
+                )
+                kills[key] += 1
+                killed_this_tick.add(target_id)
+            # 我方阵亡（observe 已算好的每 tick 阵亡，含全部阵亡渠道）
+            for uid, object_type in self.memory.lightning_recent_deaths.items():
+                key = object_type.lower()
+                if key in losses:
+                    losses[key] += 1
+            # 敌核击杀去重：DESTRUCTION_PARTICIPATION reason=CORE，target 未计过才 +1
+            for event in turn.events:
+                if (
+                    event.event_type != "DESTRUCTION_PARTICIPATION"
+                    or event.reason_code != "CORE"
+                ):
+                    continue
+                target_id = str(event.target_id) if event.target_id else None
+                if target_id is None or target_id in self.memory.battle_enemy_cores_seen:
+                    continue
+                self.memory.battle_enemy_cores_seen.add(target_id)
+                kills["enemy_core"] += 1
+            if not any(kills.values()) and not any(losses.values()) and not any(
+                shots.values()
+            ) and not core_destroyed:
+                return  # 无战斗事件，不落行
+            record = {
+                "tick": turn.tick,
+                "ts": time.time(),
+                "kills": kills,
+                "losses": losses,
+                "shots": shots,
+                "core_destroyed": core_destroyed,
+            }
+            self._append_jsonl(path, record, BATTLE_HISTORY_MAX_LINES)
+        except OSError:
+            pass
+
+    def _append_core_trail(self, turn: Turn) -> None:
+        """每 tick 追加一行 Core 轨迹到 arena_hero_core_trail.jsonl。"""
+        path = self.core_trail_path
+        if path is None or turn.core is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            record = {
+                "tick": turn.tick,
+                "ts": time.time(),
+                "pos": list(turn.core.position),
+                "hp": turn.core.hp,
+                "shield": turn.core.shield,
+                "state": turn.core.view.state.value,
+                "hold": self.memory.core_hold,
+                "target": (
+                    list(self.memory.core_target)
+                    if self.memory.core_target is not None
+                    else None
+                ),
+                "transfer_mode": self.memory.core_transfer_mode,
+                "orbit_radius": self._lightning_patrol_radius(),
+            }
+            self._append_jsonl(path, record, CORE_TRAIL_MAX_LINES)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _append_jsonl(path: Path, record: dict, max_lines: int) -> None:
+        """以 O_APPEND 追加一行 JSON；文件超容量时截断（保留末尾 max_lines 行）。
+
+        只在文件字节数超过阈值时做行数截断，避免每 tick O(n) 扫描。
+        """
+        line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(line)
+        try:
+            if path.stat().st_size > max_lines * 128:
+                lines = path.read_text(encoding="utf-8").splitlines()
+                if len(lines) > max_lines:
+                    path.write_text(
+                        "\n".join(lines[-max_lines:]) + "\n", encoding="utf-8"
+                    )
+        except OSError:
+            pass
 
     def _worker_requires_core_exit(
         self,
@@ -3413,6 +3833,30 @@ class SmartTactic:
                 acted_units.add(pursuer.id)
         return False
 
+    def _core_target_arrived(self, turn: Turn) -> bool:
+        """Core 是否已到达网页控制台设定的目标坐标（进入到达死区）。"""
+        core = turn.core
+        target = self.memory.core_target
+        if core is None or target is None:
+            return False
+        return _distance(core.position, target) <= CORE_BEACON_HYSTERESIS
+
+    def _march_active(self, turn: Turn) -> bool:
+        """急行军转移中：有目标、未到达、且模式为 march。"""
+        return (
+            self.memory.core_transfer_mode == "march"
+            and self.memory.core_target is not None
+            and not self._core_target_arrived(turn)
+        )
+
+    def _fortify_hold_active(self, turn: Turn) -> bool:
+        """坚壁清野转移中：有目标、未到达、且模式为 fortify（工人只采不交）。"""
+        return (
+            self.memory.core_transfer_mode == "fortify"
+            and self.memory.core_target is not None
+            and not self._core_target_arrived(turn)
+        )
+
     def _choose_workers(
         self,
         turn: Turn,
@@ -3452,6 +3896,26 @@ class SmartTactic:
                 continue
             if worker.cargo:
                 self.memory.clear_worker_goal(worker)
+                if self._fortify_hold_active(turn):
+                    # 坚壁清野：携带资源但不提交，回到自己的轨道带货等待；
+                    # Core 到达目标后（_fortify_hold_active 变 False）恢复交付。
+                    orbit = self._lightning_orbit_waypoint(
+                        turn, worker, UnitType.WORKER
+                    )
+                    if orbit is not None and not self._lightning_step_toward(
+                        turn,
+                        planner,
+                        worker,
+                        orbit,
+                        "worker_fortify_hold",
+                    ):
+                        worker.wait()
+                    decisions.append(
+                        f"worker:{_short_id(worker.id)} fortify_hold cargo={worker.cargo}"
+                    )
+                    self.memory.decision_totals["worker:fortify_hold"] += 1
+                    acted_units.add(worker.id)
+                    continue
                 if worker.position == turn.core.position:
                     if turn.core.view.state is CoreState.NORMAL and remaining_space > 0:
                         worker.deposit()
@@ -3524,6 +3988,26 @@ class SmartTactic:
                     else:
                         self.memory.clear_worker_goal(worker)
                     continue
+            if self._march_active(turn):
+                # 急行军：停止采集，回归自己的轨道跟随 Core 稳定推进。
+                self.memory.clear_worker_goal(worker)
+                orbit = self._lightning_orbit_waypoint(
+                    turn, worker, UnitType.WORKER
+                )
+                if orbit is not None and not self._lightning_step_toward(
+                    turn,
+                    planner,
+                    worker,
+                    orbit,
+                    "worker_march",
+                ):
+                    worker.wait()
+                decisions.append(
+                    f"worker:{_short_id(worker.id)} march orbit={orbit}"
+                )
+                self.memory.decision_totals["worker:march"] += 1
+                acted_units.add(worker.id)
+                continue
             empty_workers.append(worker)
 
         unassigned = {worker.id: worker for worker in empty_workers}
@@ -6309,7 +6793,13 @@ class SmartTactic:
         )
 
     def _lightning_patrol_radius(self) -> int:
-        """巡逻半径偏外环（内圈火力猛，Core 不深入）。"""
+        """巡逻半径偏外环（内圈火力猛，Core 不深入）。
+
+        网页控制台可配置 core_orbit_radius > 0 时直接用该值；否则按
+        LIGHTNING_PATROL_RADIUS_FRACTION 在方环内推导。
+        """
+        if self.memory.core_orbit_radius > 0:
+            return self.memory.core_orbit_radius
         inner_r, outer_r = self.memory.lightning_ring
         if outer_r <= inner_r:
             return outer_r
@@ -8244,16 +8734,130 @@ class SmartTactic:
             hypotheses.append(cell)
         return tuple(hypotheses)
 
+    def _score_aim_cells(
+        self,
+        turn: Turn,
+        enemy: UnitView | CoreView,
+        planner: MovementPlanner,
+        *,
+        context: str = "default",  # "default" | "standoff_escape" | "vanguard_dance"
+    ) -> list[tuple[Position, float]]:
+        """对敌人候选下一格打分(越高越该瞄)。复用 _enemy_shot_hypotheses 枚举候选格,
+        _enemy_motion_pattern/_predicted_enemy_cell/_enemy_movement_anchor 读运动,
+        shot_miss_counts/axis_miss_counts 做脱靶降分。调用方取 max(score) 即预瞄格。
+
+        打分原则(用户拍板):敌方 agent 控制、原地概率小,STAY 基线最低;满血游侠主动入
+        弹道→锁原位换血;残血遇满血→后撤方向优先、上下次之、向前最低;相持→后撤优先
+        (后方常有障碍);追击/先锋贴脸→向前高分;连续脱靶某方向→降分(有上限防永久放弃)。
+        """
+        hypotheses = self._enemy_shot_hypotheses(turn, enemy, planner)
+        if not hypotheses:
+            return []
+        # 敌人最近一步方向(enemy_prev→position),用于打 BACKWARD/FORWARD/LATERAL/STAY 标签。
+        eid = str(enemy.id)
+        prev = self.memory.enemy_prev.get(eid)
+        current = enemy.position
+        step = (0, 0)
+        if prev is not None:
+            step = (current[0] - prev[0], current[1] - prev[1])
+        # 场景判定。
+        low_hp_flee = False
+        ambush_stay = False
+        approach_forward = False
+        if isinstance(enemy, UnitView):
+            # (a) 满血敌游侠主动入弹道(偷袭):hp2 且最近一步缩短了与某友方游侠距离。
+            if enemy.unit_type is UnitType.RANGER and enemy.hp == 2 and prev is not None:
+                for friendly in turn.rangers:
+                    if _distance(prev, friendly.position) > _distance(current, friendly.position):
+                        ambush_stay = True
+                        break
+            # (b) 残血敌遇满血我方游侠 → 预瞄后撤:游侠 hp1 / 先锋 hp2 / 满血工人(hp2)。
+            if (enemy.unit_type is UnitType.RANGER and enemy.hp <= 1) or (
+                enemy.unit_type is UnitType.VANGUARD and enemy.hp <= 2
+            ) or (enemy.unit_type is UnitType.WORKER and enemy.hp >= 2):
+                # 仅当确有满血友方游侠在附近时才算 flee 诱因。
+                if any(r.hp == 2 and _distance(r.position, current) <= 5 for r in turn.rangers):
+                    low_hp_flee = True
+            # (d) 先锋贴脸 / 追击我方残血 → 向前高分:vanguard_dance context 或先锋上一步朝某友方。
+            if context == "vanguard_dance":
+                approach_forward = True
+            elif enemy.unit_type is UnitType.VANGUARD and prev is not None:
+                for friendly in (*turn.rangers, *turn.vanguards):
+                    if _distance(prev, friendly.position) > _distance(current, friendly.position):
+                        approach_forward = True
+                        break
+
+        # 选权重表(优先级:ambush 锁原位 > 残血 flee > 相持 > 追击/贴脸)。
+        # 残血优先于追击:hp2 先锋虽在逼近,但其下一步大概率逃(用户原则:残血→后撤最高)。
+        weights = dict(AIM_DIRECTION_WEIGHTS)
+        if ambush_stay:
+            weights["STAY"] = AIM_AMBUSH_STAY_SCORE  # 锁原位换血
+        elif low_hp_flee:
+            # (b) 残血遇满血:后撤优先、上下次之、向前最低。
+            weights.update({"BACKWARD": 60.0, "LATERAL": 30.0, "FORWARD": 10.0, "STAY": 2.0})
+        elif context == "standoff_escape":
+            # (c) 相持:其他游侠预瞄逃跑方向,后撤优先(后方常有障碍)。
+            weights.update({"BACKWARD": 55.0, "LATERAL": 28.0, "FORWARD": 12.0, "STAY": 3.0})
+        elif approach_forward:
+            # (d) 追击/先锋贴脸:向前高分。
+            weights.update({"FORWARD": 55.0, "STAY": 20.0, "LATERAL": 25.0, "BACKWARD": 15.0})
+
+        target_key = eid
+        scored: list[tuple[Position, float]] = []
+        for cell in hypotheses:
+            # 方向标签(相对敌人最近一步)。
+            tag = self._aim_direction_tag(current, cell, step)
+            score = weights.get(tag, AIM_DIRECTION_WEIGHTS["STAY"])
+            # 重复覆盖格偏好(保留 ranger:shot_coverage 语义)。
+            if (target_key, cell) in self.memory.current_shot_cells:
+                score += AIM_COVERAGE_BONUS
+            # 脱靶降分(封顶防永久放弃某方向)。
+            cell_miss = self.memory.shot_miss_counts.get(
+                _shot_cell_key(enemy.id, cell), 0
+            )
+            axis_key = _shot_axis_key(enemy.id, current, cell)
+            axis_miss = self.memory.axis_miss_counts.get(axis_key or "", 0) if axis_key else 0
+            penalty = min(
+                AIM_MISS_PENALTY_CAP,
+                cell_miss * AIM_MISS_CELL_PENALTY + axis_miss * AIM_MISS_AXIS_PENALTY,
+            )
+            score -= penalty
+            scored.append((cell, score))
+        return scored
+
+    @staticmethod
+    def _aim_direction_tag(
+        enemy_pos: Position, cell: Position, step: tuple[int, int]
+    ) -> str:
+        """射击格 cell 相对敌人当前格 + 最近一步的方向标签。
+
+        STAY=原地; BACKWARD=与最近一步反向; FORWARD=同向; LATERAL=垂直轴。
+        敌人未动(step=0)时非原位格记 LATERAL(横向候选),原位记 STAY。
+        """
+        dx = cell[0] - enemy_pos[0]
+        dy = cell[1] - enemy_pos[1]
+        if dx == 0 and dy == 0:
+            return "STAY"
+        sx, sy = step
+        if sx == 0 and sy == 0:
+            return "LATERAL"  # 敌未动:非原位格视为横向候选
+        # 与最近一步点积判定。
+        dot = dx * sx + dy * sy
+        if dot > 0:
+            return "FORWARD"
+        if dot < 0:
+            return "BACKWARD"
+        return "LATERAL"
+
     def _ranger_shot_candidates(
         self,
         turn: Turn,
         ranger: Ranger,
         planner: MovementPlanner,
     ) -> list[tuple[UnitView | CoreView, Position]]:
-        """返回 (敌人, 射击格) 候选，并协调同 Tick 的火力覆盖。"""
+        """返回 (敌人, 射击格) 候选,并协调同 Tick 的火力覆盖。射击格由打分制选定。"""
         candidates: list[tuple[UnitView | CoreView, Position]] = []
         for enemy in turn.visible_enemies:
-            target_key = str(enemy.id)
             target_prefix = f"{enemy.id}|"
             target_has_recent_miss = any(
                 shot_key.startswith(target_prefix) and miss_count > 0
@@ -8275,38 +8879,26 @@ class SmartTactic:
             )
             if not legal_cells:
                 continue
-            candidates.append(
-                (
-                    enemy,
-                    min(
-                        legal_cells,
-                        key=lambda cell: (
-                            1
-                            if coverage_active
-                            and (target_key, cell) in self.memory.current_shot_cells
-                            else 0,
-                            # 按轴脱靶惩罚：ZIGZAG 围猎时把火力导向脱靶少的对轴，
-                            # 破解"永远瞄错方向"的僵持。非 ZIGZAG 时多为 0、无副作用。
-                            self.memory.axis_miss_counts.get(
-                                _shot_axis_key(enemy.id, enemy.position, cell) or "",
-                                0,
-                            ),
-                            self.memory.shot_miss_counts.get(
-                                _shot_cell_key(enemy.id, cell),
-                                0,
-                            ),
-                            legal_cells.index(cell),
-                            cell,
-                        ),
-                    ),
-                )
+            # 打分制:对候选格打分取最高(平手按 legal_cells 序 + cell 决胜,保持确定性)。
+            scored = self._score_aim_cells(turn, enemy, planner)
+            score_by_cell = {cell: score for cell, score in scored}
+            best_cell = max(
+                legal_cells,
+                key=lambda cell: (
+                    score_by_cell.get(cell, 0.0),
+                    -legal_cells.index(cell),
+                    _cell_sort_key(cell),
+                ),
             )
+            candidates.append((enemy, best_cell))
         return candidates
+
 
     def _mark_ranger_shot(
         self,
         target: UnitView | CoreView,
         cell: Position,
+        blind: bool = False,
     ) -> None:
         target_key = str(target.id)
         if cell != target.position or self.memory.shot_miss_counts.get(
@@ -8315,6 +8907,10 @@ class SmartTactic:
         ):
             self.memory.decision_totals["ranger:shot_coverage"] += 1
         self.memory.current_shot_cells.add((target_key, cell))
+        # 盲区射击：射击格落在敌方游侠/先锋视野盲区里（对峙换血位即盲区位）。
+        # 单独累计供验收“卡视野盲区”机制是否真的在产出无伤命中。
+        if blind:
+            self.memory.decision_totals["ranger:blind_fire"] += 1
         # 按轴记录本次射击：射击格相对敌人当前格的主轴。ZIGZAG 围猎里，
         # 同一轴连续开枪却打不中，下一帧候选会偏向对轴（见 _ranger_shot_candidates）。
         axis_key = _shot_axis_key(target.id, target.position, cell)
@@ -10729,28 +11325,139 @@ class SmartTactic:
             acted_units.add(vanguard.id)
 
     def _lightning_standoff_enemy(self, turn: Turn) -> UnitView | None:
-        """对峙僵局中的敌方游侠：近几帧几乎原地（等我方先动）且在我方游侠
-        交战距离内。双方互相预测对方、都不先动时——调另一游侠从对角远位
-        换血：敌方未预瞄该新方向，动则中枪、不动则挨打；我方换血游侠
-        中枪后由既有 MEDIVAC 回 Core 回血、下一名接力。
+        """对峙僵局中的敌方游侠(薄包装):委托 _detect_strategic_standoff,
+        仅当 kind=="ranger_ranger" 时返回该敌游侠,保持既有测试契约。
         """
+        standoff = self._detect_strategic_standoff(turn)
+        if standoff is None or standoff.kind != "ranger_ranger":
+            return None
+        return standoff.enemy
+
+    def _detect_strategic_standoff(self, turn: Turn) -> StrategicStandoff | None:
+        """泛化战略相持检测:不止游侠-游侠互瞄,还包括被围的低血敌先锋、被堵的逃命敌工人。
+        任一检出即触发 45°支援换血(用户原则:主动触发、低限制、常用)。
+
+        返回 StrategicStandoff(original_cell = 敌当前格 = 支援游侠要瞄的格)。
+        """
+        friendly_positions = [u.position for u in turn.rangers] + [u.position for u in turn.vanguards]
         for enemy in sorted(turn.visible_enemies, key=lambda e: e.id.bytes):
-            if not isinstance(enemy, UnitView) or enemy.unit_type is not UnitType.RANGER:
+            if not isinstance(enemy, UnitView):
                 continue
-            trail = self.memory.enemy_trails.get(str(enemy.id), [])
-            if not trail:
-                continue
-            recent = trail[-4:]
-            xs = [p[0] for p in recent]
-            ys = [p[1] for p in recent]
-            if max(xs) - min(xs) > 2 or max(ys) - min(ys) > 2:
-                continue  # 位移超出 2x2 盒 → 在机动，不是僵持
-            if any(
-                _distance(unit.position, enemy.position) <= 4
-                for unit in turn.rangers
-            ):
-                return enemy
+            current = enemy.position
+            # (a) ranger_ranger:敌游侠近4帧在2x2盒原地 + 有友方游侠≤4格。
+            if enemy.unit_type is UnitType.RANGER:
+                trail = self.memory.enemy_trails.get(str(enemy.id), [])
+                if trail:
+                    recent = trail[-4:]
+                    xs = [p[0] for p in recent]
+                    ys = [p[1] for p in recent]
+                    if max(xs) - min(xs) <= 2 and max(ys) - min(ys) <= 2:
+                        if any(
+                            _distance(unit.position, current) <= 4
+                            for unit in turn.rangers
+                        ):
+                            return StrategicStandoff(enemy, "ranger_ranger", current)
+            # (b) vanguard_cornered:敌先锋 hp≤2 + 4 cardinal 中≥2 被障碍/友方占据。
+            if enemy.unit_type is UnitType.VANGUARD and enemy.hp <= 2:
+                boxed = sum(
+                    1
+                    for direction in DIRECTION_ORDER
+                    if self._cell_blocked_by_obstacle_or_friendly(
+                        _destination(current, direction), friendly_positions, turn, planner=None
+                    )
+                )
+                if boxed >= 2:
+                    return StrategicStandoff(enemy, "vanguard_cornered", current)
+            # (c) worker_fleeing:敌工人满血(hp2) + 最后一步远离我 Core/anchor + 逃跑受限。
+            if enemy.unit_type is UnitType.WORKER and enemy.hp >= 2:
+                trail = self.memory.enemy_trails.get(str(enemy.id), [])
+                if len(trail) >= 2:
+                    prev = trail[-2]
+                    # 最后一步远离我 Core。
+                    core_pos = turn.core.position if turn.core is not None else None
+                    fleeing = (
+                        core_pos is not None
+                        and _distance(prev, core_pos) < _distance(current, core_pos)
+                    )
+                    if fleeing:
+                        # 逃跑受限:4 cardinal ≥2 被堵,或有友游侠≤3格卡撤退轴。
+                        boxed = sum(
+                            1
+                            for direction in DIRECTION_ORDER
+                            if self._cell_blocked_by_obstacle_or_friendly(
+                                _destination(current, direction), friendly_positions, turn, planner=None
+                            )
+                        )
+                        ranger_near = any(
+                            _distance(r.position, current) <= 3 for r in turn.rangers
+                        )
+                        if boxed >= 2 or ranger_near:
+                            return StrategicStandoff(enemy, "worker_fleeing", current)
         return None
+
+    def _cell_blocked_by_obstacle_or_friendly(
+        self,
+        cell: Position,
+        friendly_positions: list[Position],
+        turn: Turn,
+        *,
+        planner: MovementPlanner | None,
+    ) -> bool:
+        """该格是否被障碍或友方战斗单位占据(用于判定敌是否被围/逃跑受限)。
+        planner 可为 None——此时用 memory.known_obstacles + 当前友方位作近似。
+        """
+        obstacles = (
+            planner.obstacles
+            if planner is not None
+            else (set(self.memory.known_obstacles) | set(turn.obstacle_cells))
+        )
+        if cell in obstacles:
+            return True
+        return cell in friendly_positions
+
+    def _pick_diagonal_support_ranger(
+        self,
+        turn: Turn,
+        standoff: StrategicStandoff,
+        planner: MovementPlanner,
+        *,
+        acted_units: set[UUID],
+        vacancy_by_id: dict,
+        relay_cell: Position | None,
+        exclude_ids: set[UUID],
+    ) -> Ranger | None:
+        """挑满血、未参战、离对峙点最近且未被指派的游侠做 45°支援。
+
+        放宽既有 _distance>3 限制(用户:低限制)——只要不在对峙点本身、未被 ShotLedger
+        占用即可。优先调第三方游侠(不已在互瞄环 exclude_ids 内的),环外无可用则允许
+        任意满血游侠。盲区位优先、无盲区直接取最远对角(_standoff_relay_cell 已落地)。
+        """
+        if relay_cell is None:
+            return None
+        target = standoff.original_cell
+
+        def eligible(ranger: Ranger) -> bool:
+            return (
+                ranger.hp == 2
+                and ranger.id not in acted_units
+                and ranger.id not in vacancy_by_id
+                and ranger.id not in exclude_ids
+                and ranger.id not in self.memory.standoff_support_assigned
+                and ranger.position != target
+            )
+
+        all_rangers = [r for r in turn.rangers if eligible(r)]
+        if not all_rangers:
+            return None
+        # 优先选不在互瞄环内的第三方(打破僵局);无则任意满血(低限制)。
+        third_party = [r for r in all_rangers if r.id not in exclude_ids]
+        pool = third_party or all_rangers
+        chosen = min(
+            pool,
+            key=lambda r: (_distance(r.position, relay_cell), r.id.bytes),
+        )
+        self.memory.standoff_support_assigned.add(str(chosen.id))
+        return chosen
 
     def _standoff_relay_cell(
         self,
@@ -10783,6 +11490,257 @@ class SmartTactic:
             return min(straight_far, key=lambda cell: cell)
         return None
 
+    def _find_vanguard_dance_target(
+        self, turn: Turn, ranger: Ranger
+    ) -> UnitView | None:
+        """挑该游侠 kiting 接战范围(VANGUARD_DANCE_ENGAGE_RADIUS)内最近的敌先锋。
+        优先选已在 vanguard_dance_phase 跟踪的(延续舞步),否则挑最近的新目标。"""
+        tracked_enemy_ids = {
+            key.split("|", 1)[1]
+            for key in self.memory.vanguard_dance_phase
+            if key.split("|", 1)[0] == str(ranger.id)
+        }
+        in_range = [
+            enemy
+            for enemy in turn.visible_enemies
+            if isinstance(enemy, UnitView)
+            and enemy.unit_type is UnitType.VANGUARD
+            and _distance(ranger.position, enemy.position) <= VANGUARD_DANCE_ENGAGE_RADIUS
+        ]
+        if not in_range:
+            return None
+        # 优先延续已跟踪的。
+        tracked = [e for e in in_range if str(e.id) in tracked_enemy_ids]
+        pool = tracked or in_range
+        return min(pool, key=lambda e: (_distance(ranger.position, e.position), e.id.bytes))
+
+    def _resolve_vanguard_dance(
+        self,
+        turn: Turn,
+        planner: MovementPlanner,
+        ranger: Ranger,
+        enemy_vanguard: UnitView,
+        ledger: ShotLedger,
+        decisions: list[str],
+    ) -> bool:
+        """游侠 vs 敌先锋单杀舞步(4 阶段状态机)。返回 True=本游侠已处理。
+
+        APPROACH_GAP(距2预瞄中间格) → ADJACENT_BACK(贴脸hp≥3后退诱空) →
+        REAIM_GAP_HP2(hp2预瞄撤退格) → FLEE_AMBUSH(敌反攻我掉hp1逃向集群+集群设伏)。
+        在 _choose_rangers_lightning 的 legal 射击分支之前介入。
+        """
+        pair_key = f"{ranger.id}|{enemy_vanguard.id}"
+        phase_state = self.memory.vanguard_dance_phase.get(pair_key)
+        # 无跟踪态时按距离决定是否启动舞步。
+        phase = phase_state["phase"] if phase_state else None
+        dist = _distance(ranger.position, enemy_vanguard.position)
+
+        # FLEE_AMBUSH:上一 tick 处于 REAIM_GAP_HP2,本 tick 我游侠掉到 hp1 且先锋仍贴脸可见。
+        if phase == "REAIM_GAP_HP2" and ranger.hp <= 1:
+            phase = "FLEE_AMBUSH"
+
+        # 启动判定:无 phase 且距离=2 且先锋上一步朝我 → APPROACH_GAP。
+        if phase is None and dist == 2:
+            prev = self.memory.enemy_prev.get(str(enemy_vanguard.id))
+            if prev is not None and _distance(prev, ranger.position) > dist:
+                phase = "APPROACH_GAP"
+
+        if phase is None:
+            return False
+
+        # 写回 phase_state(更新 hp/prev 记录)。
+        self.memory.vanguard_dance_phase[pair_key] = {
+            "phase": phase,
+            "enemy_hp_last": enemy_vanguard.hp,
+            "enemy_prev_cell": self.memory.enemy_prev.get(str(enemy_vanguard.id)),
+            "tick": turn.tick,
+        }
+
+        if phase == "APPROACH_GAP":
+            # 预瞄中间格(先锋贴脸必经格)。
+            gap = self._vanguard_dance_gap_cell(ranger, enemy_vanguard)
+            if gap is not None and _is_legal_ranger_shot(
+                ranger.position, gap, planner.obstacles
+            ):
+                if ledger.can_assign(enemy_vanguard, predicted=True):
+                    ranger.shoot(enemy_vanguard, expected_cell=gap)
+                    ledger.assign(ranger, enemy_vanguard, gap)
+                    self._mark_ranger_shot(enemy_vanguard, gap, blind=False)
+                    decisions.append(
+                        f"ranger:{_short_id(ranger.id)} vanguard_dance APPROACH_GAP "
+                        f"target={_short_id(enemy_vanguard.id)} gap={gap}"
+                    )
+                    self.memory.decision_totals["ranger:vanguard_dance"] += 1
+                    self.memory.decision_totals["ranger:shot"] += 1
+                    self.memory.vanguard_dance_phase[pair_key]["phase"] = "ADJACENT_BACK"
+                    return True
+            return False
+
+        if phase == "ADJACENT_BACK":
+            # 贴脸且先锋 hp≥3 → 其下一动作必进攻,我后退一格让其扑空。
+            if dist <= 1 and enemy_vanguard.hp >= 3:
+                back_dir = self._vanguard_dance_back_direction(ranger, enemy_vanguard)
+                if back_dir is not None and self._can_ranger_move_to(
+                    turn, planner, ranger, back_dir
+                ):
+                    ranger.move(back_dir)
+                    decisions.append(
+                        f"ranger:{_short_id(ranger.id)} vanguard_dance ADJACENT_BACK "
+                        f"retreat={back_dir}"
+                    )
+                    self.memory.decision_totals["ranger:vanguard_dance"] += 1
+                    self.memory.vanguard_dance_phase[pair_key]["phase"] = "REAIM_GAP_HP2"
+                    return True
+                # 被卡 → 回退向 Core。
+                if turn.core is not None and planner.toward(
+                    ranger, turn.core.position, "vanguard_dance_retreat"
+                ):
+                    decisions.append(
+                        f"ranger:{_short_id(ranger.id)} vanguard_dance ADJACENT_BACK retreat_core"
+                    )
+                    self.memory.decision_totals["ranger:vanguard_dance"] += 1
+                    self.memory.vanguard_dance_phase[pair_key]["phase"] = "REAIM_GAP_HP2"
+                    return True
+            # 先锋已掉到 hp2 或离开贴脸 → 跳到 REAIM_GAP_HP2。
+            self.memory.vanguard_dance_phase[pair_key]["phase"] = "REAIM_GAP_HP2"
+            return False
+
+        if phase == "REAIM_GAP_HP2":
+            # 先锋 hp2 → 预判逃跑,预瞄其撤退格(低血 flee 权重已优先 BACKWARD)。
+            if enemy_vanguard.hp <= 2:
+                scored = self._score_aim_cells(
+                    turn, enemy_vanguard, planner, context="default"
+                )
+                legal_scored = [
+                    (cell, score)
+                    for cell, score in scored
+                    if _is_legal_ranger_shot(
+                        ranger.position, cell, planner.obstacles
+                    )
+                ]
+                if legal_scored and ledger.can_assign(enemy_vanguard, predicted=True):
+                    cell = max(
+                        legal_scored,
+                        key=lambda cs: (cs[1], _cell_sort_key(cs[0])),
+                    )[0]
+                    ranger.shoot(enemy_vanguard, expected_cell=cell)
+                    ledger.assign(ranger, enemy_vanguard, cell)
+                    self._mark_ranger_shot(enemy_vanguard, cell, blind=False)
+                    decisions.append(
+                        f"ranger:{_short_id(ranger.id)} vanguard_dance REAIM_GAP_HP2 "
+                        f"target={_short_id(enemy_vanguard.id)} cell={cell}"
+                    )
+                    self.memory.decision_totals["ranger:vanguard_dance"] += 1
+                    self.memory.decision_totals["ranger:shot"] += 1
+                    return True
+            # 先锋没掉到 hp2(仍 hp3+)或无合法撤退格 → 留在 ADJACENT_BACK 继续。
+            self.memory.vanguard_dance_phase[pair_key]["phase"] = "ADJACENT_BACK"
+            return False
+
+        if phase == "FLEE_AMBUSH":
+            # 我游侠掉到 hp1:逃向集群(最近友游侠/Core)。
+            cluster_anchor = self._cluster_anchor(turn, ranger)
+            if cluster_anchor is not None and planner.toward(
+                ranger, cluster_anchor, "vanguard_dance_flee"
+            ):
+                decisions.append(
+                    f"ranger:{_short_id(ranger.id)} vanguard_dance FLEE_AMBUSH "
+                    f"flee_to={cluster_anchor}"
+                )
+                self.memory.decision_totals["ranger:vanguard_dance"] += 1
+            else:
+                ranger.wait()
+                decisions.append(
+                    f"ranger:{_short_id(ranger.id)} vanguard_dance FLEE_AMBUSH wait"
+                )
+            # 其他游侠预瞄追兵必经路 → 由常规打分制 legal 分支处理(先锋追击时上一步
+            # 朝我方友军→approach_forward=True→FORWARD 高分选追兵推进格)。本 tick 其他
+            # 游侠对该先锋开枪由 legal 分支 _enemy_is_flee_ambush_pursuer 计 ambush_trade。
+            # 保留 FLEE_AMBUSH 配对到下一 tick(供其他游侠本 tick 检测);逃跑游侠回 hp2
+            # 或先锋离视野时清掉(见 _find_vanguard_dance_target 启动前的清理 + observe 清理)。
+            self.memory.vanguard_dance_phase[pair_key]["phase"] = "FLEE_AMBUSH"
+            self.memory.vanguard_dance_phase[pair_key]["flee_tick"] = turn.tick
+            return True
+
+        # 舞步配对过期清理:逃跑游侠已回满血(hp2)或先锋已不在 kiting 范围 → 清配对。
+        if phase == "FLEE_AMBUSH" and ranger.hp >= 2:
+            self.memory.vanguard_dance_phase.pop(pair_key, None)
+            return False
+
+        return False
+
+    def _vanguard_dance_gap_cell(
+        self, ranger: Ranger, enemy: UnitView
+    ) -> Position | None:
+        """游侠与先锋之间的中间格(先锋贴脸必经格)。仅当二者共线(横/竖/对角)时存在。"""
+        rx, ry = ranger.position
+        ex, ey = enemy.position
+        dx, dy = ex - rx, ey - ry
+        # 共线且距离=2:中间格 = ranger + 单位方向。
+        if abs(dx) == 2 and dy == 0:
+            return (rx + (1 if dx > 0 else -1), ry)
+        if abs(dy) == 2 and dx == 0:
+            return (rx, ry + (1 if dy > 0 else -1))
+        if abs(dx) == 2 and abs(dy) == 2:
+            return (rx + (1 if dx > 0 else -1), ry + (1 if dy > 0 else -1))
+        return None
+
+    def _vanguard_dance_back_direction(
+        self, ranger: Ranger, enemy: UnitView
+    ) -> Direction | None:
+        """先锋→游侠向量的反方向(游侠后退方向,远离先锋)。仅 cardinal。"""
+        rx, ry = ranger.position
+        ex, ey = enemy.position
+        dx, dy = rx - ex, ry - ey  # 远离先锋的方向
+        if abs(dx) >= abs(dy) and dx != 0:
+            return Direction.RIGHT if dx > 0 else Direction.LEFT
+        if abs(dy) > abs(dx) and dy != 0:
+            return Direction.DOWN if dy > 0 else Direction.UP
+        return None
+
+    def _can_ranger_move_to(
+        self, turn: Turn, planner: MovementPlanner, ranger: Ranger, direction: Direction
+    ) -> bool:
+        """游侠能否朝该方向走一格(非障碍、非敌、容量未满)。用于 dance 后退判定。"""
+        dest = _destination(ranger.position, direction)
+        if dest in planner.obstacles or dest in planner.enemy_cells:
+            return False
+        return planner.final_occupancy(dest) < 2
+
+    def _cluster_anchor(self, turn: Turn, ranger: Ranger) -> Position | None:
+        """最近友游侠(非自己)或 Core,作为受伤游侠逃跑目的地。"""
+        others = [r for r in turn.rangers if r.id != ranger.id]
+        if others:
+            nearest = min(others, key=lambda r: (_distance(r.position, ranger.position), r.id.bytes))
+            return nearest.position
+        if turn.core is not None:
+            return turn.core.position
+        return None
+
+    def _enemy_is_flee_ambush_pursuer(
+        self, turn: Turn, enemy: UnitView | CoreView, shooter: Ranger
+    ) -> bool:
+        """该敌是否正作为某 FLEE_AMBUSH 舞步的追兵(且 shooter 不是逃跑者本人)。
+
+        FLEE_AMBUSH 时逃跑游侠已清配对并逃向集群,其他游侠对追兵(该先锋)开枪
+        即集群设伏。检查 vanguard_dance_phase 里 phase==FLEE_AMBUSH 的配对,
+        其 enemy 段 == 该敌 id,且配对 ranger 段 != shooter.id。
+        """
+        if not isinstance(enemy, UnitView):
+            return False
+        enemy_id = str(enemy.id)
+        shooter_id = str(shooter.id)
+        for pair_key, state in self.memory.vanguard_dance_phase.items():
+            if state.get("phase") != "FLEE_AMBUSH":
+                continue
+            parts = pair_key.split("|", 1)
+            if len(parts) != 2:
+                continue
+            pair_ranger, pair_enemy = parts
+            if pair_enemy == enemy_id and pair_ranger != shooter_id:
+                return True
+        return False
+
     def _choose_rangers_lightning(
         self, turn: Turn, planner: MovementPlanner, acted_units: set[UUID], decisions: list[str],
     ) -> None:
@@ -10793,33 +11751,52 @@ class SmartTactic:
         relief_by_id = {relief.ranger_id: relief for relief in plan.reliefs}
         ledger = ShotLedger()
         contacts_by_id = {contact.enemy.id: contact for contact in plan.threats}
-        # 对峙僵局换血：敌游侠原地不动等我方先动时，指派一名未参战的满血
-        # 游侠走到它盲区里的对角远位。到位后由上方 legal 分支自动开火；
-        # 中枪掉 1 HP 由既有 MEDIVAC 接管回血、下一名接力。
-        standoff = self._lightning_standoff_enemy(turn)
+        # 泛化战略相持:游侠互瞄死锁 / 被围残血先锋 / 被堵逃命工人。
+        # 检出即指派一名满血游侠走到对角最远位换血(用户:主动触发、低限制、常用)。
+        # 相持时双方都在预瞄对方下一步→原位恰好无人瞄,支援游侠直接射敌当前格。
+        strategic_standoff = self._detect_strategic_standoff(turn)
+        standoff = strategic_standoff.enemy if strategic_standoff is not None else None
         standoff_relay_cell = (
             self._standoff_relay_cell(turn, standoff, planner) if standoff is not None else None
         )
+        # 相持触发计数:检出战略相持且能算出换血位即计一次。
+        if strategic_standoff is not None and standoff_relay_cell is not None:
+            self.memory.decision_totals["ranger:standoff_engaged"] += 1
+        # 45°支援游侠挑选(放宽 _distance>3 限制,优先调第三方破僵局)。
+        # T4 核心告急时跳过(Core 存活优先):exclude 含已投入 T4 contact 的游侠。
+        t4_imminent = any(
+            c.tier == "T4" and c.core_eta <= 1 for c in plan.threats
+        )
         standoff_relay_ranger_id: UUID | None = None
-        if standoff is not None and standoff_relay_cell is not None:
-            candidates_relay = [
-                ranger
-                for ranger in turn.rangers
-                if ranger.id not in acted_units
-                and ranger.id not in vacancy_by_id
-                and ranger.hp == 2
-                and _distance(ranger.position, standoff.position) > 3  # 未参战方向
-                and ranger.position != standoff_relay_cell
-            ]
-            if candidates_relay:
-                relay_ranger = min(
-                    candidates_relay,
-                    key=lambda unit: (
-                        _distance(unit.position, standoff_relay_cell),
-                        unit.id.bytes,
-                    ),
-                )
-                standoff_relay_ranger_id = relay_ranger.id
+        standoff_support_ranger_id: UUID | None = None
+        if strategic_standoff is not None and standoff_relay_cell is not None and not t4_imminent:
+            # 互瞄环 exclude_ids = 距敌 ≤4 的游侠(已在相持里的)。
+            exclude_ids = {
+                r.id for r in turn.rangers
+                if _distance(r.position, standoff.position) <= 4
+            }
+            support_ranger = self._pick_diagonal_support_ranger(
+                turn, strategic_standoff, planner,
+                acted_units=acted_units, vacancy_by_id=vacancy_by_id,
+                relay_cell=standoff_relay_cell, exclude_ids=exclude_ids,
+            )
+            if support_ranger is not None:
+                standoff_support_ranger_id = support_ranger.id
+                # 推进指派沿用旧字段名(复用既有 standoff_relay_advance 移动分支)。
+                standoff_relay_ranger_id = support_ranger.id
+        # FLEE_AMBUSH 预标记:遍历 REAIM_GAP_HP2 配对,若该游侠本 tick 掉到 hp1
+        # (先锋 hp2 时没逃反攻了我),把配对标 FLEE_AMBUSH,供其他游侠 legal 分支计数
+        # ambush_trade。MEDIVAC 分支会接管该 hp1 游侠回 Core(即"逃向集群"的撤退部分)。
+        for pair_key, state in list(self.memory.vanguard_dance_phase.items()):
+            if state.get("phase") != "REAIM_GAP_HP2":
+                continue
+            pair_ranger_str = pair_key.split("|", 1)[0]
+            pair_ranger = next(
+                (r for r in turn.rangers if str(r.id) == pair_ranger_str), None
+            )
+            if pair_ranger is not None and pair_ranger.hp <= 1:
+                state["phase"] = "FLEE_AMBUSH"
+                state["flee_tick"] = turn.tick
         for ranger in sorted(turn.rangers, key=_uuid_key):
             if ranger.id in acted_units:
                 continue
@@ -10837,9 +11814,15 @@ class SmartTactic:
                 last_stand = [item for item in legal if item[2] is not None and item[2].tier == "T4" and item[2].core_eta <= 1]
                 if last_stand:
                     enemy, cell, _, _ = min(last_stand, key=lambda item: (_effective_hp(item[0]), item[0].id.bytes, item[1]))
-                    ranger.shoot(enemy, expected_cell=cell); ledger.assign(ranger, enemy, cell); self._mark_ranger_shot(enemy, cell)
+                    # 站在自己认领的盲区换血位上开枪 = 盲区射击（对峙换血机制产出）。
+                    on_blind_cell = (
+                        standoff_relay_cell is not None
+                        and ranger.position == standoff_relay_cell
+                    )
+                    ranger.shoot(enemy, expected_cell=cell); ledger.assign(ranger, enemy, cell); self._mark_ranger_shot(enemy, cell, blind=on_blind_cell)
                     decisions.append(f"ranger:{_short_id(ranger.id)} LAST_STAND shot target={_short_id(enemy.id)}")
                     self.memory.decision_totals["ranger:last_stand"] += 1
+                    self.memory.decision_totals["ranger:shot"] += 1
                 else:
                     at_home = ranger.position == turn.core.position
                     if not at_home and not planner.toward(ranger, turn.core.position, "ranger_medivac"):
@@ -10852,6 +11835,44 @@ class SmartTactic:
                         continue
                 acted_units.add(ranger.id)
                 continue
+            # Mode B:游侠单杀先锋舞步(在 legal 射击之前介入,T4 核心告急时跳过)。
+            if not t4_imminent:
+                dance_enemy = self._find_vanguard_dance_target(turn, ranger)
+                if dance_enemy is not None:
+                    if self._resolve_vanguard_dance(
+                        turn, planner, ranger, dance_enemy, ledger, decisions
+                    ):
+                        acted_units.add(ranger.id)
+                        continue
+            # Mode A:45°支援游侠到位后射敌原位(相持时原位无人瞄)。
+            # 置于通用 legal 之前→支援游侠瞄原位胜出;其他游侠 fall through 走打分制。
+            if (
+                standoff_support_ranger_id == ranger.id
+                and strategic_standoff is not None
+                and standoff_relay_cell is not None
+                and ranger.position == standoff_relay_cell
+            ):
+                support_enemy = standoff
+                contact = contacts_by_id.get(support_enemy.id)
+                # 若该敌是 T4 即将打 Core,让 LAST_STAND 接管(下个 medivac 循环会处理)。
+                if contact is None or not (contact.tier == "T4" and contact.core_eta <= 1):
+                    if ledger.can_assign(support_enemy, predicted=False):
+                        cell = support_enemy.position
+                        on_blind_cell = ranger.position in self._enemy_blind_firing_cells(
+                            turn, cell, planner.obstacles
+                        )
+                        ranger.shoot(support_enemy, expected_cell=cell)
+                        ledger.assign(ranger, support_enemy, cell)
+                        self._mark_ranger_shot(support_enemy, cell, blind=on_blind_cell)
+                        decisions.append(
+                            f"ranger:{_short_id(ranger.id)} diagonal_support "
+                            f"target={_short_id(support_enemy.id)} "
+                            f"kind={strategic_standoff.kind} cell={cell}"
+                        )
+                        self.memory.decision_totals["ranger:diagonal_support"] += 1
+                        self.memory.decision_totals["ranger:shot"] += 1
+                        acted_units.add(ranger.id)
+                        continue
             if legal:
                 def priority(item: tuple[UnitView | CoreView, Position, ThreatContact | None, bool]) -> tuple:
                     enemy, cell, contact, predicted = item
@@ -10859,9 +11880,17 @@ class SmartTactic:
                             contact.core_eta if contact else 99, _enemy_role_priority(enemy),
                             _effective_hp(enemy), 1 if predicted else 0, enemy.id.bytes, cell)
                 enemy, cell, _, _ = min(legal, key=priority)
-                ranger.shoot(enemy, expected_cell=cell); ledger.assign(ranger, enemy, cell); self._mark_ranger_shot(enemy, cell)
+                on_blind_cell = (
+                    standoff_relay_cell is not None
+                    and ranger.position == standoff_relay_cell
+                )
+                ranger.shoot(enemy, expected_cell=cell); ledger.assign(ranger, enemy, cell); self._mark_ranger_shot(enemy, cell, blind=on_blind_cell)
                 decisions.append(f"ranger:{_short_id(ranger.id)} ShotLedger shoot target={_short_id(enemy.id)} assigned={ledger.assigned_damage[enemy.id]}")
                 self.memory.decision_totals["ranger:shot"] += 1
+                # FLEE_AMBUSH 设伏:若该敌正是某舞步处于 FLEE_AMBUSH 阶段的追兵,
+                # 该游侠(非逃跑者本人)的开枪即集群预瞄追兵必经路。
+                if self._enemy_is_flee_ambush_pursuer(turn, enemy, ranger):
+                    self.memory.decision_totals["ranger:ambush_trade"] += 1
                 acted_units.add(ranger.id)
                 continue
             # 对峙僵局换血位推进：优先于巡逻/支援移动，但不抢占已有合法射击
@@ -11132,60 +12161,94 @@ class SmartTactic:
         # pop ≥ 9:由 _select_spawn 的 3:1/阵亡补同种逻辑决定,这里返回 None 占位。
         return None
 
+    def _unit_capped(self, unit_type: UnitType, turn: Turn) -> bool:
+        """该兵种是否达到网页控制台设定的独立上限（0/缺省 = 无上限）。
+
+        控制文件 unit_caps 用小写 key（{"worker":..,"vanguard":..,"ranger":..}），
+        unit_type.value 是大写，这里统一转小写查。
+        """
+        cap = self.memory.unit_caps.get(unit_type.value.lower(), 0)
+        if cap <= 0:
+            return False
+        count = sum(1 for unit in turn.units if unit.unit_type == unit_type)
+        return count >= cap
+
     def _lightning_ratio_spawn(
         self,
         turn: Turn,
         died: dict[str, str],
     ) -> UnitType | None:
-        """pop ≥ 9 的选兵:阵亡补同种优先,否则按 3:1(游侠:工人)趋近。
+        """pop ≥ 9 的选兵:阵亡补同种优先,否则按可配比例(游侠:工人)趋近。
 
         died: 本 tick 阵亡单位 {uid: unit_type 名}。
-        先锋维持 1 个(先锋阵亡且当前 vg=0 → 补先锋);否则补最近阵亡且缺失更
-        严重的那类;无阵亡则纯增长按 3:1 趋近(rk<3*wk 补游侠,反之补工人,
-        持平时默认补游侠推到下一档 3:1)。
+        先锋维持 1 个(先锋阵亡且当前 vg=0 → 补先锋,除非先锋封顶);否则补最近阵亡
+        且缺失更严重的那类;无阵亡则纯增长按 spawn_ratio(默认 3:1)趋近。所选兵种
+        若达到独立上限(unit_caps)则改选另一兵种;两者都封顶返回 None。
         """
         rk = len(turn.rangers)
         wk = len(turn.workers)
         vg = len(turn.vanguards)
+        ratio = self.memory.spawn_ratio
+        ranger_share = ratio.get("ranger", 3)
+        worker_share = ratio.get("worker", 1)
 
         died_rk = sum(1 for t in died.values() if t == UnitType.RANGER.name)
         died_wk = sum(1 for t in died.values() if t == UnitType.WORKER.name)
         died_vg = sum(1 for t in died.values() if t == UnitType.VANGUARD.name)
 
-        # 先锋维持 1:先锋死了且现在没有 → 补先锋。
+        def _respect_cap(choice: UnitType) -> UnitType | None:
+            if not self._unit_capped(choice, turn):
+                return choice
+            other = (
+                UnitType.WORKER
+                if choice is UnitType.RANGER
+                else UnitType.RANGER
+            )
+            if not self._unit_capped(other, turn):
+                return other
+            return None
+
+        def _ratio_choice(rk_count: int, wk_count: int) -> UnitType:
+            # 目标比例 ranger:worker = R:W，选让 |rk*W - wk*R| 偏差更小的兵种；
+            # 偏差相等时补游侠(推到下一档比例)。
+            err_if_ranger = abs((rk_count + 1) * worker_share - wk_count * ranger_share)
+            err_if_worker = abs(rk_count * worker_share - (wk_count + 1) * ranger_share)
+            return UnitType.RANGER if err_if_ranger <= err_if_worker else UnitType.WORKER
+
+        # 先锋维持 1:先锋死了且现在没有 → 补先锋(先锋封顶则放弃)。
         if died_vg > 0 and vg == 0:
-            return UnitType.VANGUARD
+            return (
+                UnitType.VANGUARD
+                if not self._unit_capped(UnitType.VANGUARD, turn)
+                else _respect_cap(_ratio_choice(rk, wk))
+            )
 
         if died:
             # 补阵亡更严重的那类(死的游侠多→补游侠,死工人多→补工人;
-            # 持平时看当前比例,谁离 3:1 更远补谁)。
+            # 持平时看当前比例,谁离目标比例更远补谁)。
             if died_rk > died_wk:
-                return UnitType.RANGER
+                return _respect_cap(UnitType.RANGER)
             if died_wk > died_rk:
-                return UnitType.WORKER
-            # 死亡数相等 → 按 3:1 偏差补(与纯增长同逻辑)。
-            err_if_ranger = abs((rk + 1) - 3 * wk)
-            err_if_worker = abs(rk - 3 * (wk + 1))
-            return UnitType.RANGER if err_if_ranger <= err_if_worker else UnitType.WORKER
+                return _respect_cap(UnitType.WORKER)
+            return _respect_cap(_ratio_choice(rk, wk))
 
-        # 无阵亡,纯增长:按 3:1 趋近。每步选让 |rk - 3*wk| 偏差更小的兵种;
-        # 偏差相等时补游侠(推到下一档 3:1)。从任意起点(wk=0 含工人全死光的边缘
-        # 情况)都能自然收敛到 3 游侠 : 1 工人。
-        err_if_ranger = abs((rk + 1) - 3 * wk)
-        err_if_worker = abs(rk - 3 * (wk + 1))
-        if err_if_ranger <= err_if_worker:
-            return UnitType.RANGER
-        return UnitType.WORKER
+        # 无阵亡,纯增长:按可配比例趋近。从任意起点(wk=0 含工人全死光的边缘
+        # 情况)都能自然收敛到 R 游侠 : W 工人。
+        return _respect_cap(_ratio_choice(rk, wk))
 
-    def _select_spawn(
+    def _select_spawn_with_source(
         self,
         turn: Turn,
         projected_resources: int,
-    ) -> UnitType | None:
-        """Return the Unit this Core would produce if its cell had capacity."""
+    ) -> tuple[UnitType | None, bool]:
+        """Return the Unit this Core would produce if its cell had capacity.
+
+        返回 (target_type, from_queue)。from_queue=True 表示本次选择来自
+        网页控制台预定队列（成功后由 _consume_build_queue 消费）。
+        """
         core = turn.core
         if core is None:
-            return None
+            return None, False
 
         current_population = len(turn.units)
         worker_cost = unit_cost(UnitType.WORKER, current_population)
@@ -11194,7 +12257,7 @@ class SmartTactic:
 
         # 硬顶 ABSOLUTE_MAX_POPULATION:不再产兵。
         if current_population >= ABSOLUTE_MAX_POPULATION:
-            return None
+            return None, False
 
         # 阵亡补同种:读 observe 里算好的本 tick 阵亡 dict(每 tick 一次,避免
         # _select_spawn 被多次调用时重复消费/清空 last_alive)。
@@ -11211,38 +12274,58 @@ class SmartTactic:
         )
         shield_cap = 10 if owns_beacon else 5
         # 战时保留：近敌或补盾期留 2 资源应急（原有行为）。
-        wartime_reserve = 2 if near_threat or core.shield < shield_cap else 0
-        # 资源存底（用户定稿）：和平期存 150 给战时医疗/补兵。
-        #   规则②产能兜底：capacity-150 不足以造一个游侠时（人口 ≤ ~40 的爬坡期）
-        #     无视存底继续造兵抬上限——否则"存 150 → 造不出兵 → 人口不涨 →
-        #     上限不涨 → 永久卡死"。每 tick 现场算，不硬编码人口阈值。
-        #   规则①存底：capacity-150 装得下一个游侠时，只有超出 150 的部分可
-        #     用于造兵。
-        #   战时（near_threat/补盾）存底让位给原有威胁分支。
+        combat_reserve = 2 if near_threat or core.shield < shield_cap else 0
+        # 资源存底（网页控制台可配）：和平期存 wartime_reserve(默认 150) 给战时
+        # 医疗/补兵。规则②产能兜底：capacity-reserve 不足以造一个游侠时（人口 ≤
+        # ~40 的爬坡期）无视存底继续造兵抬上限——否则"存满 → 造不出兵 → 人口不涨
+        # → 上限不涨 → 永久卡死"。每 tick 现场算，不硬编码人口阈值。
+        # 规则①存底：capacity-reserve 装得下一个游侠时，只有超出 reserve 的部分
+        # 可用于造兵。战时（near_threat/补盾）存底让位给原有威胁分支。
+        reserve_floor = self.memory.wartime_reserve
         hold_floor = (
-            CORE_WARTIME_RESOURCE_FLOOR
+            reserve_floor
             if (
                 not near_threat
                 and core.shield >= shield_cap
-                and turn.resource_capacity - CORE_WARTIME_RESOURCE_FLOOR >= ranger_cost
+                and turn.resource_capacity - reserve_floor >= ranger_cost
             )
             else 0
         )
-        budget = projected_resources - wartime_reserve - hold_floor
+        budget = projected_resources - combat_reserve - hold_floor
 
         # 闪电模式产兵:
         #   pop 1-8: 固定阶梯 LIGHTNING_BUILD_ORDER(撤一个补一个,自然补回同槽位)。
-        #   pop ≥ 9: 阵亡补同种优先,否则按 3:1(游侠:工人)趋近(取消 pop-20 停产,
-        #     软顶 LIGHTNING_MAX_POPULATION=100,经济随涨价自然放缓但不停产)。
-        slot = max(0, current_population - 1)
-        if slot < len(LIGHTNING_BUILD_ORDER):
-            target_type = LIGHTNING_BUILD_ORDER[slot]
+        #   pop ≥ 9: 阵亡补同种优先,否则按可配比例(游侠:工人)趋近(取消 pop-20
+        #     停产,软顶 LIGHTNING_MAX_POPULATION=100,经济随涨价自然放缓但不停产)。
+        #   网页控制台：build_queue 非空时优先于阶梯/比例；unit_caps 逐兵种独立
+        #   封顶（某兵到上限只停它自己，不影响其他兵种）。
+        queue = list(self.memory.build_queue)
+        if queue:
+            # 预定队列优先：从队首扫描，取第一个未达上限的兵种。
+            from_queue = True
+            target_type = None
+            for item in queue:
+                candidate = _unit_type_from_name(item)
+                if candidate is not None and not self._unit_capped(candidate, turn):
+                    target_type = candidate
+                    break
+            if target_type is None:
+                # 队列里所有兵种都已封顶 → 本 tick 不造（队列保留）。
+                return None, False
         else:
-            # pop ≥ 9:阵亡补同种优先,否则按 3:1(游侠:工人)趋近。取消 pop-20
-            # 停产;软顶 LIGHTNING_MAX_POPULATION=100 处资源涨价极慢但仍按 3:1 补兵。
-            target_type = self._lightning_ratio_spawn(turn, died)
+            from_queue = False
+            slot = max(0, current_population - 1)
+            target_type = None
+            for idx in range(slot, len(LIGHTNING_BUILD_ORDER)):
+                candidate = LIGHTNING_BUILD_ORDER[idx]
+                if not self._unit_capped(candidate, turn):
+                    target_type = candidate
+                    break
+            if target_type is None:
+                # pop ≥ 9 或阶梯全封顶:阵亡补同种优先,否则按可配比例趋近。
+                target_type = self._lightning_ratio_spawn(turn, died)
         if target_type is None:
-            return None
+            return None, from_queue
         cost = (
             worker_cost
             if target_type is UnitType.WORKER
@@ -11251,8 +12334,51 @@ class SmartTactic:
             else ranger_cost
         )
         if budget >= cost:
-            return target_type
-        return None  # 攒钱下个 tick
+            return target_type, from_queue
+        return None, from_queue  # 攒钱下个 tick（保留队列优先级意图）
+
+    def _select_spawn(
+        self,
+        turn: Turn,
+        projected_resources: int,
+    ) -> UnitType | None:
+        return self._select_spawn_with_source(turn, projected_resources)[0]
+
+    def _consume_build_queue(self, spawned_type: str) -> None:
+        """真实 spawn 成功后消费预定队列（内存 + 控制文件双消费，带竞态守卫）。
+
+        只移除 spawned_type 的首次出现；控制文件重写基于文件当前的 build_queue，
+        只改该字段、不覆盖其他外部改动。
+        """
+        queue = list(self.memory.build_queue)
+        if spawned_type in queue:
+            queue.remove(spawned_type)
+            self.memory.build_queue = queue
+        try:
+            data = json.loads(self.control_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return
+            raw_queue = data.get("build_queue")
+            if not isinstance(raw_queue, list):
+                return
+            file_queue = [
+                str(item) for item in raw_queue if isinstance(item, str)
+            ]
+            if spawned_type not in file_queue:
+                return
+            file_queue.remove(spawned_type)
+            data["build_queue"] = file_queue
+            temporary = self.control_path.with_suffix(
+                self.control_path.suffix + ".tmp"
+            )
+            temporary.write_text(
+                json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            temporary.replace(self.control_path)
+            self.control_mtime = self.control_path.stat().st_mtime_ns
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
 
     def _choose_core(
         self,
@@ -11308,13 +12434,16 @@ class SmartTactic:
             and True
         )
         spawn = None
+        from_queue = False
         if can_spawn:
             # An unfilled physical funnel is more urgent than the nominal 3:1
             # roster.  Conversely, an unrelieved medical vacancy asks for a Ranger.
+            # 网页控制台 unit_caps 对两个应急分支同样生效：封顶兵种不再被创建。
             if (
                 plan is not None
                 and plan.anchor is CoreAnchorState.COMBAT_ANCHOR
                 and plan.funnel.shortfall > 0
+                and not self._unit_capped(UnitType.WORKER, turn)
                 and projected_resources >= unit_cost(UnitType.WORKER, turn.state.population)
             ):
                 spawn = UnitType.WORKER
@@ -11323,21 +12452,27 @@ class SmartTactic:
                 plan is not None
                 and plan.vacancies
                 and len(plan.reliefs) < len(plan.vacancies)
+                and not self._unit_capped(UnitType.RANGER, turn)
                 and projected_resources >= unit_cost(UnitType.RANGER, turn.state.population)
             ):
                 spawn = UnitType.RANGER
                 self.memory.decision_totals["lightning:spawn_medical_ranger"] += 1
             else:
-                spawn = self._select_spawn(turn, projected_resources)
+                spawn, from_queue = self._select_spawn_with_source(
+                    turn, projected_resources
+                )
 
         if spawn is not None:
             core.spawn(spawn)
             replacement = self.memory.replacement_queue[spawn.value] > 0
             decisions.append(
                 f"core spawn {spawn.value} resources={turn.resources} "
-                f"projected={projected_resources} replacement={replacement}"
+                f"projected={projected_resources} replacement={replacement} "
+                f"queue={from_queue}"
             )
             self.memory.decision_totals[f"core:spawn:{spawn.value}"] += 1
+            if from_queue:
+                self._consume_build_queue(spawn.value)
         elif projected_resources >= 1 and core.shield < shield_cap:
             core.repair_shield()
             decisions.append(f"core repair_shield reason=spare_resources shield={core.shield}")
@@ -11349,6 +12484,36 @@ class SmartTactic:
                 return
             # In the absence of medical/combat service, patrol keeps avoiding the
             # visible combat direction through _choose_core_migration scoring.
+            # === 网页控制台：驻扎 / 目标坐标覆盖巡逻 ===
+            if self.memory.core_hold:
+                decisions.append("core hold=true")
+                self.memory.decision_totals["core:hold"] += 1
+                return
+            core_target = self.memory.core_target
+            if core_target is not None:
+                arrived = (
+                    _distance(core.position, core_target) <= CORE_BEACON_HYSTERESIS
+                )
+                if arrived:
+                    # 已到达目标：停驻，行星照常巡逻；前端"取消目标"写 null 后恢复绕圈。
+                    decisions.append(f"core target_arrived target={core_target}")
+                    self.memory.decision_totals["core:target_arrived"] += 1
+                    return
+                decisions.append(
+                    f"lightning core_transfer target={core_target} "
+                    f"mode={self.memory.core_transfer_mode}"
+                )
+                self.memory.decision_totals["lightning:core_transfer"] += 1
+                self._choose_core_migration(
+                    turn,
+                    planner,
+                    incoming_deposit,
+                    decisions,
+                    migration_target=core_target,
+                    noncombat_enemies_safe=True,
+                    ignore_beacon_progress=True,
+                )
+                return
             waypoint = self._lightning_patrol_waypoint(turn)
             decisions.append(
                 f"lightning patrol waypoint={waypoint} "
