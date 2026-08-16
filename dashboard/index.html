@@ -1,0 +1,1295 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arena Hero 控制台</title>
+<script src="/vendor/echarts.min.js"></script>
+<style>
+  :root {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface-1: #1a1a19;
+    --surface-2: #22221f;
+    --surface-3: #2c2c2a;
+    --ink-1: #ffffff;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --border: rgba(255,255,255,0.10);
+    --good: #0ca30c;
+    --warn: #fab219;
+    --crit: #d03b3b;
+    /* 暗色分类槽位（dataviz 校验通过） */
+    --s1: #3987e5;  /* 游侠 */
+    --s2: #d95926;  /* 先锋 */
+    --s3: #199e70;  /* 工人 */
+    --s4: #c98500;  /* 未知/其他 */
+    --s5: #d55181;  /* 备用 */
+    --s6: #008300;
+    --s7: #9085e9;
+    --s8: #e66767;  /* 敌核 */
+    --accent: #3987e5;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--page); color: var(--ink-1);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 14px; }
+  body { min-height: 100vh; }
+  button, input, select { font: inherit; }
+  button { cursor: pointer; }
+
+  /* ---- 登录页 ---- */
+  #login-screen { position: fixed; inset: 0; display: flex; align-items: center;
+    justify-content: center; background: var(--page); z-index: 100; }
+  #login-box { width: 320px; padding: 28px; border-radius: 12px; background: var(--surface-1);
+    border: 1px solid var(--border); }
+  #login-box h1 { font-size: 18px; margin: 0 0 16px; }
+  #login-box input { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--surface-2); color: var(--ink-1); margin-bottom: 12px; }
+  #login-box button { width: 100%; padding: 10px; border: 0; border-radius: 8px;
+    background: var(--accent); color: #fff; font-weight: 600; }
+  #login-error { color: var(--crit); font-size: 13px; margin-top: 8px; min-height: 18px; }
+
+  /* ---- 布局 ---- */
+  #app { display: none; }
+  #app.show { display: block; }
+  header { position: sticky; top: 0; z-index: 50; background: var(--surface-1);
+    border-bottom: 1px solid var(--border); padding: 10px 16px; display: flex;
+    align-items: center; gap: 16px; flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; }
+  .status-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; flex: 1; }
+  .chip { padding: 3px 10px; border-radius: 999px; background: var(--surface-2);
+    border: 1px solid var(--border); font-size: 12.5px; white-space: nowrap; }
+  .chip b { color: var(--ink-1); font-weight: 600; }
+  .chip .lbl { color: var(--muted); margin-right: 4px; }
+  .chip.online { border-color: var(--good); }
+  .chip.offline { border-color: var(--crit); }
+  header .links a { color: var(--accent); text-decoration: none; margin-left: 8px; font-size: 13px; }
+  header .links a:hover { text-decoration: underline; }
+  #logout-btn { background: transparent; border: 1px solid var(--border); color: var(--ink-2);
+    border-radius: 8px; padding: 6px 12px; }
+
+  main { display: grid; grid-template-columns: minmax(340px, 380px) 1fr;
+    gap: 16px; padding: 16px; align-items: start; }
+  @media (max-width: 1100px) { main { grid-template-columns: 1fr; } }
+
+  .card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px;
+    padding: 14px 16px; margin-bottom: 16px; }
+  .card h2 { font-size: 14px; margin: 0 0 12px; color: var(--ink-2); font-weight: 600;
+    display: flex; align-items: center; gap: 8px; }
+  .card h2 .hint { font-size: 11.5px; color: var(--muted); font-weight: 400; }
+
+  /* ---- 控制面板 ---- */
+  .field { margin-bottom: 12px; }
+  .field label { display: flex; justify-content: space-between; align-items: center;
+    font-size: 12.5px; color: var(--ink-2); margin-bottom: 4px; }
+  .field label .val { color: var(--ink-1); font-variant-numeric: tabular-nums; }
+  .field input[type=number] { width: 100%; padding: 8px 10px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--surface-2); color: var(--ink-1); }
+  .field input[type=range] { width: 100%; accent-color: var(--accent); }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row > * { flex: 1; min-width: 0; }
+  .toggle-row { display: flex; align-items: center; justify-content: space-between; padding: 6px 0; }
+  .toggle-row .tlabel { font-size: 13px; color: var(--ink-2); }
+  .switch { position: relative; width: 44px; height: 24px; flex: none; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider { position: absolute; inset: 0; background: var(--surface-3); border-radius: 24px;
+    transition: .15s; cursor: pointer; }
+  .slider:before { content: ""; position: absolute; width: 18px; height: 18px; left: 3px; top: 3px;
+    background: #fff; border-radius: 50%; transition: .15s; }
+  .switch input:checked + .slider { background: var(--accent); }
+  .switch input:checked + .slider:before { transform: translateX(20px); }
+
+  .seg { display: flex; gap: 4px; background: var(--surface-2); border-radius: 10px; padding: 4px; }
+  .seg button { flex: 1; padding: 7px 4px; border: 0; border-radius: 8px; background: transparent;
+    color: var(--ink-2); font-size: 12.5px; }
+  .seg button.active { background: var(--accent); color: #fff; font-weight: 600; }
+
+  .btn { padding: 8px 14px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--surface-2); color: var(--ink-1); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  .btn.danger { color: var(--crit); border-color: var(--crit); }
+  .btn.small { padding: 4px 10px; font-size: 12.5px; }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+
+  #save-btn { width: 100%; margin-top: 4px; padding: 11px; font-size: 14px; }
+  #toast { position: fixed; bottom: 20px; right: 20px; background: var(--surface-2);
+    border: 1px solid var(--border); border-radius: 10px; padding: 10px 16px; font-size: 13px;
+    display: none; z-index: 200; box-shadow: 0 4px 20px rgba(0,0,0,.4); }
+  #toast.ok { border-color: var(--good); color: var(--good); }
+  #toast.err { border-color: var(--crit); color: var(--crit); }
+
+  /* 造兵队列 */
+  .q-row { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+  .q-row select { flex: 1; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--surface-2); color: var(--ink-1); }
+  .q-row input { width: 62px; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--surface-2); color: var(--ink-1); text-align: center; }
+  .q-row .mini { width: 30px; padding: 4px 0; flex: none; text-align: center; }
+  .q-actions { display: flex; gap: 6px; margin-top: 8px; }
+
+  /* 高级 */
+  details.adv { border: 1px solid var(--border); border-radius: 10px; padding: 4px 10px; }
+  details.adv summary { cursor: pointer; color: var(--ink-2); font-size: 13px; padding: 6px 0; }
+  details.adv .field { margin: 10px 0; }
+
+  /* ---- 战况 ---- */
+  .kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin-bottom: 14px; }
+  .kpi { background: var(--surface-2); border-radius: 10px; padding: 10px 12px; }
+  .kpi .kval { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .kpi .klbl { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+  .chart-box { height: 210px; }
+  .chart-box.tall { height: 300px; }
+  .chart-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 900px) { .chart-grid { grid-template-columns: 1fr; } }
+  .chart-grid .card { margin-bottom: 0; }
+
+  /* ---- 地图 ---- */
+  #map-wrap { position: relative; }
+  #map { width: 100%; height: 520px; display: block; background: #0a0e14;
+    border-radius: 10px; border: 1px solid var(--border); touch-action: none; }
+  #map-toolbar { position: absolute; top: 10px; left: 10px; display: flex; gap: 6px; flex-wrap: wrap; z-index: 5; }
+  #map-toolbar button { background: rgba(26,26,25,.85); border: 1px solid var(--border);
+    color: var(--ink-1); border-radius: 8px; padding: 5px 10px; font-size: 12px; }
+  #map-toolbar button.active { background: var(--accent); border-color: var(--accent); }
+  #map-hint { position: absolute; bottom: 10px; left: 10px; background: rgba(26,26,25,.85);
+    border: 1px solid var(--border); border-radius: 8px; padding: 5px 10px; font-size: 11.5px;
+    color: var(--ink-2); z-index: 5; }
+  .legend { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px; font-size: 12px; color: var(--ink-2); }
+  .legend .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 4px; vertical-align: -1px; }
+
+  /* ---- 日志 ---- */
+  .log-list { max-height: 320px; overflow: auto; font-size: 12px; line-height: 1.55; }
+  .log-list pre { margin: 0; white-space: pre-wrap; word-break: break-all; }
+  .log-row { padding: 3px 0; border-bottom: 1px solid var(--grid); display: flex; gap: 8px; }
+  .log-row .lt { color: var(--muted); flex: none; font-variant-numeric: tabular-nums; }
+  .log-row .lm { color: var(--ink-2); flex: 1; }
+  .log-row.warn .lm { color: var(--warn); }
+  .log-row.danger .lm { color: var(--crit); }
+  .log-row.success .lm { color: var(--good); }
+
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+</style>
+</head>
+<body>
+
+<!-- 登录 -->
+<div id="login-screen">
+  <div id="login-box">
+    <h1>🔐 Arena Hero 控制台</h1>
+    <input id="password-input" type="password" placeholder="输入登录密码" autocomplete="current-password">
+    <button id="login-btn">登录</button>
+    <div id="login-error"></div>
+  </div>
+</div>
+
+<!-- 主应用 -->
+<div id="app">
+  <header>
+    <h1>⚡ Arena Hero 控制台</h1>
+    <div class="status-row" id="status-row">
+      <span class="chip" id="chip-tick"><span class="lbl">tick</span><b>—</b></span>
+      <span class="chip" id="chip-res"><span class="lbl">资源</span><b>—</b></span>
+      <span class="chip" id="chip-pop"><span class="lbl">人口</span><b>—</b></span>
+      <span class="chip" id="chip-roster"><span class="lbl">编成</span><b>—</b></span>
+      <span class="chip" id="chip-core"><span class="lbl">Core</span><b>—</b></span>
+      <span class="chip" id="chip-enemy"><span class="lbl">敌</span><b>—</b></span>
+      <span class="chip offline" id="chip-conn"><span class="lbl">连接</span><b>离线</b></span>
+    </div>
+    <div class="links">
+      <a href="https://app.arenahero.io/arena" target="_blank" rel="noopener">🎮 开始网页</a>
+      <a href="https://linuxdoshop.arenahero.io/" target="_blank" rel="noopener">🛒 兑换商店</a>
+      <button id="logout-btn">退出</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- 左栏：控制 -->
+    <div class="col-left">
+      <div class="card">
+        <h2>🪐 Core 控制</h2>
+        <div class="field">
+          <label>巡逻半径 <span class="val" id="orbit-val">0 (自动)</span></label>
+          <input type="range" id="orbit-slider" min="0" max="900" step="10" value="0">
+          <input type="number" id="orbit-input" min="0" max="900" step="10" value="0">
+        </div>
+        <div class="field">
+          <label>方环内半径 <span class="val" id="ring-inner-val">400</span></label>
+          <input type="number" id="ring-inner" min="1" value="400">
+        </div>
+        <div class="field">
+          <label>方环外半径 <span class="val" id="ring-outer-val">600</span></label>
+          <input type="number" id="ring-outer" min="1" value="600">
+        </div>
+        <div class="toggle-row">
+          <span class="tlabel">驻扎（Core 停在当前位置）</span>
+          <label class="switch"><input type="checkbox" id="core-hold"><span class="slider"></span></label>
+        </div>
+        <div class="field">
+          <label>目标坐标 <span class="val" id="target-status">未设置</span></label>
+          <div class="row">
+            <input type="number" id="target-x" placeholder="x" value="">
+            <input type="number" id="target-y" placeholder="y" value="">
+          </div>
+          <div class="row" style="margin-top:6px">
+            <button class="btn primary small" id="target-set">设置目标</button>
+            <button class="btn danger small" id="target-clear">取消目标</button>
+          </div>
+        </div>
+        <div class="field">
+          <label>转移模式</label>
+          <div class="seg" id="transfer-seg">
+            <button data-mode="star">恒星</button>
+            <button data-mode="march">急行军</button>
+            <button data-mode="fortify">坚壁清野</button>
+          </div>
+          <div style="font-size:11.5px;color:var(--muted);margin-top:6px" id="transfer-desc"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>🏗️ 造兵系统</h2>
+        <div class="field">
+          <label>预定队列（顺序 = 优先级）</label>
+          <div id="queue-editor"></div>
+          <div class="q-actions">
+            <button class="btn small" id="queue-add">＋ 添加</button>
+            <button class="btn small" id="queue-clear">清空</button>
+          </div>
+          <div style="font-size:11.5px;color:var(--muted);margin-top:6px">
+            队列非空时优先于固定阶梯/默认比例造兵；预算不足时排队攒钱。已封顶兵种自动跳过。
+          </div>
+        </div>
+        <div class="field">
+          <label>默认比例（游侠 : 工人）</label>
+          <div class="row">
+            <div style="flex:1">
+              <label style="font-size:11.5px">游侠</label>
+              <input type="number" id="ratio-ranger" min="0" value="3">
+            </div>
+            <div style="flex:1">
+              <label style="font-size:11.5px">工人</label>
+              <input type="number" id="ratio-worker" min="0" value="1">
+            </div>
+          </div>
+          <div style="font-size:11.5px;color:var(--muted);margin-top:4px">
+            无队列时 pop≥9 按此比例趋近；二者不可同时为 0。
+          </div>
+        </div>
+        <div class="field">
+          <label>各兵种独立上限（0 = 无上限）</label>
+          <div class="row">
+            <div style="flex:1">
+              <label style="font-size:11.5px">工人</label>
+              <input type="number" id="cap-worker" min="0" value="0">
+            </div>
+            <div style="flex:1">
+              <label style="font-size:11.5px">游侠</label>
+              <input type="number" id="cap-ranger" min="0" value="0">
+            </div>
+            <div style="flex:1">
+              <label style="font-size:11.5px">先锋</label>
+              <input type="number" id="cap-vanguard" min="0" value="0">
+            </div>
+          </div>
+          <div style="font-size:11.5px;color:var(--muted);margin-top:4px">
+            某兵到上限只停它自己，其他兵不受影响。
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>💰 资源 <span class="hint">战备储存</span></h2>
+        <div class="field">
+          <label>战备储存（总上限减去此值后须能造 1 游侠）<span class="val" id="reserve-val">150</span></label>
+          <input type="range" id="reserve-slider" min="0" max="400" step="10" value="150">
+          <input type="number" id="reserve-input" min="0" value="150">
+        </div>
+        <div style="font-size:11.5px;color:var(--muted)">
+          后端逻辑自动保留：capacity − 储存 < 游侠价时无视储存继续造兵抬上限，避免卡死。
+        </div>
+      </div>
+
+      <div class="card">
+        <details class="adv">
+          <summary>⚙️ 高级控制</summary>
+          <div class="toggle-row">
+            <span class="tlabel">召回（recall）</span>
+            <label class="switch"><input type="checkbox" id="adv-recall"><span class="slider"></span></label>
+          </div>
+          <div class="toggle-row">
+            <span class="tlabel">raid 远征</span>
+            <label class="switch"><input type="checkbox" id="adv-raid"><span class="slider"></span></label>
+          </div>
+          <div class="field">
+            <label>raid 先锋</label>
+            <input type="number" id="adv-raid-vg" min="0" value="1">
+          </div>
+          <div class="field">
+            <label>raid 游侠</label>
+            <input type="number" id="adv-raid-rk" min="0" value="2">
+          </div>
+          <div class="field">
+            <label>信标目标距离 <span style="color:var(--warn)">(lightning 须为 0)</span></label>
+            <input type="number" id="adv-beacon-dist" min="0" value="0">
+          </div>
+          <div class="field">
+            <label>集结点 x / y（空 = 无）</label>
+            <div class="row">
+              <input type="number" id="adv-rally-x" placeholder="x">
+              <input type="number" id="adv-rally-y" placeholder="y">
+            </div>
+          </div>
+          <div class="field">
+            <label>迁移目标 x / y（空 = 无）</label>
+            <div class="row">
+              <input type="number" id="adv-migrate-x" placeholder="x">
+              <input type="number" id="adv-migrate-y" placeholder="y">
+            </div>
+          </div>
+          <div class="toggle-row">
+            <span class="tlabel">自动迁移</span>
+            <label class="switch"><input type="checkbox" id="adv-auto-migrate"><span class="slider"></span></label>
+          </div>
+        </details>
+      </div>
+
+      <button class="btn primary" id="save-btn">💾 保存全部配置</button>
+    </div>
+
+    <!-- 右栏：战况 + 地图 + 日志 -->
+    <div class="col-right">
+      <div class="card">
+        <h2>📊 战况分析</h2>
+        <div class="kpi-row">
+          <div class="kpi"><div class="kval" id="kpi-core-kill">—</div><div class="klbl">敌核击杀（累计）</div></div>
+          <div class="kpi"><div class="kval" id="kpi-kill">—</div><div class="klbl">击杀 : 阵亡</div></div>
+          <div class="kpi"><div class="kval" id="kpi-hr">—</div><div class="klbl">命中率（最近）</div></div>
+          <div class="kpi"><div class="kval" id="kpi-surv">—</div><div class="klbl">存活率</div></div>
+        </div>
+        <div class="chart-grid">
+          <div class="card">
+            <h2>敌方击杀（累计）</h2>
+            <div class="chart-box" id="chart-kills"></div>
+          </div>
+          <div class="card">
+            <h2>我方阵亡（累计）</h2>
+            <div class="chart-box" id="chart-losses"></div>
+          </div>
+          <div class="card">
+            <h2>命中率（滚动窗口）</h2>
+            <div class="chart-box" id="chart-hitrate"></div>
+          </div>
+          <div class="card">
+            <h2>人口 · 资源 · 敌情</h2>
+            <div class="chart-box" id="chart-pop"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>🗺️ Core 轨迹 <span class="hint" id="map-mode-hint"></span></h2>
+        <div id="map-wrap">
+          <div id="map-toolbar">
+            <button id="map-follow">◎ 跟随 Core</button>
+            <button id="map-reset">⤢ 重置视图</button>
+            <button id="map-clear-trail">✕ 清轨迹</button>
+          </div>
+          <canvas id="map"></canvas>
+          <div id="map-hint">点击地图设定 Core 目标坐标 · 滚轮缩放 · 拖拽平移</div>
+        </div>
+        <div class="legend">
+          <span><span class="dot" style="background:#3987e5"></span>游侠</span>
+          <span><span class="dot" style="background:#d95926"></span>先锋</span>
+          <span><span class="dot" style="background:#199e70"></span>工人</span>
+          <span><span class="dot" style="background:#e66767"></span>敌方</span>
+          <span><span class="dot" style="background:#4ade80"></span>资源</span>
+          <span><span class="dot" style="background:#ffffff"></span>Core 轨迹</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>📜 决策日志 <span class="hint">telemetry decisions</span></h2>
+        <div class="log-list" id="decision-log"><pre>加载中…</pre></div>
+      </div>
+      <div class="card">
+        <h2>⚡ 实时事件 <span class="hint">事件流</span></h2>
+        <div class="log-list" id="event-log"><pre>加载中…</pre></div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+/* ============ 状态 ============ */
+const state = {
+  token: localStorage.getItem("ah_dash_token") || "",
+  config: null,        // 控制文件 + effective
+  stats: null,         // .arena_hero_stats.json
+  telemetry: [],       // 决策日志/人口曲线
+  battle: [],          // 战况历史
+  trail: [],           // Core 轨迹
+  trailMaxTick: 0,
+  routes: { resources: [] },
+  events: [],
+  mapFollow: true,
+  trailVisible: true,
+  chartRange: 500,
+  lastEventTitle: null,
+  localTransferMode: null, // 用户点选但尚未保存的转移模式，避免被轮询回填覆盖
+};
+
+/* 单位/兵种标签 */
+const TYPE_LABEL = { RANGER: "游侠", WORKER: "工人", VANGUARD: "先锋", CORE: "敌核" };
+const TYPE_COLOR = {
+  RANGER: "#3987e5", WORKER: "#199e70", VANGUARD: "#d95926",
+  CORE: "#e66767", UNKNOWN: "#9085e9",
+};
+
+/* ============ API 封装 ============ */
+async function api(path, opts = {}) {
+  const headers = Object.assign({}, opts.headers || {});
+  if (state.token) headers["Authorization"] = "Bearer " + state.token;
+  if (opts.body) headers["Content-Type"] = "application/json";
+  let res;
+  try {
+    res = await fetch(path, Object.assign({}, opts, { headers }));
+  } catch (err) {
+    toast("网络错误：" + err.message, true);
+    setConn(false);
+    throw err;
+  }
+  setConn(true);
+  if (res.status === 401) {
+    logout("会话已过期，请重新登录");
+    throw new Error("unauthorized");
+  }
+  const payload = await res.json().catch(() => ({}));
+  if (!res.ok) throw Object.assign(new Error(payload.error || res.statusText), { status: res.status });
+  return payload;
+}
+
+/* ============ 登录 ============ */
+async function doLogin() {
+  const password = document.getElementById("password-input").value;
+  const errBox = document.getElementById("login-error");
+  errBox.textContent = "";
+  try {
+    const payload = await api("/api/login", { method: "POST", body: JSON.stringify({ password }) });
+    state.token = payload.token;
+    localStorage.setItem("ah_dash_token", state.token);
+    enterApp();
+  } catch (err) {
+    errBox.textContent = err.status === 401 ? "密码错误" : ("登录失败：" + (err.message || err));
+  }
+}
+function logout(msg) {
+  state.token = "";
+  localStorage.removeItem("ah_dash_token");
+  document.getElementById("app").classList.remove("show");
+  document.getElementById("login-screen").style.display = "flex";
+  document.getElementById("password-input").value = "";
+  if (msg) document.getElementById("login-error").textContent = msg;
+}
+function enterApp() {
+  document.getElementById("login-screen").style.display = "none";
+  document.getElementById("app").classList.add("show");
+  initCharts();
+  refreshConfig();
+  refreshStats();
+  refreshTelemetry();
+  refreshBattle();
+  refreshTrail();
+  refreshRoutes();
+  refreshEvents();
+  // 轮询
+  setInterval(refreshConfig, 2000);
+  setInterval(refreshStats, 2000);
+  setInterval(refreshTelemetry, 6000);
+  setInterval(refreshBattle, 6000);
+  setInterval(refreshTrail, 8000);
+  setInterval(refreshRoutes, 10000);
+  setInterval(refreshEvents, 6000);
+}
+
+/* ============ 连接状态 ============ */
+function setConn(online) {
+  const chip = document.getElementById("chip-conn");
+  chip.classList.toggle("online", online);
+  chip.classList.toggle("offline", !online);
+  chip.querySelector("b").textContent = online ? "在线" : "离线";
+}
+
+/* ============ 顶栏 ============ */
+function renderTopbar() {
+  const s = state.stats;
+  if (!s) return;
+  setText("chip-tick", s.tick);
+  setText("chip-res", `${s.resources}/${s.capacity}`);
+  setText("chip-pop", s.population);
+  setText("chip-roster", `游侠${s.rangers} 工${s.workers} 锋${s.vanguards}`);
+  const coreHp = typeof s.core_hp === "number" ? s.core_hp : "—";
+  const coreShield = typeof s.core_shield === "number" ? s.core_shield : "—";
+  const coreState = s.core_state === "NORMAL" ? "" : ` ${s.core_state}`;
+  setText("chip-core", `血${coreHp}/盾${coreShield}${coreState}`);
+  setText("chip-enemy", s.visible_enemies);
+}
+function setText(id, value) { document.getElementById(id).querySelector("b").textContent = value; }
+
+/* ============ 配置读取/渲染 ============ */
+async function refreshConfig() {
+  try {
+    const cfg = await api("/api/config");
+    state.config = cfg;
+    renderControlPanel();
+  } catch (err) { /* 401/网络已处理 */ }
+}
+
+function renderControlPanel() {
+  const c = state.config;
+  if (!c) return;
+  // 回填策略：对“待编辑”输入框（数字/坐标），只在以下情况写入后端值——
+  //   1) 输入框当前正被聚焦（用户在输）→ 跳过，绝不打断；
+  //   2) 输入框当前值 == 上次回填的值（即用户未改动）→ 安全更新为新后端值；
+  //   3) 输入框当前值 != 上次回填的值（用户改了但还没保存）→ 跳过，保留用户输入。
+  // 这彻底修复“数字输不进去 / 点保存前被轮询清空”的竞态。
+  state.lastReflected = state.lastReflected || {};
+  const reflect = (id, value) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (document.activeElement === el) return; // 用户正在输
+    if (el.value === state.lastReflected[id]) {
+      // 用户没动过这个框，安全回填新值
+      el.value = value;
+      state.lastReflected[id] = String(value);
+    }
+    // 否则保留用户输入
+  };
+  const setText2 = (id, value) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = value; // 文本展示不涉及用户编辑，直接更新
+  };
+  // 巡逻半径
+  const orbit = c.core_orbit_radius || 0;
+  reflect("orbit-input", orbit);
+  reflect("orbit-slider", orbit);
+  document.getElementById("orbit-val").textContent = orbit > 0 ? String(orbit) : "0 (自动)";
+  // 方环
+  if (Array.isArray(c.lightning_ring) && c.lightning_ring.length === 2) {
+    reflect("ring-inner", c.lightning_ring[0]);
+    reflect("ring-outer", c.lightning_ring[1]);
+    setText2("ring-inner-val", c.lightning_ring[0]);
+    setText2("ring-outer-val", c.lightning_ring[1]);
+  }
+  // 驻扎
+  document.getElementById("core-hold").checked = !!c.core_hold;
+  // 目标
+  if (c.core_target && Array.isArray(c.core_target)) {
+    reflect("target-x", c.core_target[0]);
+    reflect("target-y", c.core_target[1]);
+    const eff = (c.effective || {});
+    const s = state.stats;
+    let arrived = false;
+    if (s && s.core_position && Array.isArray(s.core_position)) {
+      arrived = manhattan(s.core_position, c.core_target) <= 8;
+    }
+    const tsEl = document.getElementById("target-status");
+    tsEl.textContent =
+      `已设 ${c.core_target[0]},${c.core_target[1]}${arrived ? "（已到达）" : ""}`;
+    tsEl.style.color = arrived ? "var(--good)" : "";
+  } else {
+    reflect("target-x", "");
+    reflect("target-y", "");
+    const tsEl = document.getElementById("target-status");
+    tsEl.textContent = "未设置";
+    tsEl.style.color = "";
+  }
+  // 转移模式：只在用户没有未保存的本地选择时跟随后端值。
+  if (!state.localTransferMode) {
+    const mode = c.core_transfer_mode || "star";
+    document.querySelectorAll("#transfer-seg button").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.mode === mode);
+    });
+  }
+  const curMode = document.querySelector("#transfer-seg button.active")?.dataset.mode || c.core_transfer_mode || "star";
+  const desc = {
+    star: "恒星（默认）：一边推进一边让工人采集资源并交付。",
+    march: "急行军：工人停止采集回归自己的轨道，跟随 Core 稳定向目标推进。",
+    fortify: "坚壁清野：工人只采集不提交，回轨道带货等待；到达目标后集中提交。",
+  }[curMode] || "";
+  document.getElementById("transfer-desc").textContent = desc;
+  // 造兵
+  renderQueue(c.build_queue || []);
+  const ratio = c.spawn_ratio || {};
+  reflect("ratio-ranger", ratio.ranger ?? 3);
+  reflect("ratio-worker", ratio.worker ?? 1);
+  const caps = c.unit_caps || {};
+  reflect("cap-worker", caps.worker ?? 0);
+  reflect("cap-ranger", caps.ranger ?? 0);
+  reflect("cap-vanguard", caps.vanguard ?? 0);
+  // 存底
+  const reserve = c.wartime_reserve ?? 150;
+  reflect("reserve-input", reserve);
+  reflect("reserve-slider", reserve);
+  setText2("reserve-val", reserve);
+  // 高级
+  document.getElementById("adv-recall").checked = !!c.recall;
+  document.getElementById("adv-raid").checked = !!c.raid_enabled;
+  reflect("adv-raid-vg", c.raid_vanguards ?? 1);
+  reflect("adv-raid-rk", c.raid_rangers ?? 2);
+  reflect("adv-beacon-dist", c.beacon_target_distance ?? 0);
+  if (c.rally_point && Array.isArray(c.rally_point)) {
+    reflect("adv-rally-x", c.rally_point[0]);
+    reflect("adv-rally-y", c.rally_point[1]);
+  } else {
+    reflect("adv-rally-x", "");
+    reflect("adv-rally-y", "");
+  }
+  if (c.migration_candidate && Array.isArray(c.migration_candidate)) {
+    reflect("adv-migrate-x", c.migration_candidate[0]);
+    reflect("adv-migrate-y", c.migration_candidate[1]);
+  } else {
+    reflect("adv-migrate-x", "");
+    reflect("adv-migrate-y", "");
+  }
+  document.getElementById("adv-auto-migrate").checked = !!c.auto_migrate;
+}
+
+/* ---- 造兵队列编辑器：行 = {type, qty}，序列化展开成扁平列表 ---- */
+let queueRows = [];
+function renderQueue(flat) {
+  // 把扁平列表压缩成行（连续同类合并）
+  queueRows = [];
+  for (const item of flat) {
+    const last = queueRows[queueRows.length - 1];
+    if (last && last.type === item) last.qty += 1;
+    else queueRows.push({ type: item, qty: 1 });
+  }
+  drawQueue();
+}
+function drawQueue() {
+  const box = document.getElementById("queue-editor");
+  box.innerHTML = "";
+  if (!queueRows.length) {
+    box.innerHTML = '<div style="color:var(--muted);font-size:12px">队列为空（按固定阶梯/默认比例造兵）</div>';
+    return;
+  }
+  queueRows.forEach((row, idx) => {
+    const div = document.createElement("div");
+    div.className = "q-row";
+    const sel = document.createElement("select");
+    for (const t of ["RANGER", "WORKER", "VANGUARD"]) {
+      const opt = document.createElement("option");
+      opt.value = t; opt.textContent = TYPE_LABEL[t];
+      if (row.type === t) opt.selected = true;
+      sel.appendChild(opt);
+    }
+    sel.addEventListener("change", () => { queueRows[idx].type = sel.value; });
+    const qty = document.createElement("input");
+    qty.type = "number"; qty.min = "1"; qty.value = row.qty;
+    qty.addEventListener("input", () => { queueRows[idx].qty = Math.max(1, parseInt(qty.value, 10) || 1); });
+    const up = mkMini("↑", () => { swap(idx, idx - 1); });
+    const down = mkMini("↓", () => { swap(idx, idx + 1); });
+    const del = mkMini("✕", () => { queueRows.splice(idx, 1); drawQueue(); });
+    div.append(sel, qty, up, down, del);
+    box.appendChild(div);
+  });
+}
+function mkMini(text, fn) {
+  const b = document.createElement("button");
+  b.className = "btn small mini"; b.textContent = text; b.addEventListener("click", fn);
+  return b;
+}
+function swap(a, b) {
+  if (b < 0 || b >= queueRows.length) return;
+  [queueRows[a], queueRows[b]] = [queueRows[b], queueRows[a]];
+  drawQueue();
+}
+function queueFlat() {
+  const flat = [];
+  for (const row of queueRows) for (let i = 0; i < row.qty; i++) flat.push(row.type);
+  return flat;
+}
+
+/* ---- 保存 ---- */
+function collectConfig() {
+  const c = state.config || {};
+  const payload = {};
+  const orbit = Math.max(0, parseInt(document.getElementById("orbit-input").value, 10) || 0);
+  payload.core_orbit_radius = orbit;
+  const inner = Math.max(1, parseInt(document.getElementById("ring-inner").value, 10) || 400);
+  const outer = Math.max(inner, parseInt(document.getElementById("ring-outer").value, 10) || 600);
+  payload.lightning_ring = [inner, outer];
+  payload.core_hold = document.getElementById("core-hold").checked;
+  const tx = document.getElementById("target-x").value.trim();
+  const ty = document.getElementById("target-y").value.trim();
+  if (tx !== "" && ty !== "") {
+    payload.core_target = [parseInt(tx, 10), parseInt(ty, 10)];
+  } else {
+    payload.core_target = null;
+  }
+  payload.core_transfer_mode = document.querySelector("#transfer-seg button.active")?.dataset.mode || "star";
+  payload.build_queue = queueFlat();
+  payload.spawn_ratio = {
+    ranger: Math.max(0, parseInt(document.getElementById("ratio-ranger").value, 10) || 0),
+    worker: Math.max(0, parseInt(document.getElementById("ratio-worker").value, 10) || 0),
+  };
+  payload.unit_caps = {
+    worker: Math.max(0, parseInt(document.getElementById("cap-worker").value, 10) || 0),
+    ranger: Math.max(0, parseInt(document.getElementById("cap-ranger").value, 10) || 0),
+    vanguard: Math.max(0, parseInt(document.getElementById("cap-vanguard").value, 10) || 0),
+  };
+  payload.wartime_reserve = Math.max(0, parseInt(document.getElementById("reserve-input").value, 10) || 0);
+  // 高级
+  payload.recall = document.getElementById("adv-recall").checked;
+  payload.raid_enabled = document.getElementById("adv-raid").checked;
+  payload.raid_vanguards = Math.max(0, parseInt(document.getElementById("adv-raid-vg").value, 10) || 0);
+  payload.raid_rangers = Math.max(0, parseInt(document.getElementById("adv-raid-rk").value, 10) || 0);
+  payload.beacon_target_distance = Math.max(0, parseInt(document.getElementById("adv-beacon-dist").value, 10) || 0);
+  const rlx = document.getElementById("adv-rally-x").value.trim();
+  const rly = document.getElementById("adv-rally-y").value.trim();
+  payload.rally_point = (rlx !== "" && rly !== "") ? [parseInt(rlx, 10), parseInt(rly, 10)] : null;
+  const mgx = document.getElementById("adv-migrate-x").value.trim();
+  const mgy = document.getElementById("adv-migrate-y").value.trim();
+  payload.migration_candidate = (mgx !== "" && mgy !== "") ? [parseInt(mgx, 10), parseInt(mgy, 10)] : null;
+  payload.auto_migrate = document.getElementById("adv-auto-migrate").checked;
+  return payload;
+}
+
+async function saveConfig() {
+  const payload = collectConfig();
+  try {
+    await api("/api/config", { method: "POST", body: JSON.stringify(payload) });
+    state.localTransferMode = null; // 已落盘，恢复跟随后端
+    state.lastReflected = {}; // 保存后所有输入框视为“已同步”，允许下一轮回填
+    toast("已保存，代理将在下一 tick 生效 ✓");
+    refreshConfig();
+  } catch (err) {
+    toast("保存失败：" + (err.message || err), true);
+  }
+}
+
+/* ============ 遥测/战况拉取 ============ */
+async function refreshStats() {
+  try {
+    state.stats = await api("/api/stats");
+    renderTopbar();
+    renderKpis();
+    drawMap();
+  } catch (err) {}
+}
+async function refreshTelemetry() {
+  try {
+    const payload = await api("/api/telemetry?limit=" + state.chartRange);
+    state.telemetry = payload.rows || [];
+    renderDecisionLog();
+    drawCharts();
+  } catch (err) {}
+}
+async function refreshBattle() {
+  try {
+    const payload = await api("/api/battle?limit=" + state.chartRange);
+    state.battle = payload.rows || [];
+    drawCharts();
+  } catch (err) {}
+}
+async function refreshTrail() {
+  try {
+    const since = state.trailMaxTick;
+    const qs = "/api/trail?limit=800" + (since ? "&since=" + since : "");
+    const payload = await api(qs);
+    const rows = payload.rows || [];
+    if (rows.length) {
+      const newMax = Math.max(...rows.map((r) => r.tick || 0));
+      if (newMax > state.trailMaxTick) state.trailMaxTick = newMax;
+      state.trail = state.trail.concat(rows);
+      if (state.trail.length > 20000) state.trail = state.trail.slice(-20000);
+    }
+    drawMap();
+  } catch (err) {}
+}
+async function refreshRoutes() {
+  try {
+    state.routes = await api("/api/routes");
+    drawMap();
+  } catch (err) {}
+}
+async function refreshEvents() {
+  try {
+    const payload = await api("/api/events?limit=120");
+    const entries = payload.entries || [];
+    // load_logs 返回按 tick 升序（旧在前，新在末尾）。
+    const latest = entries.length ? entries[entries.length - 1] : null;
+    if (latest) {
+      if (!state.lastEventTitle) {
+        state.lastEventTitle = latest.title; // 首次只记录基线，不弹 toast
+      } else if (latest.title !== state.lastEventTitle || latest.tick !== state.lastEventTick) {
+        state.lastEventTitle = latest.title;
+        state.lastEventTick = latest.tick;
+        toast(latest.title + "：" + (latest.message || ""));
+      }
+    }
+    renderEventLog(entries);
+  } catch (err) {}
+}
+
+/* ============ 战况 KPI + 图表 ============ */
+function renderKpis() {
+  const s = state.stats;
+  if (!s) return;
+  setText2("kpi-core-kill", s.enemy_cores_destroyed ?? 0);
+  const shotsHit = s.shots_hit ?? 0;
+  const shotsFired = s.shots_fired ?? 0;
+  const hitRate = shotsFired > 0 ? Math.round((shotsHit / shotsFired) * 100) + "%" : "—";
+  setText2("kpi-hr", hitRate);
+  const unitsLost = s.units_lost ?? 0;
+  const unitsBuilt = s.units_built ?? 0;
+  const survived = unitsBuilt + unitsLost > 0 ? Math.round((unitsBuilt / (unitsBuilt + unitsLost)) * 100) + "%" : "—";
+  setText2("kpi-surv", survived);
+  // 击杀:阵亡（用战况历史累计）
+  let totalK = 0, totalL = 0;
+  for (const row of state.battle) {
+    for (const v of Object.values(row.kills || {})) totalK += v;
+    for (const v of Object.values(row.losses || {})) totalL += v;
+  }
+  setText2("kpi-kill", totalK + ":" + totalL);
+}
+function setText2(id, value) { document.getElementById(id).textContent = value; }
+
+function manhattan(a, b) { return Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]); }
+
+let charts = {};
+let chartsReady = false;
+function initCharts() {
+  // #app 刚 display:block 时布局可能未完成，等下一帧再 init，确保容器有尺寸。
+  requestAnimationFrame(() => {
+    charts.kills = echarts.init(document.getElementById("chart-kills"));
+    charts.losses = echarts.init(document.getElementById("chart-losses"));
+    charts.hitrate = echarts.init(document.getElementById("chart-hitrate"));
+    charts.pop = echarts.init(document.getElementById("chart-pop"));
+    chartsReady = true;
+    Object.values(charts).forEach((c) => { try { c.resize(); } catch (e) {} });
+    drawCharts();
+  });
+  window.addEventListener("resize", () => {
+    if (!chartsReady) return;
+    Object.values(charts).forEach((c) => { try { c.resize(); } catch (e) {} });
+  });
+}
+
+function chartSeries(kind, rows) {
+  if (!rows.length) return { x: [], series: [] };
+  const x = rows.map((r) => r.tick);
+  const defs = {
+    kills: [
+      { key: "enemy_ranger", name: "敌游侠", color: TYPE_COLOR.RANGER },
+      { key: "enemy_vanguard", name: "敌先锋", color: TYPE_COLOR.VANGUARD },
+      { key: "enemy_worker", name: "敌工人", color: TYPE_COLOR.WORKER },
+      { key: "enemy_core", name: "敌核", color: TYPE_COLOR.CORE },
+      { key: "enemy_unknown", name: "其他", color: TYPE_COLOR.UNKNOWN },
+    ],
+    losses: [
+      { key: "worker", name: "工人", color: TYPE_COLOR.WORKER },
+      { key: "ranger", name: "游侠", color: TYPE_COLOR.RANGER },
+      { key: "vanguard", name: "先锋", color: TYPE_COLOR.VANGUARD },
+    ],
+  };
+  const series = defs[kind].map((def) => {
+    let cum = 0;
+    const bucketKey = kind; // "kills" 或 "losses"
+    const data = rows.map((r) => {
+      cum += (r[bucketKey] || {})[def.key] || 0;
+      return cum;
+    });
+    return { name: def.name, type: "line", showSymbol: false, smooth: true,
+      lineStyle: { width: 2 }, itemStyle: { color: def.color }, data };
+  });
+  return { x, series };
+}
+
+function chartBase(xData, series) {
+  return {
+    backgroundColor: "transparent",
+    grid: { left: 46, right: 16, top: 28, bottom: 26 },
+    legend: { textStyle: { color: "#c3c2b7" }, top: 0, left: 0 },
+    tooltip: { trigger: "axis", backgroundColor: "#1a1a19", borderColor: "rgba(255,255,255,0.15)",
+      textStyle: { color: "#fff", fontSize: 12 } },
+    xAxis: { type: "category", data: xData, axisLine: { lineStyle: { color: "#383835" } },
+      axisLabel: { color: "#898781" }, axisTick: { show: false } },
+    yAxis: { type: "value", splitLine: { lineStyle: { color: "#2c2c2a" } },
+      axisLabel: { color: "#898781" } },
+    series,
+  };
+}
+
+function drawCharts() {
+  if (!chartsReady) return;
+  // 敌方击杀累计
+  const kills = chartSeries("kills", state.battle);
+  charts.kills.setOption(chartBase(kills.x, kills.series), true);
+  // 我方阵亡累计
+  const losses = chartSeries("losses", state.battle);
+  charts.losses.setOption(chartBase(losses.x, losses.series), true);
+  // 命中率滚动窗口（每 tick 命中/总射击，平滑）
+  const hrX = [];
+  const hrData = [];
+  for (const row of state.battle) {
+    const shots = row.shots || {};
+    const total = (shots.hit || 0) + (shots.miss || 0);
+    hrX.push(row.tick);
+    hrData.push(total > 0 ? Math.round((shots.hit / total) * 1000) / 10 : null);
+  }
+  charts.hitrate.setOption(chartBase(hrX, [
+    { name: "命中率 %", type: "line", showSymbol: false, data: hrData,
+      lineStyle: { width: 2, color: "#3987e5" }, itemStyle: { color: "#3987e5" },
+      connectNulls: true, markLine: { silent: true, symbol: "none",
+        lineStyle: { color: "#383835" }, data: [{ yAxis: 50 }] } },
+  ]), true);
+  // 人口与编成（telemetry 只有 population/resources/visible_enemies，无兵种时序）
+  const t = state.telemetry;
+  const popX = t.map((r) => r.tick);
+  const mkSeries = (name, key, color) => ({
+    name, type: "line", showSymbol: false, smooth: true,
+    lineStyle: { width: 2 }, itemStyle: { color },
+    data: t.map((r) => (typeof r[key] === "number" ? r[key] : null)),
+  });
+  charts.pop.setOption(chartBase(popX, [
+    mkSeries("总人口", "population", "#ffffff"),
+    mkSeries("可见敌人", "visible_enemies", TYPE_COLOR.CORE),
+    mkSeries("资源", "resources", "#4ade80"),
+  ]), true);
+  // 布局完成后强制 resize，避免容器 0 宽导致图表不显示。
+  Object.values(charts).forEach((c) => { try { c.resize(); } catch (e) {} });
+}
+
+/* ============ 地图 ============ */
+const mapView = { cx: 500, cy: -200, scale: 4 };
+let drag = null;
+function setupMap() {
+  const canvas = document.getElementById("map");
+  canvas.addEventListener("wheel", (ev) => {
+    ev.preventDefault();
+    const factor = ev.deltaY < 0 ? 1.15 : 1 / 1.15;
+    const rect = canvas.getBoundingClientRect();
+    const px = ev.clientX - rect.left, py = ev.clientY - rect.top;
+    const wx = mapView.cx + (px - rect.width / 2) / mapView.scale;
+    const wy = mapView.cy + (py - rect.height / 2) / mapView.scale;
+    mapView.scale = Math.max(0.5, Math.min(60, mapView.scale * factor));
+    mapView.cx = wx - (px - rect.width / 2) / mapView.scale;
+    mapView.cy = wy - (py - rect.height / 2) / mapView.scale;
+    drawMap();
+  }, { passive: false });
+  canvas.addEventListener("mousedown", (ev) => {
+    drag = { x: ev.clientX, y: ev.clientY, moved: false };
+  });
+  window.addEventListener("mousemove", (ev) => {
+    if (!drag) return;
+    const dx = ev.clientX - drag.x, dy = ev.clientY - drag.y;
+    if (Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
+    if (drag.moved) {
+      mapView.cx -= dx / mapView.scale;
+      mapView.cy -= dy / mapView.scale;
+      drag.x = ev.clientX; drag.y = ev.clientY;
+      drawMap();
+    }
+  });
+  window.addEventListener("mouseup", (ev) => {
+    if (drag && !drag.moved) { // 视为点击 → 设定目标
+      const rect = canvas.getBoundingClientRect();
+      const wx = Math.round(mapView.cx + (ev.clientX - rect.left - rect.width / 2) / mapView.scale);
+      const wy = Math.round(mapView.cy + (ev.clientY - rect.top - rect.height / 2) / mapView.scale);
+      document.getElementById("target-x").value = wx;
+      document.getElementById("target-y").value = wy;
+      setTarget(wx, wy);
+    }
+    drag = null;
+  });
+  document.getElementById("map-follow").addEventListener("click", () => {
+    state.mapFollow = !state.mapFollow;
+    document.getElementById("map-follow").classList.toggle("active", state.mapFollow);
+    if (state.mapFollow) followCore();
+    drawMap();
+  });
+  document.getElementById("map-reset").addEventListener("click", () => {
+    mapView.scale = 4;
+    followCore();
+    drawMap();
+  });
+  document.getElementById("map-clear-trail").addEventListener("click", () => {
+    state.trail = [];
+    state.trailMaxTick = 0;
+    drawMap();
+  });
+  document.getElementById("map-follow").classList.add("active");
+}
+
+function followCore() {
+  if (state.stats && state.stats.core_position && Array.isArray(state.stats.core_position)) {
+    mapView.cx = state.stats.core_position[0];
+    mapView.cy = state.stats.core_position[1];
+  }
+}
+
+function toScreen(wx, wy) {
+  const canvas = document.getElementById("map");
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: rect.width / 2 + (wx - mapView.cx) * mapView.scale,
+    y: rect.height / 2 + (wy - mapView.cy) * mapView.scale,
+  };
+}
+
+function drawMap() {
+  const canvas = document.getElementById("map");
+  const ctx = canvas.getContext("2d");
+  const rect = canvas.getBoundingClientRect();
+  if (canvas.width !== rect.width) canvas.width = rect.width;
+  if (canvas.height !== rect.height) canvas.height = rect.height;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (state.mapFollow) followCore();
+
+  // 网格
+  ctx.strokeStyle = "rgba(255,255,255,0.04)";
+  ctx.lineWidth = 1;
+  const gridStep = 50;
+  const worldLeft = mapView.cx - canvas.width / 2 / mapView.scale;
+  const worldTop = mapView.cy - canvas.height / 2 / mapView.scale;
+  const startX = Math.floor(worldLeft / gridStep) * gridStep;
+  const startY = Math.floor(worldTop / gridStep) * gridStep;
+  for (let gx = startX; gx < worldLeft + canvas.width / mapView.scale; gx += gridStep) {
+    const p = toScreen(gx, worldTop);
+    ctx.beginPath(); ctx.moveTo(p.x, 0); ctx.lineTo(p.x, canvas.height); ctx.stroke();
+  }
+  for (let gy = startY; gy < worldTop + canvas.height / mapView.scale; gy += gridStep) {
+    const p = toScreen(worldLeft, gy);
+    ctx.beginPath(); ctx.moveTo(0, p.y); ctx.lineTo(canvas.width, p.y); ctx.stroke();
+  }
+
+  // 方环（巡逻边界）
+  const ring = state.config && state.config.lightning_ring;
+  if (ring && ring.length === 2) {
+    ctx.strokeStyle = "rgba(57,135,229,0.35)";
+    ctx.setLineDash([6, 4]);
+    strokeSquare(ring[0]);
+    ctx.strokeStyle = "rgba(57,135,229,0.5)";
+    strokeSquare(ring[1]);
+    ctx.setLineDash([]);
+  }
+
+  // Core 轨迹
+  if (state.trailVisible && state.trail.length > 1) {
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    let first = true;
+    for (const row of state.trail) {
+      const p = toScreen(row.pos[0], row.pos[1]);
+      if (p.x < -50 || p.x > canvas.width + 50 || p.y < -50 || p.y > canvas.height + 50) {
+        first = true; continue;
+      }
+      if (first) { ctx.moveTo(p.x, p.y); first = false; }
+      else ctx.lineTo(p.x, p.y);
+    }
+    ctx.stroke();
+  }
+
+  // 资源点
+  const resources = state.routes.resources || [];
+  ctx.fillStyle = "#4ade80";
+  for (const [rx, ry] of resources) {
+    const p = toScreen(rx, ry);
+    if (p.x < -10 || p.x > canvas.width + 10 || p.y < -10 || p.y > canvas.height + 10) continue;
+    ctx.fillRect(p.x - 1.5, p.y - 1.5, 3, 3);
+  }
+
+  // 我方单位
+  const units = (state.stats && state.stats.units) || [];
+  for (const u of units) {
+    const p = toScreen(u.position[0], u.position[1]);
+    if (p.x < -10 || p.x > canvas.width + 10 || p.y < -10 || p.y > canvas.height + 10) continue;
+    ctx.beginPath();
+    ctx.fillStyle = TYPE_COLOR[u.type] || "#cccccc";
+    ctx.arc(p.x, p.y, u.type === "VANGUARD" ? 4 : 3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.6)"; ctx.lineWidth = 1; ctx.stroke();
+  }
+
+  // 敌方单位
+  const enemies = (state.stats && state.stats.enemy_units) || [];
+  for (const e of enemies) {
+    const p = toScreen(e.position[0], e.position[1]);
+    if (p.x < -10 || p.x > canvas.width + 10 || p.y < -10 || p.y > canvas.height + 10) continue;
+    ctx.beginPath();
+    ctx.fillStyle = TYPE_COLOR.CORE;
+    const size = e.type === "CORE" ? 6 : 4;
+    ctx.moveTo(p.x, p.y - size); ctx.lineTo(p.x + size, p.y);
+    ctx.lineTo(p.x, p.y + size); ctx.lineTo(p.x - size, p.y); ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.6)"; ctx.lineWidth = 1; ctx.stroke();
+  }
+
+  // 目标标记
+  const target = state.config && state.config.core_target;
+  if (target && Array.isArray(target)) {
+    const p = toScreen(target[0], target[1]);
+    ctx.strokeStyle = "#fab219"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 9, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(p.x - 5, p.y); ctx.lineTo(p.x + 5, p.y);
+    ctx.moveTo(p.x, p.y - 5); ctx.lineTo(p.x, p.y + 5);
+    ctx.stroke();
+  }
+
+  // Core 当前位置
+  if (state.stats && state.stats.core_position && Array.isArray(state.stats.core_position)) {
+    const p = toScreen(state.stats.core_position[0], state.stats.core_position[1]);
+    const s = state.stats;
+    const ring = mapView.scale > 14;
+    ctx.beginPath();
+    ctx.fillStyle = "#ffffff";
+    ctx.arc(p.x, p.y, ring ? 6 : 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = "#3987e5"; ctx.lineWidth = 2; ctx.stroke();
+    if (ring) {
+      ctx.fillStyle = "#3987e5"; ctx.font = "11px system-ui";
+      ctx.fillText(`${s.core_position[0]},${s.core_position[1]}`, p.x + 9, p.y - 7);
+      const hp = s.core_hp ?? 0;
+      ctx.fillStyle = "#c3c2b7"; ctx.font = "10px system-ui";
+      ctx.fillText(`HP${hp}/${s.core_shield ?? 0}`, p.x + 9, p.y + 6);
+    }
+  }
+
+  function strokeSquare(radius) {
+    const a = toScreen(-radius, -radius);
+    const b = toScreen(radius, radius);
+    ctx.strokeRect(a.x, a.y, b.x - a.x, b.y - a.y);
+  }
+}
+
+async function setTarget(x, y) {
+  if (!state.token) { toast("请先登录", true); return; }
+  try {
+    await api("/api/config", { method: "POST", body: JSON.stringify({ core_target: [x, y] }) });
+    state.lastReflected = {}; // 保存后允许回填新值
+    toast(`目标设为 ${x},${y} ✓`);
+    refreshConfig();
+  } catch (err) { toast("设目标失败：" + (err.message || err), true); }
+}
+
+/* ============ 日志 ============ */
+function renderDecisionLog() {
+  const box = document.getElementById("decision-log");
+  if (!state.telemetry.length) { box.innerHTML = "<pre>暂无数据</pre>"; return; }
+  const rows = state.telemetry.slice(-40).reverse();
+  const html = rows.map((r) => {
+    const decisions = (r.decisions || []).join(" | ");
+    const accepted = r.accepted === false ? ` <span style='color:var(--crit)'>[rejected ${r.error || ""}]</span>` : "";
+    return `<div class="log-row"><span class="lt">t${r.tick}</span><span class="lm">${esc(decisions || "wait")}${accepted}</span></div>`;
+  }).join("");
+  box.innerHTML = html;
+}
+function renderEventLog(entries) {
+  const box = document.getElementById("event-log");
+  if (!entries.length) { box.innerHTML = "<pre>暂无事件</pre>"; return; }
+  // 反转：最新事件显示在顶部。
+  const html = entries.slice().reverse().map((e) => {
+    const cls = e.level === "danger" ? "danger" : e.level === "warning" ? "warn" : e.level === "success" ? "success" : "";
+    return `<div class="log-row ${cls}"><span class="lt">t${e.tick}</span><span class="lm">${esc(e.title)}：${esc(e.message || "")}</span></div>`;
+  }).join("");
+  box.innerHTML = html;
+}
+function esc(text) {
+  return String(text).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+/* ============ toast ============ */
+let toastTimer = null;
+function toast(msg, isError) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.className = isError ? "err" : "ok";
+  el.style.display = "block";
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.style.display = "none"; }, 3200);
+}
+
+/* ============ 事件绑定 ============ */
+document.getElementById("login-btn").addEventListener("click", doLogin);
+document.getElementById("password-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") doLogin();
+});
+document.getElementById("logout-btn").addEventListener("click", () => logout());
+document.getElementById("save-btn").addEventListener("click", saveConfig);
+document.getElementById("queue-add").addEventListener("click", () => {
+  queueRows.push({ type: "RANGER", qty: 1 });
+  drawQueue();
+});
+document.getElementById("queue-clear").addEventListener("click", () => { queueRows = []; drawQueue(); });
+document.getElementById("orbit-slider").addEventListener("input", (e) => {
+  document.getElementById("orbit-input").value = e.target.value;
+  document.getElementById("orbit-val").textContent = e.target.value > 0 ? e.target.value : "0 (自动)";
+});
+document.getElementById("orbit-input").addEventListener("input", (e) => {
+  const v = Math.max(0, parseInt(e.target.value, 10) || 0);
+  document.getElementById("orbit-slider").value = Math.min(900, v);
+  document.getElementById("orbit-val").textContent = v > 0 ? v : "0 (自动)";
+});
+document.getElementById("ring-inner").addEventListener("input", (e) => {
+  document.getElementById("ring-inner-val").textContent = e.target.value;
+});
+document.getElementById("ring-outer").addEventListener("input", (e) => {
+  document.getElementById("ring-outer-val").textContent = e.target.value;
+});
+document.getElementById("reserve-slider").addEventListener("input", (e) => {
+  document.getElementById("reserve-input").value = e.target.value;
+  document.getElementById("reserve-val").textContent = e.target.value;
+});
+document.getElementById("reserve-input").addEventListener("input", (e) => {
+  const v = Math.max(0, parseInt(e.target.value, 10) || 0);
+  document.getElementById("reserve-slider").value = Math.min(400, v);
+  document.getElementById("reserve-val").textContent = v;
+});
+document.querySelectorAll("#transfer-seg button").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("#transfer-seg button").forEach((b) => b.classList.toggle("active", b === btn));
+    state.localTransferMode = btn.dataset.mode; // 暂存，避免被轮询覆盖
+    // 只更新描述，不触发整体回填
+    const desc = {
+      star: "恒星（默认）：一边推进一边让工人采集资源并交付。",
+      march: "急行军：工人停止采集回归自己的轨道，跟随 Core 稳定向目标推进。",
+      fortify: "坚壁清野：工人只采集不提交，回轨道带货等待；到达目标后集中提交。",
+    }[btn.dataset.mode] || "";
+    document.getElementById("transfer-desc").textContent = desc;
+  });
+});
+document.getElementById("target-clear").addEventListener("click", async () => {
+  document.getElementById("target-x").value = "";
+  document.getElementById("target-y").value = "";
+  try {
+    await api("/api/config", { method: "POST", body: JSON.stringify({ core_target: null }) });
+    state.lastReflected = {};
+    toast("目标已取消 ✓");
+    refreshConfig();
+  } catch (err) { toast("取消失败：" + (err.message || err), true); }
+});
+document.getElementById("target-set").addEventListener("click", () => {
+  const x = document.getElementById("target-x").value.trim();
+  const y = document.getElementById("target-y").value.trim();
+  if (x === "" || y === "") { toast("请填写目标 x 和 y", true); return; }
+  setTarget(parseInt(x, 10), parseInt(y, 10));
+});
+
+/* ============ 启动 ============ */
+setupMap();
+if (state.token) {
+  // 尝试恢复会话
+  api("/api/config").then(() => enterApp()).catch(() => {});
+}
+</script>
+</body>
+</html>
