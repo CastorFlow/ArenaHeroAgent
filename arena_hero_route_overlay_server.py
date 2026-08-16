@@ -93,7 +93,14 @@ EMPTY_BROWSER_INTEL = {
     "captured_at": None,
     "resources": [],
 }
-VALID_MODES = {"develop", "aggress", "beacon", "migrate"}
+VALID_MODES = {"develop", "aggress", "beacon", "migrate", "lightning"}
+# 网页控制台新增控制字段（与 arena_hero_strategy.TacticMemory 一致）。
+CONTROL_TRANSFER_MODES = {"star", "march", "fortify"}
+CONTROL_UNIT_TYPES = ("WORKER", "VANGUARD", "RANGER")
+CONTROL_MAX_BUILD_QUEUE_LENGTH = 20
+CONTROL_MAX_RING = 10000
+CONTROL_MAX_ORBIT = 900
+CONTROL_MAX_WARTIME_RESERVE = 10000
 POSITION_STATS = {
     "core_position",
     "beacon_position",
@@ -343,6 +350,46 @@ def _normalize_counter(value: Any) -> dict[str, int]:
     return dict(sorted(result.items()))
 
 
+def _is_sensitive_key(key: str) -> bool:
+    lowered = key.lower()
+    return any(part in lowered for part in SENSITIVE_KEY_PARTS)
+
+
+def _clamp_non_negative_int(value: Any, default: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return max(0, int(value))
+
+
+def _normalize_unit_list(raw_units: Any) -> list[dict[str, Any]]:
+    """归一化我方/敌方单位列表：保留 id/type/number/position/hp，剥离敏感字段。"""
+    if not isinstance(raw_units, list):
+        return []
+    units: list[dict[str, Any]] = []
+    for raw_unit in raw_units[:256]:
+        if not isinstance(raw_unit, dict):
+            continue
+        position = _position(raw_unit.get("position"))
+        if position is None:
+            continue
+        unit_type = raw_unit.get("type")
+        if not isinstance(unit_type, str) or not unit_type:
+            continue
+        entry: dict[str, Any] = {
+            "id": str(raw_unit.get("id", ""))[:128],
+            "type": unit_type[:32],
+            "position": position,
+        }
+        number = raw_unit.get("number")
+        if isinstance(number, int) and not isinstance(number, bool) and number >= 1:
+            entry["number"] = number
+        hp = raw_unit.get("hp")
+        if isinstance(hp, int) and not isinstance(hp, bool) and hp >= 0:
+            entry["hp"] = hp
+        units.append(entry)
+    return units
+
+
 def _normalize_stats(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return dict(EMPTY_STATS)
@@ -364,25 +411,233 @@ def _normalize_stats(payload: Any) -> dict[str, Any]:
         elif isinstance(default, str):
             result[key] = str(value)[:64] if isinstance(value, str) else default
         else:
+            # 列表/复杂默认值（如 units: []）—— 走下面的显式归一化分支。
             result[key] = default
+    # 我方/敌方单位列表：始终走显式归一化（剥离敏感字段、补齐位置/类型）。
+    result["units"] = _normalize_unit_list(payload.get("units"))
+    result["enemy_units"] = _normalize_unit_list(payload.get("enemy_units"))
+    # 透传网页控制台/战况分析需要的非敏感扩展字段。
+    for key, value in payload.items():
+        if key in result or _is_sensitive_key(key):
+            continue
+        if isinstance(value, bool):
+            result[key] = value
+        elif isinstance(value, (int, float)):
+            result[key] = _clamp_non_negative_int(value, 0)
+        elif isinstance(value, str):
+            result[key] = value[:256]
+        elif isinstance(value, list):
+            result[key] = [
+                _position_or_none(item) if isinstance(item, (list, tuple)) else item
+                for item in value[:512]
+            ]
+        elif isinstance(value, dict):
+            result[key] = _sanitize_dict(value)
+        # 其余类型（None 等）直接丢弃。
     if result["mode"] not in VALID_MODES:
         result["mode"] = "develop"
     return result
+
+
+def _sanitize_dict(value: Any, *, depth: int = 0) -> Any:
+    """递归清理 dict/嵌套结构：剥离敏感 key，整型转非负。"""
+    if depth > 6:
+        return None
+    if isinstance(value, dict):
+        cleaned: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or _is_sensitive_key(key):
+                continue
+            cleaned[key] = _sanitize_dict(item, depth=depth + 1)
+        return cleaned
+    if isinstance(value, list):
+        return [_sanitize_dict(item, depth=depth + 1) for item in value[:512]]
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return _clamp_non_negative_int(value, 0)
+    if isinstance(value, str):
+        return value[:256]
+    return None
+
+
+def _int_clamp(value: Any, *, minimum: int, maximum: int, default: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return max(minimum, min(maximum, int(value)))
+
+
+def _position_or_none(value: Any) -> list[int] | None:
+    """接受 [x, y]（int/float，非 bool）；其余一律 None。"""
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    if any(isinstance(item, bool) or not isinstance(item, (int, float)) for item in value):
+        return None
+    return [int(value[0]), int(value[1])]
+
+
+def _default_dashboard_control_fields(payload: dict[str, Any]) -> None:
+    """网页控制台新增控制字段的默认值。"""
+    payload["core_orbit_radius"] = 0
+    payload["core_hold"] = False
+    payload["core_target"] = None
+    payload["core_transfer_mode"] = "star"
+    payload["lightning_ring"] = [400, 600]
+    payload["build_queue"] = []
+    payload["spawn_ratio"] = {"ranger": 3, "worker": 1}
+    payload["unit_caps"] = {"worker": 0, "vanguard": 0, "ranger": 0}
+    payload["wartime_reserve"] = 150
+
+
+def _read_dashboard_control_fields(data: dict[str, Any], result: dict[str, Any]) -> None:
+    """从原始 JSON 读取网页控制台新增字段，做宽松归一化（读取容错）。"""
+    result["core_orbit_radius"] = _int_clamp(
+        data.get("core_orbit_radius", 0),
+        minimum=0,
+        maximum=CONTROL_MAX_ORBIT,
+        default=0,
+    )
+    result["core_hold"] = bool(data.get("core_hold", False))
+    result["core_target"] = _position_or_none(data.get("core_target"))
+    mode = data.get("core_transfer_mode", "star")
+    result["core_transfer_mode"] = mode if mode in CONTROL_TRANSFER_MODES else "star"
+    raw_ring = data.get("lightning_ring")
+    ring = _position_or_none(raw_ring)
+    if ring is None:
+        ring = [400, 600]
+    inner, outer = ring
+    if outer < inner or inner <= 0:
+        ring = [400, 600]
+    else:
+        ring = [
+            min(CONTROL_MAX_RING, max(1, inner)),
+            min(CONTROL_MAX_RING, max(1, outer)),
+        ]
+    result["lightning_ring"] = ring
+    raw_queue = data.get("build_queue")
+    queue: list[str] = []
+    if isinstance(raw_queue, list):
+        for item in raw_queue[:CONTROL_MAX_BUILD_QUEUE_LENGTH]:
+            if isinstance(item, str) and item in CONTROL_UNIT_TYPES:
+                queue.append(item)
+    result["build_queue"] = queue
+    raw_ratio = data.get("spawn_ratio")
+    if isinstance(raw_ratio, dict):
+        ranger = _int_clamp(raw_ratio.get("ranger", 0), minimum=0, maximum=9999, default=0)
+        worker = _int_clamp(raw_ratio.get("worker", 0), minimum=0, maximum=9999, default=0)
+        if ranger > 0 or worker > 0:
+            result["spawn_ratio"] = {"ranger": ranger, "worker": worker}
+        else:
+            result["spawn_ratio"] = {"ranger": 3, "worker": 1}
+    else:
+        result["spawn_ratio"] = {"ranger": 3, "worker": 1}
+    raw_caps = data.get("unit_caps")
+    caps: dict[str, int] = {"worker": 0, "vanguard": 0, "ranger": 0}
+    if isinstance(raw_caps, dict):
+        for key in caps:
+            caps[key] = _int_clamp(raw_caps.get(key, 0), minimum=0, maximum=9999, default=0)
+    result["unit_caps"] = caps
+    result["wartime_reserve"] = _int_clamp(
+        data.get("wartime_reserve", 150),
+        minimum=0,
+        maximum=CONTROL_MAX_WARTIME_RESERVE,
+        default=150,
+    )
+
+
+def _apply_dashboard_control_fields(data: dict[str, Any], payload: dict[str, Any]) -> None:
+    """在 save_control 中把前端 POST 的新增字段写入 payload（严格校验，错误抛 ValueError）。"""
+    if "core_orbit_radius" in data:
+        value = data["core_orbit_radius"]
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError("core_orbit_radius must be a number")
+        payload["core_orbit_radius"] = max(0, min(CONTROL_MAX_ORBIT, int(value)))
+    if "core_hold" in data:
+        if not isinstance(data["core_hold"], bool):
+            raise ValueError("core_hold must be boolean")
+        payload["core_hold"] = data["core_hold"]
+    if "core_target" in data:
+        candidate = _position_or_none(data["core_target"])
+        if data["core_target"] is not None and candidate is None:
+            raise ValueError("core_target must be null or [x, y]")
+        payload["core_target"] = candidate
+    if "core_transfer_mode" in data:
+        mode = data["core_transfer_mode"]
+        if mode not in CONTROL_TRANSFER_MODES:
+            raise ValueError(
+                f"core_transfer_mode must be one of {sorted(CONTROL_TRANSFER_MODES)}"
+            )
+        payload["core_transfer_mode"] = mode
+    if "lightning_ring" in data:
+        ring = _position_or_none(data["lightning_ring"])
+        if ring is None:
+            raise ValueError("lightning_ring must be [inner, outer]")
+        inner, outer = ring
+        if outer < inner or inner <= 0:
+            raise ValueError("lightning_ring must satisfy outer >= inner > 0")
+        payload["lightning_ring"] = [
+            min(CONTROL_MAX_RING, max(1, inner)),
+            min(CONTROL_MAX_RING, max(1, outer)),
+        ]
+    if "build_queue" in data:
+        raw_queue = data["build_queue"]
+        if not isinstance(raw_queue, list):
+            raise ValueError("build_queue must be a list")
+        queue: list[str] = []
+        for item in raw_queue[:CONTROL_MAX_BUILD_QUEUE_LENGTH]:
+            if not isinstance(item, str) or item not in CONTROL_UNIT_TYPES:
+                raise ValueError(
+                    f"build_queue item must be one of {list(CONTROL_UNIT_TYPES)}"
+                )
+            queue.append(item)
+        payload["build_queue"] = queue
+    if "spawn_ratio" in data:
+        raw_ratio = data["spawn_ratio"]
+        if not isinstance(raw_ratio, dict):
+            raise ValueError("spawn_ratio must be an object")
+        ranger = raw_ratio.get("ranger")
+        worker = raw_ratio.get("worker")
+        if (
+            not isinstance(ranger, (int, float))
+            or isinstance(ranger, bool)
+            or not isinstance(worker, (int, float))
+            or isinstance(worker, bool)
+            or ranger < 0
+            or worker < 0
+        ):
+            raise ValueError("spawn_ratio ranger/worker must be non-negative numbers")
+        if ranger == 0 and worker == 0:
+            raise ValueError("spawn_ratio ranger and worker cannot both be zero")
+        payload["spawn_ratio"] = {"ranger": int(ranger), "worker": int(worker)}
+    if "unit_caps" in data:
+        raw_caps = data["unit_caps"]
+        if not isinstance(raw_caps, dict):
+            raise ValueError("unit_caps must be an object")
+        caps: dict[str, int] = {}
+        for key in ("worker", "vanguard", "ranger"):
+            value = raw_caps.get(key, 0)
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or value < 0
+            ):
+                raise ValueError(f"unit_caps {key} must be a non-negative number")
+            caps[key] = int(value)
+        payload["unit_caps"] = caps
+    if "wartime_reserve" in data:
+        value = data["wartime_reserve"]
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError("wartime_reserve must be a number")
+        payload["wartime_reserve"] = max(
+            0, min(CONTROL_MAX_WARTIME_RESERVE, int(value))
+        )
 
 
 def load_control(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
-            return {
-                "mode": "develop",
-                "recall": False,
-                "raid_enabled": False,
-                "raid_recall": False,
-                "raid_vanguards": 1,
-                "raid_rangers": 2,
-                "beacon_target_distance": 0,
-            }
+            return _default_control()
         mode = data.get("mode", "develop")
         if mode not in VALID_MODES:
             mode = "develop"
@@ -433,20 +688,29 @@ def load_control(path: Path) -> dict[str, Any]:
                 and not isinstance(raw_value, bool)
                 else default
             )
+        # === 网页控制台新增控制字段：回显读取值（save_control 做校验/落盘）===
+        _read_dashboard_control_fields(data, result)
         return result
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        return {
-            "mode": "develop",
-            "recall": False,
-            "raid_enabled": False,
-            "raid_recall": False,
-            "raid_vanguards": 1,
-            "raid_rangers": 2,
-            "beacon_target_distance": 0,
-            "rally_point": None,
-            "aggress_vanguards": 0,
-            "aggress_rangers": 0,
-        }
+        return _default_control()
+
+
+def _default_control() -> dict[str, Any]:
+    """控制文件的完整默认值，含网页控制台新增字段。"""
+    payload: dict[str, Any] = {
+        "mode": "develop",
+        "recall": False,
+        "raid_enabled": False,
+        "raid_recall": False,
+        "raid_vanguards": 1,
+        "raid_rangers": 2,
+        "beacon_target_distance": 0,
+        "rally_point": None,
+        "aggress_vanguards": 0,
+        "aggress_rangers": 0,
+    }
+    _default_dashboard_control_fields(payload)
+    return payload
 
 
 def save_control(
@@ -520,6 +784,8 @@ def save_control(
             if not isinstance(raw_value, (int, float)) or isinstance(raw_value, bool):
                 raise ValueError(f"{key} must be a number")
             payload[key] = max(0, int(raw_value))
+        # 网页控制台新增控制字段：严格校验后落盘。
+        _apply_dashboard_control_fields(data, payload)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(

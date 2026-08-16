@@ -90,11 +90,11 @@ class EndToEndTests(unittest.TestCase):
             stats_path = root / ".arena_hero_stats.json"
             control_path = root / ".arena_hero_control.json"
             control_path.write_text(
-                json.dumps({"mode": "aggress", "recall": False}),
+                json.dumps({"mode": "lightning", "recall": False}),
                 encoding="utf-8",
             )
 
-            # 1) 策略决策（aggress 模式）
+            # 1) 策略决策（强制 lightning 分支）
             turn = _turn(
                 12,
                 resources=25,
@@ -110,7 +110,7 @@ class EndToEndTests(unittest.TestCase):
             memory = TacticMemory()
             tactic = SmartTactic(memory, control_path=control_path)
             summary = tactic.choose_actions(turn)
-            self.assertEqual(memory.mode, "aggress")
+            self.assertEqual(summary.mode, "lightning")
             self.assertGreaterEqual(summary.unit_actions, 0)
 
             # 2) 模拟 submit 成功后 memory.save + write_stats
@@ -140,12 +140,12 @@ class EndToEndTests(unittest.TestCase):
                 thread.join(timeout=2)
 
             self.assertEqual(routes_payload["tick"], 12)
-            self.assertEqual(stats_payload["mode"], "aggress")
+            self.assertEqual(stats_payload["mode"], "lightning")
             self.assertEqual(stats_payload["resources"], 25)
             self.assertEqual(
                 control_payload,
                 {
-                    "mode": "aggress",
+                    "mode": "lightning",
                     "recall": False,
                     "raid_enabled": False,
                     "raid_recall": False,
@@ -155,6 +155,15 @@ class EndToEndTests(unittest.TestCase):
                     "rally_point": None,
                     "aggress_vanguards": 0,
                     "aggress_rangers": 0,
+                    "core_orbit_radius": 0,
+                    "core_hold": False,
+                    "core_target": None,
+                    "core_transfer_mode": "star",
+                    "lightning_ring": [400, 600],
+                    "build_queue": [],
+                    "spawn_ratio": {"ranger": 3, "worker": 1},
+                    "unit_caps": {"worker": 0, "vanguard": 0, "ranger": 0},
+                    "wartime_reserve": 150,
                 },
             )
 
