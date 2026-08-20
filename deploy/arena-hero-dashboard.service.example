@@ -1,0 +1,26 @@
+[Unit]
+Description=Arena Hero API-key dashboard and Agent supervisor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=arena-hero
+Group=arena-hero
+WorkingDirectory=/opt/ArenaHeroAgent
+Environment=PYTHONUNBUFFERED=1
+Environment=ARENA_HERO_DASHBOARD_HOST=127.0.0.1
+Environment=ARENA_HERO_DASHBOARD_PORT=8766
+Environment=ARENA_HERO_DASHBOARD_TRUST_PROXY=true
+ExecStart=/opt/ArenaHeroAgent/.venv/bin/python /opt/ArenaHeroAgent/arena_hero_dashboard_server.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/ArenaHeroAgent
+
+[Install]
+WantedBy=multi-user.target

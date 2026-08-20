@@ -39,9 +39,8 @@ from arena_hero import (
     unit_cost,
 )
 
-from arena_hero_tactic import choose_actions
+from arena_hero_tactic import _write_agent_status, choose_actions
 from arena_hero_strategy import (
-    LIGHTNING_DEFAULT_RING,
     MODE_LIGHTNING,
     MovementPlanner,
     SmartTactic,
@@ -50,6 +49,7 @@ from arena_hero_strategy import (
     _distance,
     _enemy_can_see_cell,
     _enemy_watchers,
+    _short_id,
 )
 
 _test_control_directory: TemporaryDirectory[str] | None = None
@@ -328,33 +328,19 @@ class LightningModeTests(unittest.TestCase):
         """Keep local-behaviour fixtures independent of Core migration.
 
         These tests intentionally place the Core at (600, 600) to exercise
-        spawning and lane helpers.  The production donut is now (400, 600),
-        so use the former neutral test ring rather than let a global Core
-        relocation consume the Core action under test.
+        spawning and lane helpers.  Set a stable orbit radius so the Core's
+        patrol/migration does not consume the Core action under test.
         """
         memory = TacticMemory()
-        memory.lightning_ring = (500, 700)
+        memory.core_orbit_radius = 550
         return memory
 
     def _box_core(self) -> CoreView:
         # Stable coordinate for the isolated lightning fixtures below.
         return core((600, 600))
 
-    def test_default_core_patrol_ring_is_shifted_100_toward_origin(self) -> None:
-        self.assertEqual(LIGHTNING_DEFAULT_RING, (400, 600))
-        self.assertEqual(SmartTactic(TacticMemory())._lightning_patrol_radius(), 450)
-
-    def test_patrol_reprojects_persisted_waypoint_after_ring_change(self) -> None:
-        memory = TacticMemory()
-        memory.lightning_patrol_waypoint = (-650, -650)
-        memory.lightning_patrol_phase = 2
-        tactic = SmartTactic(memory)
-        turn, _ = make_turn(own_core=core((446, -650)))
-        self.assertEqual(tactic._lightning_patrol_waypoint(turn), (-450, -450))
-        self.assertEqual(memory.lightning_patrol_phase, 2)
-
     def test_cap10_forces_vanguard_not_ranger(self) -> None:
-        # pop1 → 容量 10，资源 10：必须产先锋（游侠要 12 存不下）。
+        # pop1 → 容量 10，资源 10：开局引导未造满 3 工人 → 造工人（游侠要 12 存不下）。
         turn, _ = make_turn(
             own_core=self._box_core(),
             units=(worker(WORKER_LOW, (601, 600)),),
@@ -363,10 +349,10 @@ class LightningModeTests(unittest.TestCase):
         SmartTactic(self._isolated_lightning_memory()).choose_actions(turn)
 
         self.assertIsInstance(turn.plan.core_action, SpawnAction)
-        self.assertEqual(turn.plan.core_action.unit_type, UnitType.VANGUARD)
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.WORKER)
 
     def test_second_worker_raises_cap_before_ranger(self) -> None:
-        # pop2（工人+先锋），容量仍 10：应产工人#2 抬容量，而非卡在游侠。
+        # pop2（工人+先锋），容量仍 10：开局引导仍要造工人抬容量。
         turn, _ = make_turn(
             own_core=self._box_core(),
             units=(
@@ -380,113 +366,12 @@ class LightningModeTests(unittest.TestCase):
         self.assertIsInstance(turn.plan.core_action, SpawnAction)
         self.assertEqual(turn.plan.core_action.unit_type, UnitType.WORKER)
 
-    def test_vanguard_claims_and_sweeps_unguarded_core(self) -> None:
-        turn, _ = make_turn(
-            own_core=self._box_core(),
-            units=(vanguard((609, 600)),),
-            enemies=(enemy_core((610, 600)),),
-        )
-        SmartTactic(TacticMemory()).choose_actions(turn)
-
-        action = turn.plan.unit_actions[VANGUARD_ID]
-        self.assertIsInstance(action, SweepAction)
-        self.assertEqual(action.direction, Direction.RIGHT)
-
-    def test_releases_claim_when_enemy_vanguard_guards_target(self) -> None:
-        # 守卫贴脸目标 Core（1 格，≤close radius 3）→ 释放 claim，不扑上去 sweep。
-        turn, _ = make_turn(
-            own_core=self._box_core(),
-            units=(vanguard((605, 600)),),
-            enemies=(
-                enemy_core((610, 600)),
-                enemy_vanguard((611, 600)),
-            ),
-        )
+    def test_patrol_waypoint_on_square_perimeter(self) -> None:
         memory = TacticMemory()
-        SmartTactic(memory).choose_actions(turn)
-
-        # 无 claim，且先锋动作不是朝向该 Core 的 sweep。
-        self.assertEqual(memory.lightning_claims, {})
-        action = turn.plan.unit_actions.get(VANGUARD_ID)
-        self.assertFalse(
-            isinstance(action, SweepAction)
-            and _destination((605, 600), action.direction) == (610, 600)
-        )
-
-    def test_blacklists_crowded_core_permanently(self) -> None:
-        # 重兵 Core 一旦放弃 → 永久黑名单，即使之后 sighting 老化也不再 claim。
-        from arena_hero_strategy import EnemySighting
-        memory = TacticMemory()
-        # 曼哈顿距离 = |600-700| + |600-300| = 400 < 900
-        memory.enemy_sightings = {
-            "crowded-core": EnemySighting(position=(700, 300), seen_tick=1000, is_core=True),
-            "g-1": EnemySighting(position=(699, 302), seen_tick=1010, is_core=False),
-            "g-2": EnemySighting(position=(699, 298), seen_tick=1011, is_core=False),
-        }
-        memory.last_tick = 1015
-        turn, _ = make_turn(
-            own_core=core((600, 600)),
-            units=(vanguard((620, 600)),),
-        )
-        SmartTactic(memory).choose_actions(turn)
-        self.assertIn("crowded-core", memory.lightning_blacklist)
-        # 模拟 sighting 老化后（守卫 sighting 超龄，crowd 不再触发）仍不 claim。
-        memory.enemy_sightings = {
-            "crowded-core": EnemySighting(position=(700, 300), seen_tick=1000, is_core=True),
-        }
-        memory.last_tick = 9999  # 守卫 sighting 已删，即使还在黑名单也不 claim
-        turn2, _ = make_turn(
-            own_core=core((600, 600)),
-            units=(vanguard((620, 600)),),
-        )
-        SmartTactic(memory).choose_actions(turn2)
-        self.assertEqual(memory.lightning_claims, {})
-        self.assertIn("crowded-core", memory.lightning_blacklist)
-
-    def test_skips_crowded_target_with_fogged_guards(self) -> None:
-        # 目标 Core 周围雾里有 2 个近期敌方 sighting（当前不可见）→ 视为重兵把守，
-        # 不 claim，先锋转扇区探索。补住"雾里守卫看不见→误判无护卫→凑过去卡死"。
-        memory = TacticMemory()
-        from arena_hero_strategy import EnemySighting
-        # 曼哈顿距离 = |600-700| + |600-300| = 400 < 900
-        memory.enemy_sightings = {
-            "core-1": EnemySighting(position=(700, 300), seen_tick=1000, is_core=True),
-            "g-1": EnemySighting(position=(699, 302), seen_tick=1010, is_core=False),
-            "g-2": EnemySighting(position=(699, 298), seen_tick=1011, is_core=False),
-        }
-        memory.last_tick = 1015
-        turn, _ = make_turn(
-            own_core=core((600, 600)),
-            units=(vanguard((620, 600)),),
-            # 当前视野无敌方单位（守卫在雾里）。
-        )
-        SmartTactic(memory).choose_actions(turn)
-        # 不 claim 重兵 Core。
-        self.assertEqual(memory.lightning_claims, {})
-
-    def test_keeps_claim_and_detours_around_distant_guard(self) -> None:
-        # 守卫在目标 5 格（>close 3，不贴脸）且不触发家防（离自家 Core 远）→
-        # 不释放 claim；先锋保留 claim，朝目标走但把守卫格当障碍绕开。
-        # 自家 Core (600,600)；敌方 Core (640,600)；守卫先锋 (635,600)（目标 5 格）。
-        turn, _ = make_turn(
-            own_core=core((600, 600)),
-            units=(vanguard((620, 600)),),
-            enemies=(
-                enemy_core((640, 600)),
-                enemy_vanguard((635, 600)),  # 目标和先锋之间，离目标 5 格
-            ),
-        )
-        memory = TacticMemory()
-        SmartTactic(memory).choose_actions(turn)
-        # claim 保留（不释放）；先锋走了，不原地卡死。
-        self.assertEqual(len(memory.lightning_claims), 1)
-        self.assertIn(VANGUARD_ID, turn.plan.unit_actions)
-
-    def test_patrol_waypoint_stays_inside_donut(self) -> None:
-        memory = TacticMemory()
+        memory.core_orbit_radius = 450
         tactic = SmartTactic(memory)
         # 巡逻不需战斗护卫门槛（贫瘠区不能等攒够先锋+游侠才动）。
-        # Core 置于方环内（max-norm 半径在 500..700），仅 1 工人、0 战斗单位。
+        # Core 置于轨道内侧（max-norm 半径 < r），仅 1 工人、0 战斗单位。
         turn, _ = make_turn(
             own_core=core((535, -201)),
             units=(worker(WORKER_LOW, (536, -201)),),
@@ -494,14 +379,13 @@ class LightningModeTests(unittest.TestCase):
         tactic.choose_actions(turn)
         waypoint = memory.lightning_patrol_waypoint
         self.assertIsNotNone(waypoint)
-        inner_r, outer_r = LIGHTNING_DEFAULT_RING
         radius = max(abs(waypoint[0]), abs(waypoint[1]))
-        # 巡逻点应在巡逻半径 pr（方环外半）的方形周界上。
-        self.assertGreaterEqual(radius, inner_r)
-        self.assertLessEqual(radius, outer_r)
+        # 巡逻点应在半径 r=450 的方形周界角上。
+        self.assertEqual(radius, 450)
 
     def test_core_threat_recalls_vanguard_instead_of_hunting(self) -> None:
-        # 敌方先锋贴近 Core → 视为告急，先锋召回护核而非去猎杀远处 Core。
+        # 敌方先锋贴近 Core → 视为告急，先锋召回护核而非离开近轨。
+        # （敌方 Core 猎杀链已废弃：先锋不再 claim/远征敌方 Core，只守近轨。）
         turn, _ = make_turn(
             own_core=self._box_core(),
             units=(vanguard((601, 600)),),
@@ -513,9 +397,10 @@ class LightningModeTests(unittest.TestCase):
         memory = TacticMemory()
         SmartTactic(memory).choose_actions(turn)
 
-        # 无猎杀 claim（没有去猎杀远处的敌方 Core）；先锋可能在召回时横扫
-        # 贴近 Core 的敌方先锋，那是防御行为，不算猎杀。
-        self.assertEqual(memory.lightning_claims, {})
+        # 先锋本 tick 应有防御动作（sweep 贴脸敌先锋 / 朝 Core 回防 / 就地 wait），
+        # 而不是朝远方敌方 Core (610,600) 前进远征。
+        action = turn.plan.unit_actions.get(VANGUARD_ID)
+        self.assertIsNotNone(action, "先锋应对贴 Core 威胁做出防御响应，不能零指令")
 
     def test_patrol_continues_past_noncombat_enemy_worker(self) -> None:
         # 敌方工人在 Core 8 格内（无攻击力）→ Core 继续巡逻，不停摆。
@@ -524,7 +409,9 @@ class LightningModeTests(unittest.TestCase):
             units=(worker(WORKER_LOW, (540, -201)),),
             enemies=(enemy_worker((536, -201)),),
         )
-        SmartTactic(TacticMemory()).choose_actions(turn)
+        memory = TacticMemory()
+        memory.core_orbit_radius = 650
+        SmartTactic(memory).choose_actions(turn)
         self.assertIsInstance(turn.plan.core_action, StartMoveAction)
 
     def test_combat_anchor_holds_against_near_vanguard(self) -> None:
@@ -548,35 +435,17 @@ class LightningModeTests(unittest.TestCase):
         )
         summary = SmartTactic(TacticMemory()).choose_actions(turn)
         self.assertIsNone(turn.plan.core_action)
-        self.assertTrue(any("core anchor_hold state=COMBAT_ANCHOR" in d for d in summary.decisions))
-
-
-    def test_sector_target_stays_near_units_quadrant(self) -> None:
-        # 回归：单位在第四象限 (y<0)，扇区目标不该在第一象限 (y>0)。
-        # 旧 bug 用固定四角把单位派去 (644,644)，要穿越原点。
-        memory = TacticMemory()
-        tactic = SmartTactic(memory)
-        turn, _ = make_turn(
-            own_core=core((535, -201)),
-            units=(vanguard((516, -222)),),
-        )
-        sector = tactic._lightning_sector_target(turn, turn.vanguards[0])
-        self.assertIsNotNone(sector)
-        # 单位 y=-222（负），扇区目标也应在 y<0 半侧，不被派去 y>0。
-        self.assertLess(sector[1], 0, f"sector {sector} should stay in y<0 half")
-        # 且在方环内。
-        radius = max(abs(sector[0]), abs(sector[1]))
-        self.assertGreaterEqual(radius, 400)
-        self.assertLessEqual(radius, 600)
 
     def test_patrol_moves_toward_waypoint_not_origin(self) -> None:
-        # Core 在 (535,-201)，最近巡逻角 (650,-650)。应朝巡逻点（远离原点）
+        # Core 在 (535,-201)，r=650 时最近巡逻角 (650,-650)。应朝巡逻点（远离原点）
         # 走，而非被 beacon_progress 拉向原点（旧 bug 会漂向 LEFT/UP）。
         turn, _ = make_turn(
             own_core=core((535, -201)),
             units=(worker(WORKER_LOW, (540, -201)),),
         )
-        SmartTactic(TacticMemory()).choose_actions(turn)
+        memory = TacticMemory()
+        memory.core_orbit_radius = 650
+        SmartTactic(memory).choose_actions(turn)
         self.assertIsInstance(turn.plan.core_action, StartMoveAction)
         dest = _destination((535, -201), turn.plan.core_action.direction)
         self.assertLess(
@@ -658,258 +527,35 @@ class LightningModeTests(unittest.TestCase):
             uniq, 4, f"ranger stuck oscillating: {positions}"
         )
 
-    def test_ranger_scout_aligns_to_core_patrol_phase(self) -> None:
-        # 游侠首次探路的角应跟 Core 巡逻 phase 对齐(朝 Core 前方),而非最近角。
-        # Core 巡逻 phase=2 → 第三象限角 (-650,-650);游侠即使在第一象限附近,
-        # 起点目标也应是第三象限角,顺方向绕圈、点亮 Core 前方视野。
-        memory = TacticMemory()
-        memory.lightning_patrol_phase = 2
-        tactic = SmartTactic(memory)
-        # 游侠在第一象限 (650, 650) 附近(离第一象限角最近,但应被忽略)。
-        turn, _ = make_turn(
-            own_core=core((600, 600)),
-            units=(ranger((648, 649), UUID(int=0xB004)),),
-        )
-        target = tactic._lightning_ranger_scout_target(turn, turn.rangers[0])
-        uid = str(turn.rangers[0].id)
-        # phase 对齐 Core=2 → 目标在第三象限角(x<0, y<0)。
-        self.assertEqual(memory.lightning_scout_phase[uid], 2)
-        self.assertIsNotNone(target)
-        self.assertLess(target[0], 0, "should head to Core's forward corner (phase 2 = Q3)")
-        self.assertLess(target[1], 0)
-
-    def test_ranger_scout_advances_corner_independently_of_core(self) -> None:
-        # 游侠已到达当前角(周界角)→ 推进下一角,不等 Core。Core 留在原地不动,
-        # 游侠靠自己在周界上转圈。
-        memory = TacticMemory()
-        tactic = SmartTactic(memory)
-        # Core 在 (600,600) 不靠近任何角;游侠放在 (650,650) 附近(第一象限角)。
-        turn, _ = make_turn(
-            own_core=core((600, 600)),
-            units=(ranger((648, 649), UUID(int=0xB003)),),
-        )
-        # 首次调用:认领 lane、选最近角为目标(应是第一象限角附近)。
-        first = tactic._lightning_ranger_scout_target(turn, turn.rangers[0])
-        uid = str(turn.rangers[0].id)
-        phase0 = memory.lightning_scout_phase.get(uid, 0)
-        # 把游侠移到该角死区内,再调一次 → phase 应推进(独立绕圈)。
-        memory.lightning_scout_phase[uid] = phase0
-        turn2, _ = make_turn(
-            own_core=core((600, 600)),
-            units=(ranger(first, UUID(int=0xB003)),),
-        )
-        tactic._lightning_ranger_scout_target(turn2, turn2.rangers[0])
-        self.assertEqual(
-            memory.lightning_scout_phase[uid], (phase0 + 1) % 4
-        )
-
-    def test_vanguard_vee_outbound_target_orthogonal_to_heading(self) -> None:
-        # Core 在 (600,600),行进方向由最近巡逻角推出;先锋 OUTBOUND 目标应正交于
-        # 行进方向(perp=(-fwd_y,fwd_x)),不沿行进方向延伸;深度 ~ LIGHTNING_VEE_DEPTH;
-        # clamp 在方环内。
-        from arena_hero_strategy import LIGHTNING_VEE_DEPTH
-        memory = self._isolated_lightning_memory()
-        tactic = SmartTactic(memory)
-        turn, _ = make_turn(
-            own_core=core((600, 600)),
-            units=(vanguard((600, 605)),),
-        )
-        vanguard_unit = turn.vanguards[0]
-        target = tactic._lightning_vanguard_vee_target(turn, vanguard_unit)
-        self.assertIsNotNone(target)
-        fwd = tactic._lightning_core_heading_vector(turn)
-        perp = (-fwd[1], fwd[0])
-        # 沿 perp 方向延伸(不沿 fwd):origin→target 的位移与 perp 同向、与 fwd 正交。
-        dx = target[0] - vanguard_unit.position[0]
-        dy = target[1] - vanguard_unit.position[1]
-        # 与 perp 点积为正(同向),与 fwd 点积近零(正交)。
-        self.assertGreater(dx * perp[0] + dy * perp[1], 0, "target should move along perp")
-        self.assertEqual(dx * fwd[0] + dy * fwd[1], 0, "target should be orthogonal to fwd")
-        # 深度 ~ VEE_DEPTH。
-        self.assertGreater(_distance(target, (600, 605)), LIGHTNING_VEE_DEPTH - 5)
-        # 在方环内。
-        radius = max(abs(target[0]), abs(target[1]))
-        self.assertLessEqual(radius, 700)
-
-    def test_vanguard_vee_flips_to_inbound_on_reaching_depth(self) -> None:
-        # 先锋已接近 OUTBOUND 目标(≤ REACH_TOLERANCE)→ 翻 INBOUND,目标=Core。
-        memory = TacticMemory()
-        tactic = SmartTactic(memory)
-        turn, _ = make_turn(
-            own_core=core((600, 600)),
-            units=(vanguard((600, 630)),),
-        )
-        # 第一调用初始化 OUTBOUND 目标(垂直方向 ~ +32)。
-        tactic._lightning_vanguard_vee_target(turn, turn.vanguards[0])
-        state = memory.lightning_vee_state[str(turn.vanguards[0].id)]
-        state["target"] = (600, 632)  # 先锋(600,630) 距它 2 ≤ tol
-        # 再调一次:先锋在 (600,630) 距 (600,632) ≤3 → 翻 INBOUND。
-        target = tactic._lightning_vanguard_vee_target(turn, turn.vanguards[0])
-        self.assertEqual(memory.lightning_vee_state[str(turn.vanguards[0].id)]["phase"], "IN")
-        self.assertEqual(target, (600, 600))
-
-    def test_vanguard_vee_flips_to_outbound_on_reaching_core(self) -> None:
-        # INBOUND 状态、先锋贴近 Core → 翻 OUTBOUND,leg 翻转,origin 重设。
-        memory = TacticMemory()
-        tactic = SmartTactic(memory)
-        turn, _ = make_turn(
-            own_core=core((600, 600)),
-            units=(vanguard((602, 600)),),  # 距 Core 2 ≤ HOME_TOL
-        )
-        # 手动置 INBOUND 状态。
-        memory.lightning_vee_state[str(turn.vanguards[0].id)] = {
-            "phase": "IN",
-            "leg": 0,
-            "origin": (568, 600),
-            "target": (600, 600),
-        }
-        tactic._lightning_vanguard_vee_target(turn, turn.vanguards[0])
-        state = memory.lightning_vee_state[str(turn.vanguards[0].id)]
-        self.assertEqual(state["phase"], "OUT")
-        self.assertEqual(state["leg"], 1)  # 翻转
-        self.assertEqual(state["origin"], (600, 600))  # origin 重设为 Core
-
-    def test_focus_fire_multiple_units_claim_same_core(self) -> None:
-        # 同一敌方 Core 允许多 unit 同时 claim(集火),不互相排除。
-        # 先锋走 _lightning_acquire_target 路径,故用两个先锋验证集火。
-        from arena_hero_strategy import EnemySighting
-        memory = TacticMemory()
-        memory.enemy_sightings = {
-            "target-A": EnemySighting(position=(620, 600), seen_tick=100, is_core=True),
-        }
-        memory.last_tick = 100
-        tactic = SmartTactic(memory)
-        turn, _ = make_turn(
-            own_core=core((600, 600)),
-            units=(
-                vanguard((610, 600)),
-                vanguard((615, 605), UUID(int=0xD010)),
-            ),
-        )
-        tactic.choose_actions(turn)
-        claims = list(memory.lightning_claims.values())
-        # 两个先锋都 claim 同一 target-A(集火)。
-        self.assertEqual(claims, ["target-A", "target-A"])
-
-    def test_focus_fire_caps_at_max_attackers(self) -> None:
-        # 已有 3 个 unit claim target-A(上限)→ 第 4 个 unit 不应再 claim 它,
-        # 应跳过(无其他目标 → 不 claim)。
-        from arena_hero_strategy import EnemySighting, LIGHTNING_FOCUS_MAX_ATTACKERS
-        memory = TacticMemory()
-        memory.enemy_sightings = {
-            "target-A": EnemySighting(position=(620, 600), seen_tick=100, is_core=True),
-        }
-        memory.last_tick = 100
-        memory.lightning_claims = {
-            "u1": "target-A",
-            "u2": "target-A",
-            "u3": "target-A",
-        }
-        tactic = SmartTactic(memory)
-        turn, _ = make_turn(
-            own_core=core((600, 600)),
-            units=(vanguard((610, 600), UUID(int=0xD004)),),
-        )
-        acquired = tactic._lightning_acquire_target(turn, turn.vanguards[0])
-        # 已满员 → 不 claim(返回 None),第 4 个 unit 不扑同一目标。
-        self.assertIsNone(acquired)
-
-    def test_blacklist_releases_all_units_claiming_same_core(self) -> None:
-        # 两 unit 都 claim target-A;判为 crowded → 两个 claim 都释放 + 黑名单 +
-        # sightings 清脏。
-        from arena_hero_strategy import EnemySighting
-        memory = TacticMemory()
-        memory.enemy_sightings = {
-            "target-A": EnemySighting(position=(620, 600), seen_tick=100, is_core=True),
-            "g-1": EnemySighting(position=(619, 599), seen_tick=100, is_core=False),
-            "g-2": EnemySighting(position=(619, 601), seen_tick=100, is_core=False),
-        }
-        memory.last_tick = 100
-        memory.lightning_claims = {
-            "u1": "target-A",
-            "u2": "target-A",
-        }
-        tactic = SmartTactic(memory)
-        tactic._lightning_blacklist_core("target-A")
-        self.assertIn("target-A", memory.lightning_blacklist)
-        # 两个 unit 的 claim 都释放。
-        self.assertEqual(memory.lightning_claims, {})
-        # sightings 中 target-A 被清(守卫 sighting 不动)。
-        self.assertNotIn("target-A", memory.enemy_sightings)
-
-    def test_blacklisted_core_removed_from_sightings(self) -> None:
-        # 已黑名单的 Core 在 acquire 时被从 sightings 清掉(脏数据不残留)。
-        from arena_hero_strategy import EnemySighting
-        memory = TacticMemory()
-        memory.enemy_sightings = {
-            "bl": EnemySighting(position=(620, 600), seen_tick=100, is_core=True),
-        }
-        memory.lightning_blacklist.add("bl")
-        memory.last_tick = 100
-        tactic = SmartTactic(memory)
-        turn, _ = make_turn(
-            own_core=core((600, 600)),
-            units=(vanguard((610, 600)),),
-        )
-        tactic._lightning_acquire_target(turn, turn.vanguards[0])
-        self.assertNotIn("bl", memory.enemy_sightings)
-
-    # ---- 绕银河多层轨道体系 ----
-
     def test_lightning_banks_when_slot0_vanguard_unaffordable(self) -> None:
-        # 新固定阶梯槽 0=先锋(10)。pop1(1 免费工人 0 先锋)、资源 5 买不起先锋
-        # → 应攒钱,不 fallthrough 造工人。绝不在买不起槽 0 先锋时向下造便宜兵种。
+        # 开局引导前 3 个造工人：pop1(1 免费工人)、资源 5 恰好够造工人(价 5)
+        # → 造工人；买不起的是先锋/游侠,但引导期不造它们。这里验证资源不足
+        # 造工人时才攒钱:把资源降到 4(买不起工人价 5)→ 不造,攒钱。
         turn, _ = make_turn(
             own_core=self._box_core(),
             units=(worker(WORKER_LOW, (601, 600)),),
-            resources=5,
+            resources=4,
         )
         SmartTactic(TacticMemory()).choose_actions(turn)
         self.assertNotIsInstance(turn.plan.core_action, SpawnAction)
 
-    def test_lightning_build_order_first_three_slots(self) -> None:
-        # 槽 0=先锋, 1=工人, 2=游侠。逐 pop 检查 _lightning_build_slot(只管 pop1-8 阶梯)。
+    def test_no_fixed_build_order_from_first_unit(self) -> None:
+        # 老的"前 N 个固定阶梯"已移除：从第 1 个单位起，无队列无阈值时一律走
+        # _lightning_ratio_spawn 按默认比例 1:1:3 趋近。空编队归一化计数全 0，
+        # 平局按补兵优先级（游侠 > 工人 > 先锋）→ 第一个造游侠。
         from arena_hero_strategy import SmartTactic
         tactic = SmartTactic(TacticMemory())
-        self.assertIs(tactic._lightning_build_slot(1), UnitType.VANGUARD)
-        self.assertIs(tactic._lightning_build_slot(2), UnitType.WORKER)
-        self.assertIs(tactic._lightning_build_slot(3), UnitType.RANGER)
-        self.assertIs(tactic._lightning_build_slot(4), UnitType.WORKER)
-        self.assertIs(tactic._lightning_build_slot(8), UnitType.WORKER)
-        # pop≥9 不再走固定阶梯:改由 _select_spawn 的 3:1/阵亡补同种逻辑决定。
-        self.assertIsNone(tactic._lightning_build_slot(9))
-        self.assertIsNone(tactic._lightning_build_slot(15))
-        # 硬顶 ABSOLUTE_MAX_POPULATION=105:绝不再造。
-        self.assertIsNone(tactic._lightning_build_slot(105))
-        self.assertIsNone(tactic._lightning_build_slot(200))
-
-    def test_engage_assessment_skips_ranger_guards(self) -> None:
-        # 敌方 Core 周围有游侠守卫(远程) → SKIP(我 2HP 游侠易亏,回避)。
-        memory = TacticMemory()
-        tactic = SmartTactic(memory)
-        turn, _ = make_turn(
-            own_core=core((600, 600)),
-            units=(vanguard((620, 600)),),
-            enemies=(
-                enemy_core((640, 600)),
-                enemy_ranger((635, 600)),
-            ),
+        turn, _ = make_turn(own_core=core((600, 600)), units=())
+        self.assertIs(
+            tactic._lightning_ratio_spawn(turn, died={}),
+            UnitType.RANGER,
+            "空编队首兵应按比例 1:1:3 + 优先级补游侠，而非固定先锋",
         )
-        self.assertEqual(tactic._lightning_engage_assessment(turn, (640, 600)), "SKIP")
-
-    def test_engage_assessment_press_for_lone_vanguard_guard(self) -> None:
-        # 敌方 Core 周围只有先锋守卫(近战),无游侠 → PRESS(我游侠手长,游击取胜)。
-        memory = TacticMemory()
-        tactic = SmartTactic(memory)
-        turn, _ = make_turn(
-            own_core=core((600, 600)),
-            units=(ranger((620, 600), UUID(int=0xB010)),),
-            enemies=(
-                enemy_core((640, 600)),
-                enemy_vanguard((635, 600)),
-            ),
-        )
-        self.assertEqual(tactic._lightning_engage_assessment(turn, (640, 600)), "PRESS")
+        # 再造一个：rk=1 后归一化 游侠1/1=1, 先锋0/1=0, 工人0/3=0 → 先锋/工人
+        # 归一化同为 0，平局按优先级（工人 > 先锋）→ 工人。
+        units = (ranger((610, 600), UUID(int=0xF100)),)
+        turn2, _ = make_turn(own_core=core((600, 600)), units=units)
+        self.assertIs(tactic._lightning_ratio_spawn(turn2, died={}), UnitType.WORKER)
 
     def test_defense_tier_near_mid_far_none(self) -> None:
         # 按敌方与我 Core 距离分三档。
@@ -1191,6 +837,7 @@ class LightningModeTests(unittest.TestCase):
     def test_core_patrol_waypoint_skips_obstructed_corner(self) -> None:
         # Core 巡逻角埋在乱石堆里 → 距角尚远时提前跳下一角。
         memory = TacticMemory()
+        memory.core_orbit_radius = 600
         tactic = SmartTactic(memory)
         turn, _ = make_turn(own_core=core((600, 600)), units=())
         first = tactic._lightning_patrol_waypoint(turn)
@@ -1261,8 +908,9 @@ class LightningModeTests(unittest.TestCase):
         self.assertNotIsInstance(turn.plan.core_action, SpawnAction)
 
     def test_spawn_ratio_under_soft_cap_when_capacity_ok(self) -> None:
-        # pop=10 (容量 50), resources 充足:pop≥9 走 ratio(3:1)。
-        # 10 人全工人(rk=0,wk=10) → rk<3*wk → 补游侠。
+        # pop=10 (容量 50), resources 充足:无固定阶梯,直接走 ratio(1:1:3)。
+        # 10 人全工人(rk=0,wk=10) → 游侠归一化 0/1=0 最低(平局按优先级游侠>工人>先锋)
+        # → 补游侠。
         from arena_hero_strategy import SmartTactic
         units = tuple(worker(UUID(int=i), (600 + i, 600)) for i in range(10))
         turn, _ = make_turn(
@@ -1273,6 +921,69 @@ class LightningModeTests(unittest.TestCase):
         SmartTactic(self._isolated_lightning_memory()).choose_actions(turn)
         self.assertIsInstance(turn.plan.core_action, SpawnAction)
         self.assertEqual(turn.plan.core_action.unit_type, UnitType.RANGER)
+
+    def test_medical_ranger_spawn_respects_spawn_ratio_zero(self) -> None:
+        # 回归:医疗空缺应急分支(medical_ranger)必须遵守 spawn_ratio=0(停造该兵种)。
+        # 旧代码应急分支只查 _unit_capped,绕过 spawn_ratio → 玩家把游侠比例设 0 仍造游侠。
+        # 场景:无固定阶梯,直接走 _lightning_ratio_spawn;含 1 名 hp1 游侠(医疗空缺)、
+        # 无满血游侠可替补 → 应急分支想造游侠;spawn_ratio.ranger=0 时不得造游侠。
+        from arena_hero_strategy import SmartTactic, TacticMemory
+        wounded = ranger((610, 600), RANGER_ID, hp=1)
+        # 9 名工人让 pop=10 → 走 _lightning_ratio_spawn(无固定阶梯)。
+        workers = tuple(worker(UUID(int=0x1000 + i), (601 + i, 599)) for i in range(9))
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(wounded,) + workers,
+            enemies=(enemy_vanguard((612, 600)),),
+            resources=500,  # 充足,确保买得起
+        )
+        # ratio 全 0(停造) → 医疗应急分支不得绕过 → 不造游侠(也不造其他兵)。
+        mem_zero = TacticMemory()
+        mem_zero.core_orbit_radius = 550
+        mem_zero.spawn_ratio = {"ranger": 0, "vanguard": 0, "worker": 0}
+        SmartTactic(mem_zero).choose_actions(turn)
+        action = turn.plan.core_action
+        self.assertNotIsInstance(
+            action, SpawnAction,
+            f"spawn_ratio 全 0 时不得造任何兵(含医疗应急游侠),实际={action!r}",
+        )
+        # 对照:放开游侠比例 → 医疗空缺应急分支应造游侠。
+        mem_ok = TacticMemory()
+        mem_ok.core_orbit_radius = 550
+        mem_ok.spawn_ratio = {"ranger": 3, "vanguard": 1, "worker": 1}
+        SmartTactic(mem_ok).choose_actions(turn)
+        action_ok = turn.plan.core_action
+        self.assertIsInstance(action_ok, SpawnAction)
+        self.assertEqual(
+            action_ok.unit_type, UnitType.RANGER,
+            f"放开游侠比例后医疗应急应造游侠,实际={action_ok!r}",
+        )
+
+    def test_core_hold_suppresses_evade_during_invasion(self) -> None:
+        # 回归:core_hold=true 时,即使有敌方入侵(T4 近圈威胁),Core 必须停在原地,
+        # 不得因 MOBILE_EVADE/巡逻本能往入侵相反方向逃跑。
+        # 旧代码 core_hold 检查在 else 分支里,造兵/修盾的 tick 会 fall through 到
+        # 迁移逻辑 → Core 面对入侵时逃跑。修复后 core_hold 在造兵/修盾之后、迁移之前拦截。
+        from arena_hero import StartMoveAction
+        from arena_hero_strategy import SmartTactic, TacticMemory
+        # 敌先锋贴脸(距 Core 1 格)→ 近圈威胁,plan.anchor 非 MOBILE_EVADE 即 COMBAT,
+        # 没有造兵/修盾余地(无资源)→ 必须命中 core_hold 分支,不动。
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(ranger((610, 600), RANGER_ID),),
+            enemies=(enemy_vanguard((601, 600)),),
+            resources=0,
+        )
+        mem = TacticMemory()
+        mem.core_orbit_radius = 550
+        mem.core_hold = True
+        SmartTactic(mem).choose_actions(turn)
+        action = turn.plan.core_action
+        # 驻扎时 Core 不得移动(逃跑)。无资源不造兵/修盾,动作应为空或非 StartMove。
+        self.assertNotIsInstance(
+            action, StartMoveAction,
+            f"core_hold=true 时 Core 不得移动逃避入侵,实际={action!r}",
+        )
 
     def test_worker_switches_to_closer_resource(self) -> None:
         # 工人途中发现更近资源（近 2 格以上）时切换目标。
@@ -1594,7 +1305,7 @@ class SharedOrbitTests(unittest.TestCase):
 
 
 class SpawnRatioTests(unittest.TestCase):
-    """pop≥9 产兵:3:1(游侠:工人)趋近 + 阵亡补同种 + 先锋维持 1。"""
+    """统一产兵：1:1:3(游侠:先锋:工人)比例趋近 + 阈值补兵 + 优先级。"""
 
     @staticmethod
     def _turn_with(rk: int, wk: int, vg: int = 1):
@@ -1608,27 +1319,33 @@ class SpawnRatioTests(unittest.TestCase):
         turn, _ = make_turn(own_core=core((600, 600)), units=tuple(units))
         return turn
 
-    def test_spawn_3to1_ratio(self) -> None:
-        # 从 pop1-8 阶梯结束的真实起点 (rk=3, wk=4) 连续纯增长(无阵亡),
-        # 断言最终 rk:wk 趋近 3:1(误差 ≤ 1 兵)。
+    def test_spawn_1to1to3_ratio(self) -> None:
+        # 默认比例 spawn_ratio = 游侠1 : 先锋1 : 工人3。从空编队连续纯增长
+        # (无阵亡、无阈值),断言最终 wk ≈ 3×rk ≈ 3×vg(各 ±1 兵容差)。
         memory = TacticMemory()
+        memory.unit_caps = {"ranger": 0, "vanguard": 0, "worker": 0}  # 关掉默认工人上限 20,测纯比例趋近
         tactic = SmartTactic(memory)
-        rk, wk = 3, 4
-        for _ in range(60):
-            turn = self._turn_with(rk, wk, vg=1)
+        rk, vg, wk = 0, 0, 0
+        for _ in range(80):
+            turn = self._turn_with(rk, wk, vg=vg)
             pick = tactic._lightning_ratio_spawn(turn, died={})
             self.assertIsNotNone(pick)
             if pick is UnitType.RANGER:
                 rk += 1
+            elif pick is UnitType.VANGUARD:
+                vg += 1
             else:
                 wk += 1
-        # ratio 在 [2.5, 3.5] 之间即视为收敛到 3:1。
-        ratio = rk / max(1, wk)
-        self.assertGreaterEqual(ratio, 2.5, f"rk={rk} wk={wk} ratio={ratio:.2f} 偏低")
-        self.assertLessEqual(ratio, 3.5, f"rk={rk} wk={wk} ratio={ratio:.2f} 偏高")
+        # 工人数 ≈ 3×游侠数 ≈ 3×先锋数(允许 ±1 容差)。
+        self.assertAlmostEqual(wk / max(1, rk), 3.0, delta=1.5,
+                               msg=f"rk={rk} vg={vg} wk={wk} 工人:游侠未趋近 3:1")
+        self.assertAlmostEqual(wk / max(1, vg), 3.0, delta=1.5,
+                               msg=f"rk={rk} vg={vg} wk={wk} 工人:先锋未趋近 3:1")
 
     def test_spawn_replaces_dead_type(self) -> None:
-        # rk=6 wk=2(正好 3:1):死一个游侠 → 补游侠;死一个工人 → 补工人。
+        # 新逻辑不再"死什么补什么":阵亡只通过拉低当前数量间接触发比例趋近/
+        # 阈值补兵。rk=6 wk=2 vg=1(比例 1:1:3 归一化 rk=6,wk≈0.67,vg=1)
+        # → 工人归一化最低 → 补工人(无论死的是游侠还是先锋)。
         memory = TacticMemory()
         tactic = SmartTactic(memory)
 
@@ -1636,19 +1353,22 @@ class SpawnRatioTests(unittest.TestCase):
         pick = tactic._lightning_ratio_spawn(
             turn, died={"dead-rk": UnitType.RANGER.name}
         )
-        self.assertIs(pick, UnitType.RANGER, "死游侠应补游侠")
+        self.assertIs(pick, UnitType.WORKER, "应按归一化最低补工人,而非死什么补什么")
 
+        # 阈值驱动主动补兵:设游侠阈值=10(当前 rk=6 < 10)→ 应补游侠。
+        memory.replenish_threshold = {"ranger": 10, "vanguard": 0, "worker": 0}
         turn = self._turn_with(rk=6, wk=2, vg=1)
         pick = tactic._lightning_ratio_spawn(
             turn, died={"dead-wk": UnitType.WORKER.name}
         )
-        self.assertIs(pick, UnitType.WORKER, "死工人应补工人")
+        self.assertIs(pick, UnitType.RANGER, "低于阈值时按优先级主动补游侠")
 
-    def test_spawn_keeps_one_vanguard(self) -> None:
-        # 先锋死了且当前 vg=0 → 下次补先锋(维持 1 个先锋)。
+    def test_spawn_keeps_vanguard_when_zero(self) -> None:
+        # 先锋归一化最低(0/1=0)时补先锋。rk=1 wk=3 vg=0(比例 1:1:3):
+        # 归一化 rk=1, wk=1, vg=0 → 先锋最低 → 补先锋。
         memory = TacticMemory()
         tactic = SmartTactic(memory)
-        turn = self._turn_with(rk=3, wk=1, vg=0)
+        turn = self._turn_with(rk=1, wk=3, vg=0)
         pick = tactic._lightning_ratio_spawn(
             turn, died={"dead-vg": UnitType.VANGUARD.name}
         )
@@ -1693,9 +1413,10 @@ class SpawnRatioTests(unittest.TestCase):
         # 模拟 _select_spawn 被调两次(预检 + 决策):两次都应读同一个 died。
         pick1 = tactic._select_spawn(turn2, 1000)
         pick2 = tactic._select_spawn(turn2, 1000)
-        # 阵亡游侠 → pop≥9 ratio 逻辑补游侠(died_rk>died_wk)。
-        self.assertIs(pick1, UnitType.RANGER, "阵亡游侠应补游侠")
-        self.assertIs(pick2, UnitType.RANGER, "第二次调用也应补游侠(died 不被消费)")
+        # 新补兵逻辑不再"死什么补什么":rk=5 wk=2 vg=1 比例 1:1:3 归一化
+        # rk=5, wk≈0.67, vg=1 → 工人最低 → 补工人;两次调用应返回同一选择
+        # (阵亡信息不被消费)。
+        self.assertIs(pick1, pick2, "两次调用应返回同一选择(died 不被消费)")
 
 
 class OrbitalRepulsionTests(unittest.TestCase):
@@ -1808,7 +1529,9 @@ class OrbitalRepulsionTests(unittest.TestCase):
         self.assertEqual(plan.funnel.gate_cell, (607, 602))
         self.assertEqual(plan.funnel.block_cells, ((608, 601),))
         self.assertEqual(plan.funnel.assignments, ((WORKER_LOW, (608, 601)),))
-        self.assertEqual(turn.plan.unit_actions[WORKER_LOW].direction, Direction.DOWN)
+        # 该工人同时满足旧漏斗阻挡条件，但已进入敌先锋战斗接触；
+        # 新规则逃跑优先，不能为了堵门继续向先锋火力线靠近。
+        self.assertEqual(turn.plan.unit_actions[WORKER_LOW].direction, Direction.LEFT)
 
     def test_medical_and_combat_core_anchor_states(self) -> None:
         medical = SmartTactic(TacticMemory())
@@ -1966,6 +1689,117 @@ class StandoffRelayAndBlindSpotTests(unittest.TestCase):
         relay_action = turn.plan.unit_actions.get(relay_view.id)
         self.assertIsNotNone(relay_action)
         self.assertIsInstance(relay_action, MoveAction)
+
+    def test_ranger_on_orbit_anchor_always_issues_action(self) -> None:
+        # 游侠零指令回归(607c149 引入):当 _lightning_orbit_waypoint 返回 None
+        # (已到轨道点 / lane 缺失),旧兜底 `goal = ... or ranger.position` 让
+        # position!=goal 为假,既不 move 也不 wait → 游侠本 tick 完全零指令。
+        # 修复后到点应显式 wait 或 move 到下一轨道点,总之必有动作。
+        from arena_hero import MoveAction, WaitAction
+        r_unit = ranger((610, 610), UUID(int=0xB040))
+        turn, _ = make_turn(own_core=core((600, 600)), units=(r_unit,))
+        SmartTactic(TacticMemory()).choose_actions(turn)
+        action = turn.plan.unit_actions.get(r_unit.id)
+        self.assertIsNotNone(
+            action,
+            "游侠到轨道点不能零指令:应有 move(推进下一点位)或 wait(占位)",
+        )
+        self.assertIsInstance(action, (MoveAction, WaitAction))
+
+    def test_ranger_emits_wait_not_silent_when_orbit_waypoint_none(self) -> None:
+        # 游侠零指令回归核心:模拟 _lightning_orbit_waypoint 返回 None(已到点/lane
+        # 缺失/core 为 None 的边界),修复前会让游侠本 tick 完全零指令(既不 move
+        # 也不 wait);修复后必须显式 wait 占位,不能静默跳过。
+        from arena_hero import WaitAction
+        r_unit = ranger((610, 610), UUID(int=0xB040))
+        turn, _ = make_turn(own_core=core((600, 600)), units=(r_unit,))
+        tactic = SmartTactic(TacticMemory())
+        # 强制轨道点返回 None,精准复现 bug 触发条件。
+        tactic._lightning_orbit_waypoint = lambda *args, **kwargs: None
+        tactic.choose_actions(turn)
+        action = turn.plan.unit_actions.get(r_unit.id)
+        self.assertIsInstance(
+            action, WaitAction,
+            f"_lightning_orbit_waypoint 返回 None 时游侠应 wait 占位,不能零指令;实际={action}",
+        )
+
+
+class CombatContactAndAssaultTests(unittest.TestCase):
+    """战斗接触回归：工人先逃，游侠四人组主动覆盖火力。"""
+
+    def test_loaded_worker_flees_before_returning_to_core(self) -> None:
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(worker(WORKER_LOW, (610, 600), cargo=1),),
+            enemies=(enemy_vanguard((612, 600)),),
+        )
+        summary = tactic.choose_actions(turn)
+        action = turn.plan.unit_actions.get(WORKER_LOW)
+        self.assertIsInstance(action, MoveAction)
+        self.assertTrue(
+            any("combat_flee" in decision for decision in summary.decisions),
+            summary.decisions,
+        )
+        self.assertNotIn("worker:deposit", " ".join(summary.decisions))
+
+    def test_enemy_worker_does_not_trigger_combat_flee(self) -> None:
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        turn, _ = make_turn(
+            own_core=core((600, 600)),
+            units=(worker(WORKER_LOW, (610, 600)),),
+            enemies=(enemy_worker((612, 600)),),
+        )
+        summary = tactic.choose_actions(turn)
+        self.assertFalse(
+            any("combat_flee" in decision for decision in summary.decisions),
+            summary.decisions,
+        )
+
+    def test_four_rangers_split_preaim_and_active_diagonal_assault(self) -> None:
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        rangers = (
+            ranger((595, 600), RANGER_ID),
+            ranger((595, 602), RANGER_TWO_ID),
+            ranger((595, 604), RANGER_THREE_ID),
+            ranger((595, 606), RANGER_FOURTH_ID),
+        )
+        target = enemy_worker((600, 600))
+        turn, _ = make_turn(
+            own_core=core((560, 600)),
+            units=rangers,
+            enemies=(target,),
+        )
+        summary = tactic.choose_actions(turn)
+
+        self.assertTrue(
+            any("ranger:assault_squad" in decision for decision in summary.decisions),
+            summary.decisions,
+        )
+        assault_routes = [
+            tactic.memory.current_routes[str(unit.id)]
+            for unit in rangers[2:]
+            if str(unit.id) in tactic.memory.current_routes
+        ]
+        self.assertEqual(len(assault_routes), 2, summary.decisions)
+        self.assertEqual(assault_routes[0].goal, assault_routes[1].goal)
+        assert assault_routes[0].goal is not None
+        self.assertEqual(
+            (
+                abs(assault_routes[0].goal[0] - target.position[0]),
+                abs(assault_routes[0].goal[1] - target.position[1]),
+            ),
+            (3, 3),
+        )
+        self.assertTrue(
+            all(
+                "ranger_assault_45" in tactic.memory.current_routes[str(unit.id)].reason
+                for unit in rangers[2:]
+            )
+        )
 
 
 class CoreReserveFloorTests(unittest.TestCase):
@@ -2402,6 +2236,70 @@ class ScoringPreaimAndSoloKillTests(unittest.TestCase):
             memory.decision_totals["ranger:diagonal_support"], 1
         )
 
+    def test_diagonal_support_does_not_fire_out_of_range(self) -> None:
+        # 回归:支援游侠被指派但站位超射程(距敌原位 6 格,远超游侠射程 3)时,
+        # 不得提交超距 SHOOT(否则服务器判 SHOT_MISSED——看得见命中、实际无效)。
+        # 必须回落到 standoff_relay_advance 推进分支继续走近,而非原地开空枪。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        self._observe_standoff_warmup(tactic)
+        # 第三游侠站在 (597,597),距敌原位 (603,600) = max(6,3)=6,既超射程又非 45°对齐。
+        far_ranger = ranger((597, 597), UUID(int=0xB041))
+        turn, _ = make_turn(
+            tick=5, own_core=core((560, 600)),
+            units=(ranger((600, 600)), far_ranger),
+            enemies=(enemy_ranger((603, 600)),),
+            obstacle_cells=((602, 598),),
+        )
+        summary = tactic.choose_actions(turn)
+        action = turn.plan.unit_actions.get(far_ranger.id)
+        # 不得是 ShootAction(超射程开火即无效命中)。
+        self.assertNotIsInstance(
+            action, ShootAction,
+            f"超射程支援游侠不应开火,实际动作={action!r};决策={summary.decisions}",
+        )
+        self.assertEqual(
+            memory.decision_totals["ranger:diagonal_support"], 0,
+            f"超射程不应计 diagonal_support;决策={summary.decisions}",
+        )
+        # 应正在推进向换血位(standoff_relay_advance),或至少不是原地无效开火。
+        self.assertTrue(
+            any("standoff_relay_advance" in line for line in summary.decisions),
+            f"应推进向换血位;决策={summary.decisions}",
+        )
+
+    def test_diagonal_support_abandons_dead_chase_and_releases_ranger(self) -> None:
+        # 死追保护:支援游侠连续多 tick 被指派却到不了合法射击线(敌每 tick 移动→
+        # relay_cell 跟着移)→ 达阈值后冷却该游侠、回落常规分支(动起来),不再死追。
+        memory = TacticMemory()
+        tactic = SmartTactic(memory)
+        self._observe_standoff_warmup(tactic)
+        far_ranger = ranger((570, 590), UUID(int=0xB042))
+        # 预置:该游侠已连续未开火到阈值-1,再走一帧即触发放弃。
+        from arena_hero_strategy import STANDOFF_SUPPORT_MAX_STALL_TICKS
+        memory.standoff_support_stall[str(far_ranger.id)] = STANDOFF_SUPPORT_MAX_STALL_TICKS - 1
+        # 敌游侠仍在(603,600)原地相持(relay_cell=(600,597),游侠(570,590)远在外)。
+        turn, _ = make_turn(
+            tick=5, own_core=core((560, 600)),
+            units=(ranger((600, 600)), far_ranger),
+            enemies=(enemy_ranger((603, 600)),),
+            obstacle_cells=((602, 598),),
+        )
+        summary = tactic.choose_actions(turn)
+        # 应触发放弃并写入冷却。
+        self.assertTrue(
+            any("standoff_relay_abandon" in line for line in summary.decisions),
+            f"应触发死追放弃;决策={summary.decisions}",
+        )
+        self.assertIn(str(far_ranger.id), memory.standoff_support_cooldown)
+        # 放弃后本 tick 仍有动作(动起来),不得是空 wait——回落巡逻/作战分支。
+        action = turn.plan.unit_actions.get(far_ranger.id)
+        self.assertIsNotNone(action, f"放弃后应有动作;决策={summary.decisions}")
+        # 放弃的 tick 不应再是 standoff_relay_advance(已让出指派)。
+        for line in summary.decisions:
+            if _short_id(far_ranger.id) in line:
+                self.assertNotIn("standoff_relay_advance", line)
+
     def test_vanguard_dance_approach_gap_aims_gap_cell(self) -> None:
         # 我游侠(600,600) 敌先锋 hp4(602,600) 上一步朝我 → APPROACH_GAP 射 gap(601,600)。
         memory = TacticMemory()
@@ -2500,6 +2398,40 @@ class ScoringPreaimAndSoloKillTests(unittest.TestCase):
         summary = tactic.choose_actions(turn)
         # FLEE_AMBUSH 预标记 + 第二游侠射追兵 + ambush_trade≥1。
         self.assertGreaterEqual(memory.decision_totals["ranger:ambush_trade"], 1)
+
+
+class AgentLifecycleStatusTests(unittest.TestCase):
+    def test_status_file_is_atomic_credential_free_and_carries_session(self) -> None:
+        with TemporaryDirectory() as directory_name:
+            path = Path(directory_name) / "nested" / "status.json"
+            previous_path = os.environ.get("ARENA_HERO_AGENT_STATUS_FILE")
+            previous_session = os.environ.get("ARENA_HERO_AGENT_SESSION_ID")
+            previous_key = os.environ.get("ARENA_HERO_API_KEY")
+            os.environ["ARENA_HERO_AGENT_STATUS_FILE"] = str(path)
+            os.environ["ARENA_HERO_AGENT_SESSION_ID"] = "test-session"
+            os.environ["ARENA_HERO_API_KEY"] = "must-not-leak"
+            try:
+                _write_agent_status("running", detail="AuthenticationError")
+            finally:
+                if previous_path is None:
+                    os.environ.pop("ARENA_HERO_AGENT_STATUS_FILE", None)
+                else:
+                    os.environ["ARENA_HERO_AGENT_STATUS_FILE"] = previous_path
+                if previous_session is None:
+                    os.environ.pop("ARENA_HERO_AGENT_SESSION_ID", None)
+                else:
+                    os.environ["ARENA_HERO_AGENT_SESSION_ID"] = previous_session
+                if previous_key is None:
+                    os.environ.pop("ARENA_HERO_API_KEY", None)
+                else:
+                    os.environ["ARENA_HERO_API_KEY"] = previous_key
+
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["state"], "running")
+            self.assertEqual(payload["session_id"], "test-session")
+            self.assertEqual(payload["detail"], "AuthenticationError")
+            self.assertNotIn("must-not-leak", path.read_text(encoding="utf-8"))
+            self.assertFalse(path.with_suffix(".json.tmp").exists())
 
 
 if __name__ == "__main__":

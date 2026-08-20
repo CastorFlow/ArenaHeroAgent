@@ -20,20 +20,20 @@ EMPTY_ROUTES = {
 EMPTY_STATS = {
     "tick": 0,
     "mode": "develop",
-    "recall": False,
-    "raid_enabled": False,
-    "raid_recall": False,
-    "raid_vanguards": 1,
-    "raid_rangers": 2,
-    "raid_selected_vanguards": 0,
-    "raid_selected_rangers": 0,
-    "raid_core_position": None,
-    "raid_core_acquired_tick": 0,
-    "raid_sweep_radius": 18,
-    "migration_candidate": None,
-    "migration_target": None,
-    "migration_site_checked": False,
-    "migration_site_score": 0,
+    "comet_active": False,
+    "comet_mode": "beacon",
+    "comet_target": None,
+    "comet_vanguards": 3,
+    "comet_rangers": 3,
+    "comet_min_reserve_vanguards": 3,
+    "comet_min_reserve_rangers": 3,
+    "comet_wounded_threshold": 0.5,
+    "comet_rally_enabled": False,
+    "comet_rally_distance": 0,
+    "comet_selected_vanguards": 0,
+    "comet_selected_rangers": 0,
+    "comet_retreating": 0,
+    "comet_dispatched_tick": 0,
     "resources": 0,
     "capacity": 0,
     "population": 0,
@@ -98,15 +98,12 @@ VALID_MODES = {"develop", "aggress", "beacon", "migrate", "lightning"}
 CONTROL_TRANSFER_MODES = {"star", "march", "fortify"}
 CONTROL_UNIT_TYPES = ("WORKER", "VANGUARD", "RANGER")
 CONTROL_MAX_BUILD_QUEUE_LENGTH = 20
-CONTROL_MAX_RING = 10000
 CONTROL_MAX_ORBIT = 900
 CONTROL_MAX_WARTIME_RESERVE = 10000
 POSITION_STATS = {
     "core_position",
     "beacon_position",
-    "migration_candidate",
-    "migration_target",
-    "raid_core_position",
+    "comet_target",
 }
 COUNTER_STATS = {"event_totals", "decision_totals"}
 SENSITIVE_KEY_PARTS = ("api", "authorization", "credential", "secret", "token")
@@ -482,11 +479,25 @@ def _default_dashboard_control_fields(payload: dict[str, Any]) -> None:
     payload["core_hold"] = False
     payload["core_target"] = None
     payload["core_transfer_mode"] = "star"
-    payload["lightning_ring"] = [400, 600]
+    payload["core_evade_enemies"] = False
+    payload["core_chase_enemies"] = False
+    payload["core_pursue_beacon"] = False
     payload["build_queue"] = []
-    payload["spawn_ratio"] = {"ranger": 3, "worker": 1}
-    payload["unit_caps"] = {"worker": 0, "vanguard": 0, "ranger": 0}
+    payload["spawn_ratio"] = {"ranger": 1, "vanguard": 1, "worker": 3}
+    payload["unit_caps"] = {"worker": 20, "vanguard": 0, "ranger": 0}
+    payload["replenish_threshold"] = {"ranger": 0, "vanguard": 0, "worker": 0}
+    payload["replenish_priority"] = ["ranger", "worker", "vanguard"]
     payload["wartime_reserve"] = 150
+    payload["comet_active"] = False
+    payload["comet_mode"] = "beacon"
+    payload["comet_target"] = None
+    payload["comet_vanguards"] = 3
+    payload["comet_rangers"] = 3
+    payload["comet_min_reserve_vanguards"] = 3
+    payload["comet_min_reserve_rangers"] = 3
+    payload["comet_wounded_threshold"] = 0.5
+    payload["comet_rally_enabled"] = False
+    payload["comet_rally_distance"] = 0
 
 
 def _read_dashboard_control_fields(data: dict[str, Any], result: dict[str, Any]) -> None:
@@ -501,19 +512,9 @@ def _read_dashboard_control_fields(data: dict[str, Any], result: dict[str, Any])
     result["core_target"] = _position_or_none(data.get("core_target"))
     mode = data.get("core_transfer_mode", "star")
     result["core_transfer_mode"] = mode if mode in CONTROL_TRANSFER_MODES else "star"
-    raw_ring = data.get("lightning_ring")
-    ring = _position_or_none(raw_ring)
-    if ring is None:
-        ring = [400, 600]
-    inner, outer = ring
-    if outer < inner or inner <= 0:
-        ring = [400, 600]
-    else:
-        ring = [
-            min(CONTROL_MAX_RING, max(1, inner)),
-            min(CONTROL_MAX_RING, max(1, outer)),
-        ]
-    result["lightning_ring"] = ring
+    result["core_evade_enemies"] = bool(data.get("core_evade_enemies", False))
+    result["core_chase_enemies"] = bool(data.get("core_chase_enemies", False))
+    result["core_pursue_beacon"] = bool(data.get("core_pursue_beacon", False))
     raw_queue = data.get("build_queue")
     queue: list[str] = []
     if isinstance(raw_queue, list):
@@ -523,25 +524,87 @@ def _read_dashboard_control_fields(data: dict[str, Any], result: dict[str, Any])
     result["build_queue"] = queue
     raw_ratio = data.get("spawn_ratio")
     if isinstance(raw_ratio, dict):
-        ranger = _int_clamp(raw_ratio.get("ranger", 0), minimum=0, maximum=9999, default=0)
-        worker = _int_clamp(raw_ratio.get("worker", 0), minimum=0, maximum=9999, default=0)
-        if ranger > 0 or worker > 0:
-            result["spawn_ratio"] = {"ranger": ranger, "worker": worker}
+        # 三元比例（默认 1:1:3 游侠:先锋:工人）。允许全 0（囤资源）。
+        ranger = _int_clamp(raw_ratio.get("ranger", 1), minimum=0, maximum=9999, default=1)
+        vanguard = _int_clamp(raw_ratio.get("vanguard", 1), minimum=0, maximum=9999, default=1)
+        worker = _int_clamp(raw_ratio.get("worker", 3), minimum=0, maximum=9999, default=3)
+        if ranger == 0 and vanguard == 0 and worker == 0:
+            result["spawn_ratio"] = {"ranger": 0, "vanguard": 0, "worker": 0}
         else:
-            result["spawn_ratio"] = {"ranger": 3, "worker": 1}
+            result["spawn_ratio"] = {
+                "ranger": ranger,
+                "vanguard": vanguard,
+                "worker": worker,
+            }
     else:
-        result["spawn_ratio"] = {"ranger": 3, "worker": 1}
+        result["spawn_ratio"] = {"ranger": 1, "vanguard": 1, "worker": 3}
     raw_caps = data.get("unit_caps")
-    caps: dict[str, int] = {"worker": 0, "vanguard": 0, "ranger": 0}
+    caps: dict[str, int] = {"worker": 20, "vanguard": 0, "ranger": 0}
     if isinstance(raw_caps, dict):
         for key in caps:
             caps[key] = _int_clamp(raw_caps.get(key, 0), minimum=0, maximum=9999, default=0)
     result["unit_caps"] = caps
+    # 补兵阈值：各兵种 < 阈值时优先补。0 = 不主动补该兵种。
+    raw_threshold = data.get("replenish_threshold")
+    thresholds: dict[str, int] = {"ranger": 0, "vanguard": 0, "worker": 0}
+    if isinstance(raw_threshold, dict):
+        for key in thresholds:
+            thresholds[key] = _int_clamp(
+                raw_threshold.get(key, 0), minimum=0, maximum=9999, default=0
+            )
+    result["replenish_threshold"] = thresholds
+    # 补兵优先级：多兵种同时低于阈值时按此顺序补。缺失兵种补到末尾。
+    raw_priority = data.get("replenish_priority")
+    priority_order: list[str] = []
+    if isinstance(raw_priority, list):
+        for item in raw_priority:
+            if isinstance(item, str) and item.lower() in ("ranger", "vanguard", "worker"):
+                key = item.lower()
+                if key not in priority_order:
+                    priority_order.append(key)
+    for key in ("ranger", "worker", "vanguard"):
+        if key not in priority_order:
+            priority_order.append(key)
+    result["replenish_priority"] = priority_order
     result["wartime_reserve"] = _int_clamp(
         data.get("wartime_reserve", 150),
         minimum=0,
         maximum=CONTROL_MAX_WARTIME_RESERVE,
         default=150,
+    )
+    result["comet_active"] = bool(data.get("comet_active", False))
+    comet_mode = data.get("comet_mode", "beacon")
+    result["comet_mode"] = (
+        comet_mode if comet_mode in ("beacon", "coordinate") else "beacon"
+    )
+    result["comet_target"] = _position_or_none(data.get("comet_target"))
+    result["comet_vanguards"] = _int_clamp(
+        data.get("comet_vanguards", 3), minimum=0, maximum=9999, default=3
+    )
+    result["comet_rangers"] = _int_clamp(
+        data.get("comet_rangers", 3), minimum=0, maximum=9999, default=3
+    )
+    result["comet_min_reserve_vanguards"] = _int_clamp(
+        data.get("comet_min_reserve_vanguards", 3), minimum=0, maximum=9999, default=3
+    )
+    result["comet_min_reserve_rangers"] = _int_clamp(
+        data.get("comet_min_reserve_rangers", 3), minimum=0, maximum=9999, default=3
+    )
+    raw_threshold = data.get("comet_wounded_threshold", 0.5)
+    if isinstance(raw_threshold, (int, float)) and not isinstance(raw_threshold, bool):
+        result["comet_wounded_threshold"] = max(0.0, min(1.0, float(raw_threshold)))
+    else:
+        result["comet_wounded_threshold"] = 0.5
+    rally_enabled_raw = data.get("comet_rally_enabled")
+    if isinstance(rally_enabled_raw, bool):
+        result["comet_rally_enabled"] = rally_enabled_raw
+    else:
+        result["comet_rally_enabled"] = False
+    result["comet_rally_distance"] = _int_clamp(
+        data.get("comet_rally_distance", 0),
+        minimum=0,
+        maximum=9999,
+        default=0,
     )
 
 
@@ -568,17 +631,11 @@ def _apply_dashboard_control_fields(data: dict[str, Any], payload: dict[str, Any
                 f"core_transfer_mode must be one of {sorted(CONTROL_TRANSFER_MODES)}"
             )
         payload["core_transfer_mode"] = mode
-    if "lightning_ring" in data:
-        ring = _position_or_none(data["lightning_ring"])
-        if ring is None:
-            raise ValueError("lightning_ring must be [inner, outer]")
-        inner, outer = ring
-        if outer < inner or inner <= 0:
-            raise ValueError("lightning_ring must satisfy outer >= inner > 0")
-        payload["lightning_ring"] = [
-            min(CONTROL_MAX_RING, max(1, inner)),
-            min(CONTROL_MAX_RING, max(1, outer)),
-        ]
+    for _flag in ("core_evade_enemies", "core_chase_enemies", "core_pursue_beacon"):
+        if _flag in data:
+            if not isinstance(data[_flag], bool):
+                raise ValueError(f"{_flag} must be boolean")
+            payload[_flag] = data[_flag]
     if "build_queue" in data:
         raw_queue = data["build_queue"]
         if not isinstance(raw_queue, list):
@@ -595,20 +652,24 @@ def _apply_dashboard_control_fields(data: dict[str, Any], payload: dict[str, Any
         raw_ratio = data["spawn_ratio"]
         if not isinstance(raw_ratio, dict):
             raise ValueError("spawn_ratio must be an object")
-        ranger = raw_ratio.get("ranger")
-        worker = raw_ratio.get("worker")
-        if (
-            not isinstance(ranger, (int, float))
-            or isinstance(ranger, bool)
-            or not isinstance(worker, (int, float))
-            or isinstance(worker, bool)
-            or ranger < 0
-            or worker < 0
-        ):
-            raise ValueError("spawn_ratio ranger/worker must be non-negative numbers")
-        if ranger == 0 and worker == 0:
-            raise ValueError("spawn_ratio ranger and worker cannot both be zero")
-        payload["spawn_ratio"] = {"ranger": int(ranger), "worker": int(worker)}
+        # 三元比例（默认 1:1:3 游侠:先锋:工人）。允许全 0（停止造兵囤资源）。
+        shares: dict[str, int] = {}
+        for key, default in (("ranger", 1), ("vanguard", 1), ("worker", 3)):
+            value = raw_ratio.get(key, default)
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or value < 0
+            ):
+                raise ValueError(
+                    f"spawn_ratio {key} must be a non-negative number"
+                )
+            shares[key] = int(value)
+        payload["spawn_ratio"] = {
+            "ranger": shares["ranger"],
+            "vanguard": shares["vanguard"],
+            "worker": shares["worker"],
+        }
     if "unit_caps" in data:
         raw_caps = data["unit_caps"]
         if not isinstance(raw_caps, dict):
@@ -624,6 +685,47 @@ def _apply_dashboard_control_fields(data: dict[str, Any], payload: dict[str, Any
                 raise ValueError(f"unit_caps {key} must be a non-negative number")
             caps[key] = int(value)
         payload["unit_caps"] = caps
+    if "replenish_threshold" in data:
+        raw_threshold = data["replenish_threshold"]
+        if not isinstance(raw_threshold, dict):
+            raise ValueError("replenish_threshold must be an object")
+        thresholds: dict[str, int] = {}
+        for key in ("ranger", "vanguard", "worker"):
+            value = raw_threshold.get(key, 0)
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or value < 0
+            ):
+                raise ValueError(
+                    f"replenish_threshold {key} must be a non-negative number"
+                )
+            thresholds[key] = int(value)
+        payload["replenish_threshold"] = thresholds
+    if "replenish_priority" in data:
+        raw_priority = data["replenish_priority"]
+        if not isinstance(raw_priority, list):
+            raise ValueError("replenish_priority must be a list")
+        priority: list[str] = []
+        for item in raw_priority:
+            if (
+                not isinstance(item, str)
+                or item.lower() not in ("ranger", "vanguard", "worker")
+            ):
+                raise ValueError(
+                    "replenish_priority items must be ranger/vanguard/worker"
+                )
+            key = item.lower()
+            if key in priority:
+                raise ValueError(
+                    f"replenish_priority has duplicate: {key}"
+                )
+            priority.append(key)
+        # 缺失的兵种补到末尾，保证三类全覆盖。
+        for key in ("ranger", "vanguard", "worker"):
+            if key not in priority:
+                priority.append(key)
+        payload["replenish_priority"] = priority
     if "wartime_reserve" in data:
         value = data["wartime_reserve"]
         if not isinstance(value, (int, float)) or isinstance(value, bool):
@@ -631,6 +733,45 @@ def _apply_dashboard_control_fields(data: dict[str, Any], payload: dict[str, Any
         payload["wartime_reserve"] = max(
             0, min(CONTROL_MAX_WARTIME_RESERVE, int(value))
         )
+    if "comet_active" in data:
+        if not isinstance(data["comet_active"], bool):
+            raise ValueError("comet_active must be boolean")
+        payload["comet_active"] = data["comet_active"]
+    if "comet_mode" in data:
+        mode = data["comet_mode"]
+        if mode not in ("beacon", "coordinate"):
+            raise ValueError("comet_mode must be one of beacon, coordinate")
+        payload["comet_mode"] = mode
+    if "comet_target" in data:
+        candidate = _position_or_none(data["comet_target"])
+        if data["comet_target"] is not None and candidate is None:
+            raise ValueError("comet_target must be null or [x, y]")
+        payload["comet_target"] = candidate
+    for key in (
+        "comet_vanguards",
+        "comet_rangers",
+        "comet_min_reserve_vanguards",
+        "comet_min_reserve_rangers",
+    ):
+        if key in data:
+            value = data[key]
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ValueError(f"{key} must be a number")
+            payload[key] = max(0, int(value))
+    if "comet_wounded_threshold" in data:
+        value = data["comet_wounded_threshold"]
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError("comet_wounded_threshold must be a number")
+        payload["comet_wounded_threshold"] = max(0.0, min(1.0, float(value)))
+    if "comet_rally_enabled" in data:
+        if not isinstance(data["comet_rally_enabled"], bool):
+            raise ValueError("comet_rally_enabled must be boolean")
+        payload["comet_rally_enabled"] = data["comet_rally_enabled"]
+    if "comet_rally_distance" in data:
+        value = data["comet_rally_distance"]
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError("comet_rally_distance must be a number")
+        payload["comet_rally_distance"] = max(0, int(value))
 
 
 def load_control(path: Path) -> dict[str, Any]:
@@ -641,37 +782,9 @@ def load_control(path: Path) -> dict[str, Any]:
         mode = data.get("mode", "develop")
         if mode not in VALID_MODES:
             mode = "develop"
-        recall = data.get("recall", False)
-        raid_enabled = data.get("raid_enabled", False)
-        raid_recall = data.get("raid_recall", False)
-        raw_distance = data.get("beacon_target_distance", 0)
-        distance = (
-            max(0, int(raw_distance))
-            if isinstance(raw_distance, (int, float))
-            and not isinstance(raw_distance, bool)
-            else 0
-        )
-        raw_rally = data.get("rally_point")
-        rally = None
-        if (
-            isinstance(raw_rally, list)
-            and len(raw_rally) == 2
-            and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in raw_rally)
-        ):
-            rally = [int(raw_rally[0]), int(raw_rally[1])]
         result: dict[str, Any] = {
             "mode": mode,
-            "recall": bool(recall),
-            "raid_enabled": bool(raid_enabled),
-            "raid_recall": bool(raid_recall),
-            "beacon_target_distance": distance,
-            "rally_point": rally,
         }
-        if "migration_candidate" in data or "auto_migrate" in data:
-            result["migration_candidate"] = _position(
-                data.get("migration_candidate")
-            )
-            result["auto_migrate"] = bool(data.get("auto_migrate", False))
         for key in ("aggress_vanguards", "aggress_rangers"):
             raw_value = data.get(key, 0)
             result[key] = (
@@ -679,14 +792,6 @@ def load_control(path: Path) -> dict[str, Any]:
                 if isinstance(raw_value, (int, float))
                 and not isinstance(raw_value, bool)
                 else 0
-            )
-        for key, default in (("raid_vanguards", 1), ("raid_rangers", 2)):
-            raw_value = data.get(key, default)
-            result[key] = (
-                max(0, int(raw_value))
-                if isinstance(raw_value, (int, float))
-                and not isinstance(raw_value, bool)
-                else default
             )
         # === 网页控制台新增控制字段：回显读取值（save_control 做校验/落盘）===
         _read_dashboard_control_fields(data, result)
@@ -699,13 +804,6 @@ def _default_control() -> dict[str, Any]:
     """控制文件的完整默认值，含网页控制台新增字段。"""
     payload: dict[str, Any] = {
         "mode": "develop",
-        "recall": False,
-        "raid_enabled": False,
-        "raid_recall": False,
-        "raid_vanguards": 1,
-        "raid_rangers": 2,
-        "beacon_target_distance": 0,
-        "rally_point": None,
         "aggress_vanguards": 0,
         "aggress_rangers": 0,
     }
@@ -716,57 +814,13 @@ def _default_control() -> dict[str, Any]:
 def save_control(
     path: Path,
     mode: str,
-    recall: bool,
     data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if mode not in VALID_MODES:
         raise ValueError(f"mode must be one of {sorted(VALID_MODES)}")
     payload = load_control(path)
-    payload.update({"mode": mode, "recall": bool(recall)})
+    payload.update({"mode": mode})
     if data is not None:
-        if "beacon_target_distance" in data:
-            raw_distance = data["beacon_target_distance"]
-            if not isinstance(raw_distance, (int, float)) or isinstance(
-                raw_distance,
-                bool,
-            ):
-                raise ValueError("beacon_target_distance must be a number")
-            payload["beacon_target_distance"] = max(0, int(raw_distance))
-        if "rally_point" in data:
-            raw_rally = data["rally_point"]
-            if raw_rally is None:
-                payload["rally_point"] = None
-            elif (
-                isinstance(raw_rally, list)
-                and len(raw_rally) == 2
-                and all(
-                    isinstance(value, (int, float))
-                    and not isinstance(value, bool)
-                    for value in raw_rally
-                )
-            ):
-                payload["rally_point"] = [int(raw_rally[0]), int(raw_rally[1])]
-            else:
-                raise ValueError("rally_point must be null or [x, y]")
-        if "migration_candidate" in data:
-            raw_candidate = data["migration_candidate"]
-            if raw_candidate is None:
-                payload["migration_candidate"] = None
-            else:
-                candidate = _position(raw_candidate)
-                if candidate is None:
-                    raise ValueError("migration_candidate must be null or [x, y]")
-                payload["migration_candidate"] = candidate
-        if "auto_migrate" in data:
-            if not isinstance(data["auto_migrate"], bool):
-                raise ValueError("auto_migrate must be boolean")
-            payload["auto_migrate"] = data["auto_migrate"]
-        for key in ("raid_enabled", "raid_recall"):
-            if key not in data:
-                continue
-            if not isinstance(data[key], bool):
-                raise ValueError(f"{key} must be boolean")
-            payload[key] = data[key]
         for key in ("aggress_vanguards", "aggress_rangers"):
             if key not in data:
                 continue
@@ -775,13 +829,6 @@ def save_control(
                 raw_value,
                 bool,
             ):
-                raise ValueError(f"{key} must be a number")
-            payload[key] = max(0, int(raw_value))
-        for key in ("raid_vanguards", "raid_rangers"):
-            if key not in data:
-                continue
-            raw_value = data[key]
-            if not isinstance(raw_value, (int, float)) or isinstance(raw_value, bool):
                 raise ValueError(f"{key} must be a number")
             payload[key] = max(0, int(raw_value))
         # 网页控制台新增控制字段：严格校验后落盘。
@@ -904,9 +951,8 @@ class RouteOverlayHandler(BaseHTTPRequestHandler):
             return
         current = load_control(self.server.control_path)
         mode = data.get("mode", current["mode"])
-        recall = data.get("recall", current["recall"])
         try:
-            payload = save_control(self.server.control_path, mode, recall, data)
+            payload = save_control(self.server.control_path, mode, data)
         except ValueError as exc:
             self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return

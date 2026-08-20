@@ -1,15 +1,44 @@
 {
   "mode": "develop",
-  "recall": false,
-  "raid_enabled": false,
-  "raid_recall": false,
-  "raid_vanguards": 1,
-  "raid_rangers": 2,
-  "beacon_target_distance": 0,
-  "rally_point": null,
-  "migration_candidate": null,
-  "auto_migrate": false,
   "aggress_vanguards": 0,
   "aggress_rangers": 0,
-  "lightning_ring": [500, 700]
+  "core_orbit_radius": 0,
+  "core_hold": false,
+  "core_target": null,
+  "core_transfer_mode": "star",
+  "core_evade_enemies": false,
+  "core_chase_enemies": false,
+  "core_pursue_beacon": false,
+  "build_queue": [],
+  "spawn_ratio": {
+    "ranger": 1,
+    "vanguard": 1,
+    "worker": 3
+  },
+  "unit_caps": {
+    "worker": 20,
+    "vanguard": 0,
+    "ranger": 0
+  },
+  "replenish_threshold": {
+    "ranger": 0,
+    "vanguard": 0,
+    "worker": 0
+  },
+  "replenish_priority": [
+    "ranger",
+    "worker",
+    "vanguard"
+  ],
+  "wartime_reserve": 150,
+  "comet_active": false,
+  "comet_mode": "beacon",
+  "comet_target": null,
+  "comet_vanguards": 3,
+  "comet_rangers": 3,
+  "comet_min_reserve_vanguards": 3,
+  "comet_min_reserve_rangers": 3,
+  "comet_wounded_threshold": 0.5,
+  "comet_rally_enabled": false,
+  "comet_rally_distance": 0
 }

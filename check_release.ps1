@@ -23,6 +23,8 @@ Push-Location $root
 try {
     Invoke-Checked $python @(
         "-m", "compileall", "-q",
+        "arena_hero_agent_supervisor.py",
+        "arena_hero_dashboard_server.py",
         "arena_hero_tactic.py",
         "arena_hero_strategy.py",
         "arena_hero_event_log.py",
@@ -49,10 +51,15 @@ try {
         ".arena_hero_stats.json",
         ".arena_hero_control.json",
         ".arena_hero_browser_intel.json",
+        ".arena_hero_agent_status.json",
         "arena_hero_telemetry.jsonl",
         "arena_hero_events_zh.jsonl",
         "agent.log",
-        "agent_err.log"
+        "agent_err.log",
+        "arena_hero_dashboard.log",
+        "arena_hero_dashboard_err.log",
+        "arena_hero_overlay.log",
+        "arena_hero_overlay_err.log"
     )
     $forbiddenTracked = @(
         $publishable | Where-Object {

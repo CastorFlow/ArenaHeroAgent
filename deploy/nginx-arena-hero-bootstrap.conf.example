@@ -1,0 +1,12 @@
+# Temporary HTTP-only configuration used only to obtain the first certificate.
+# Replace arena.example.com, enable this site, then run Certbot in certonly mode.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name arena.example.com;
+
+    location / {
+        default_type text/plain;
+        return 503 "HTTPS setup pending\n";
+    }
+}

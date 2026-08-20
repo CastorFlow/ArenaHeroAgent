@@ -6,9 +6,11 @@ import json
 import os
 import sys
 import traceback
+import time
 from getpass import getpass
 from pathlib import Path
 from types import ModuleType
+from typing import Callable
 
 from arena_hero import (
     APIError,
@@ -111,6 +113,33 @@ def _append_telemetry(
         stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
+def _write_agent_status(state: str, *, detail: str | None = None) -> None:
+    """Write credential-free lifecycle state for the dashboard supervisor."""
+    target_raw = os.environ.get("ARENA_HERO_AGENT_STATUS_FILE")
+    if not target_raw:
+        return
+    payload: dict[str, object] = {
+        "version": 1,
+        "state": state,
+        "session_id": os.environ.get("ARENA_HERO_AGENT_SESSION_ID", ""),
+        "updated_at": time.time(),
+    }
+    if detail:
+        payload["detail"] = detail[:160]
+    target = Path(target_raw)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        temporary.replace(target)
+    except OSError:
+        # Status is an optional integration signal; never stop the tactic for it.
+        pass
+
+
 def play(
     api_key: str,
     *,
@@ -121,6 +150,7 @@ def play(
     telemetry_path: Path = Path("arena_hero_telemetry.jsonl"),
     stats_path: Path = Path(".arena_hero_stats.json"),
     event_log_path: Path = DEFAULT_LOG_PATH,
+    on_ready: Callable[[], None] | None = None,
 ) -> None:
     completed_turns = 0
     strategy = strategy_module
@@ -131,6 +161,7 @@ def play(
     tactic = strategy.SmartTactic(memory)
     fallback_strategy: ModuleType | None = None
     event_logger = ChineseEventLogger(event_log_path)
+    ready_reported = False
 
     with ArenaHeroClient(
         api_key=api_key,
@@ -138,6 +169,10 @@ def play(
         websocket_url=websocket_url,
     ) as game:
         for turn in game.turns():
+            if not ready_reported:
+                ready_reported = True
+                if on_ready is not None:
+                    on_ready()
             current_mtime = strategy_file.stat().st_mtime_ns
             if current_mtime != strategy_mtime:
                 if pending_strategy_mtime != current_mtime:
@@ -294,6 +329,7 @@ def main() -> int:
     if args.max_turns is not None and args.max_turns < 1:
         parser.error("--max-turns must be positive")
 
+    _write_agent_status("starting")
     try:
         play(
             load_api_key(),
@@ -304,23 +340,30 @@ def main() -> int:
             telemetry_path=args.telemetry_file,
             stats_path=args.stats_file,
             event_log_path=args.event_log_file,
+            on_ready=lambda: _write_agent_status("running"),
         )
+        _write_agent_status("stopped")
     except KeyboardInterrupt:
+        _write_agent_status("stopped")
         print("Stopped by user.", flush=True)
         return 0
     except (AuthenticationError, PolicyViolationError) as exc:
+        _write_agent_status("auth_failed", type(exc).__name__)
         print(f"Arena Hero authentication stopped: {type(exc).__name__}", file=sys.stderr)
         return 2
     except ProtocolError:
+        _write_agent_status("protocol_error")
         print(
             "Arena Hero protocol mismatch. Upgrade the official arena-hero SDK and retry.",
             file=sys.stderr,
         )
         return 3
     except TransportError as exc:
+        _write_agent_status("transport_error", type(exc).__name__)
         print(f"Arena Hero transport failure: {type(exc).__name__}", file=sys.stderr)
         return 4
     except RuntimeError as exc:
+        _write_agent_status("failed", type(exc).__name__)
         print(str(exc), file=sys.stderr)
         return 5
     return 0

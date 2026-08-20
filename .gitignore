@@ -19,12 +19,16 @@ htmlcov/
 arena_hero_telemetry.jsonl
 arena_hero_events_zh.jsonl
 arena_hero_*.log
+arena_hero_battle_history.jsonl
+arena_hero_core_trail.jsonl
+.arena_hero_agent_status.json
 .arena_hero_memory.json
 .arena_hero_routes.json
 .arena_hero_recovery_targets.json
 .arena_hero_stats.json
 .arena_hero_control.json
 .arena_hero_browser_intel.json
+.dashboard_password
 agent.log
 agent_err.log
 

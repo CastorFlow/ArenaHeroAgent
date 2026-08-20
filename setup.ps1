@@ -41,4 +41,4 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 & $venvPython -c "import arena_hero; print(f'Arena Hero SDK {arena_hero.__version__} is ready.')"
-Write-Host "Setup complete. Run .\set_key.ps1, then .\start_all.ps1."
+Write-Host "Setup complete. Run .\start_all.ps1, then enter the Arena Hero API Key at http://127.0.0.1:8766/."

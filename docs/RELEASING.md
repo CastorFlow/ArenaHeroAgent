@@ -1,6 +1,6 @@
 # 发布清单
 
-本仓库发布的是长期运行战术源码、测试、Windows 辅助脚本和可选浏览器叠加层，不发布本地状态或账号数据。
+本仓库发布长期运行战术源码、API Key 初始化 Dashboard、测试、Windows/Linux 辅助脚本、部署模板和可选浏览器叠加层；不发布本地状态或账号数据。
 
 ## 1. 兼容基线
 
@@ -13,17 +13,34 @@
 
 ## 2. 本地检查
 
+Windows 完整检查：
+
 ```powershell
 .\check_release.ps1
 ```
 
+Linux/WSL2 可运行等价核心检查：
+
+```bash
+python -m compileall -q \
+  arena_hero_agent_supervisor.py \
+  arena_hero_dashboard_server.py \
+  arena_hero_tactic.py \
+  arena_hero_strategy.py \
+  arena_hero_event_log.py \
+  arena_hero_route_overlay_server.py
+python -m unittest discover -v
+node arena_hero_route_overlay/test_overlay_core.js
+python -m pip check
+git diff --check
+```
+
 检查内容包括：
 
-- Python 编译。
-- 全套 `unittest`。
+- Python 编译和全套 `unittest`。
+- Dashboard/Supervisor 登录初始化测试。
 - 浏览器叠加层 Node 测试。
-- `pip check`。
-- Git 空白错误。
+- `pip check` 和 Git 空白错误。
 - 禁止跟踪的凭据、运行状态和日志文件名。
 - 常见 DPAPI blob、Bearer Token 和明文 API Key 形态。
 
@@ -35,7 +52,7 @@ git status --ignored --short
 git diff --stat
 ```
 
-运行中的 `.arena_hero_*.json`、`.env`、`.arena_hero_api_key.dpapi`、`*.jsonl` 和 `agent*.log` 应只出现在 ignored 列表中。
+运行中的 `.arena_hero_*.json`、`.env`、`.arena_hero_api_key.dpapi`、`*.jsonl`、`agent*.log`、`arena_hero_dashboard*.log` 和 `arena_hero_overlay*.log` 应只出现在 ignored 列表中。
 
 ## 3. Git 历史检查
 
@@ -47,27 +64,41 @@ git log --all --name-only --pretty=format: |
     Select-String -Pattern '\.env|api_key|credential|secret|token'
 ```
 
-发现真实 Key 后应立即在 Arena Hero 侧吊销并重新签发，再使用适当的历史清理工具处理仓库。不要把旧 Key 留在 issue、PR、CI artifact 或 release archive 中。
+发现真实 Key 后应立即在 Arena Hero 侧吊销并重新签发，再使用适当的历史清理工具处理仓库。不要把旧 Key 留在 Issue、PR、CI artifact 或 Release archive 中。
 
 ## 4. 发布内容
 
 应包含：
 
-- Python 源码和 PowerShell 脚本。
+- Python 源码和 PowerShell/Linux 启动脚本。
+- `arena_hero_dashboard_server.py`、`arena_hero_agent_supervisor.py` 与对应测试。
+- `dashboard/` 前端及其本地 `dashboard/vendor/echarts.min.js` 依赖。
 - `arena_hero_route_overlay/` 扩展源码。
-- 测试和 CI。
-- README、用法、策略、安全、贡献和许可证文件。
+- `deploy/` 中的 systemd/Nginx 示例。
+- 测试、GitHub Actions CI、README、用法、部署、策略、安全、贡献和许可证文件。
 - `.env.example` 与 `.arena_hero_control.example.json`。
 
 不应包含：
 
-- 虚拟环境、缓存、构建目录。
-- API Key 或 DPAPI 文件。
-- 战术记忆、路线、控制状态、统计、浏览器情报。
-- 遥测、中文事件、后台输出。
+- 虚拟环境、Python/测试缓存、构建目录。
+- API Key、DPAPI 文件或 Dashboard 会话 Token。
+- `.arena_hero_agent_status.json`、战术记忆、路线、控制状态、统计、浏览器情报。
+- 遥测、中文事件、Agent/Dashboard/叠加层后台输出。
 - 个人截图、账号标识或未脱敏的敌我状态导出。
 
-## 5. 建议的 Git 流程
+## 5. Dashboard 发布验证
+
+不要使用真实 API Key 做公开 CI。通过注入测试 Supervisor 验证：
+
+- 静态登录页可加载，ECharts 从仓库本地资源加载。
+- 错误 Key 显示安全错误且响应不回显 Key。
+- 测试有效 Key 会进入控制台并创建默认配置。
+- Key 不进入 `localStorage` 或 `sessionStorage`；浏览器只保存会话 Token。
+- 未带 Token 的数据 API 返回 401，`/api/health` 保持公开。
+
+部署到公网域名前，还要确认 8766 只监听回环、反代启用 HTTPS，且仅在可信反代场景启用 `ARENA_HERO_DASHBOARD_TRUST_PROXY=true`。
+
+## 6. 建议的 Git 流程
 
 ```powershell
 git switch -c release/vX.Y.Z
@@ -83,7 +114,7 @@ git push origin release/vX.Y.Z --follow-tags
 
 - 兼容的 Arena Hero 规则和 SDK 版本。
 - 经济、产兵、编队、战斗或迁移策略变化。
-- 控制字段或运行文件格式变化。
+- Dashboard/API Key 初始化、安全边界、控制字段或运行文件格式变化。
 - 已知风险和升级步骤。
 
 不要在没有明确版本选择时直接照抄示例中的 `vX.Y.Z`。

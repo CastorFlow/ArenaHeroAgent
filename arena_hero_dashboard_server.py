@@ -1,42 +1,28 @@
-"""Arena Hero 网页控制台后端。
+"""Arena Hero web dashboard and API-key initialization gateway.
 
-绑 127.0.0.1:8766（可用 ARENA_HERO_DASHBOARD_PORT 覆盖），配 Nginx 反代 + HTTPS 域名访问。
-登录密码读 ARENA_HERO_DASHBOARD_PASSWORD 环境变量或 .dashboard_password 文件（mode 600）；
-未配置密码 → 拒绝启动（fail-fast）。除 / 与 /api/login、/api/health 外，所有 /api/* 需
-Authorization: Bearer <token>（登录签发，12h 过期）。
+The server listens on ``127.0.0.1:8766`` by default.  The login form accepts the
+Arena Hero API key, starts the real tactic with that key, waits until the
+official SDK authenticates and publishes the first actionable Turn, then
+returns a 12-hour dashboard session token.  The key is never written to disk.
 
-数据源全部是代理(arena_hero_tactic.py)落盘的 JSON/JSONL 文件，控制文件
-.arena_hero_control.json 是唯一配置入口（代理每 tick 热加载）。本服务只读写这些文件，
-不侵入代理主循环。复用 arena_hero_route_overlay_server 的 load_control/save_control/
-load_stats/load_logs，保证控制文件 schema 与 Chrome 扩展叠加层一致。
-
-端点：
-  GET  /                    → 前端页面 dashboard/index.html
-  GET  /api/health          → {status:ok}
-  POST /api/login           → {password} → {token}
-  GET  /api/config          → 控制文件 + stats 回显的生效值
-  POST /api/config          → 原子写控制文件（下次 tick 生效）
-  GET  /api/stats           → .arena_hero_stats.json
-  GET  /api/telemetry?limit → arena_hero_telemetry.jsonl 尾部
-  GET  /api/battle?limit&since → 战况历史尾部（可增量）
-  GET  /api/trail?limit&step → Core 轨迹（step 抽稀）
-  GET  /api/routes          → .arena_hero_routes.json
-  GET  /api/events?limit    → 事件流日志尾部
+Use Nginx/Caddy and HTTPS when exposing the dashboard through a domain.  All
+data APIs require ``Authorization: Bearer <session token>``.
 """
 from __future__ import annotations
 
 import argparse
-import hmac
 import json
 import os
 import secrets
 import threading
 import time
+from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from arena_hero_agent_supervisor import AgentStartError, AgentSupervisor
 from arena_hero_route_overlay_server import (
     load_control,
     load_logs,
@@ -45,19 +31,22 @@ from arena_hero_route_overlay_server import (
     save_control,
 )
 
-LOOPBACK_HOST = "127.0.0.1"
+DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8766
 DASHBOARD_DIR = Path(__file__).resolve().parent / "dashboard"
-PASSWORD_FILE_NAME = ".dashboard_password"
 TOKEN_TTL_SECONDS = 12 * 60 * 60
 MAX_JSONL_ROWS = 10_000
-AUTH_EXEMPT = {"/api/health", "/api/login"}
-SENSITIVE_PARTS = ("password", "token", "api", "authorization", "credential", "secret")
+MAX_LOGIN_ATTEMPTS = 8
+LOGIN_ATTEMPT_WINDOW_SECONDS = 60.0
 
 
 class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+    def server_close(self) -> None:
+        self.agent_supervisor.stop()
+        super().server_close()
 
     def __init__(
         self,
@@ -71,7 +60,7 @@ class DashboardServer(ThreadingHTTPServer):
         trail_path: Path,
         routes_path: Path,
         events_path: Path,
-        password: str,
+        agent_supervisor: AgentSupervisor,
     ) -> None:
         self.dashboard_dir = dashboard_dir
         self.control_path = control_path
@@ -81,28 +70,12 @@ class DashboardServer(ThreadingHTTPServer):
         self.trail_path = trail_path
         self.routes_path = routes_path
         self.events_path = events_path
-        self._password = password
+        self.agent_supervisor = agent_supervisor
         self._tokens: dict[str, float] = {}  # token -> expiry unix ts
         self._tokens_lock = threading.Lock()
+        self._login_attempts: dict[str, deque[float]] = {}
+        self._login_attempts_lock = threading.Lock()
         super().__init__(address, DashboardHandler)
-
-
-def _load_password(*, env_value: str | None, password_file: Path) -> str:
-    """登录密码：env 优先，其次 .dashboard_password 文件；都没有 → 抛错拒绝启动。"""
-    if env_value:
-        return env_value
-    try:
-        raw = password_file.read_text(encoding="utf-8").strip()
-    except OSError:
-        raise RuntimeError(
-            "网页控制台未配置密码：设 ARENA_HERO_DASHBOARD_PASSWORD 或写 "
-            f"{password_file}（mode 600，一行明文）。拒绝启动。"
-        ) from None
-    if not raw:
-        raise RuntimeError(
-            f"网页控制台密码文件 {password_file} 为空。拒绝启动。"
-        )
-    return raw
 
 
 def _jsonl_tail(path: Path, limit: int) -> list[dict[str, Any]]:
@@ -146,6 +119,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            "connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+        )
         self.end_headers()
         # HEAD 请求只回响应头（标正确 Content-Length），不回 body。
         if self.command != "HEAD":
@@ -194,7 +176,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             expiry = self.server._tokens.get(token)
             if expiry is None or expiry < now:
                 return False
-            self.server._tokens[token] = expiry  # 滑动续期
+            self.server._tokens[token] = now + TOKEN_TTL_SECONDS  # 滑动续期
             return True
 
     def _require_auth(self) -> bool:
@@ -231,7 +213,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if endpoint == "/api/health":
-            self._send_json({"status": "ok"}, HTTPStatus.OK)
+            self._send_json(
+                {"status": "ok", "agent": self.server.agent_supervisor.status()},
+                HTTPStatus.OK,
+            )
             return
         if endpoint == "/api/login":
             self._send_error("method_not_allowed", HTTPStatus.METHOD_NOT_ALLOWED)
@@ -244,6 +229,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "effective_control", {}
             )
             payload["effective"] = effective
+            payload["agent"] = self.server.agent_supervisor.status()
             self._send_json(payload, HTTPStatus.OK)
             return
         if endpoint == "/api/stats":
@@ -317,30 +303,93 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "public, max-age=3600")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def do_HEAD(self) -> None:
         # HEAD 与 GET 同路由，_send_bytes 会因 command=="HEAD" 跳过 body。
         self.do_GET()
 
+    def _login_rate_key(self) -> str:
+        if os.environ.get("ARENA_HERO_DASHBOARD_TRUST_PROXY", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            forwarded = self.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+            if forwarded:
+                return forwarded
+        return self.client_address[0] if self.client_address else "unknown"
+
+    def _check_login_rate(self) -> bool:
+        key = self._login_rate_key()
+        now = time.monotonic()
+        with self.server._login_attempts_lock:
+            attempts = self.server._login_attempts.setdefault(key, deque())
+            while attempts and attempts[0] <= now - LOGIN_ATTEMPT_WINDOW_SECONDS:
+                attempts.popleft()
+            if len(attempts) >= MAX_LOGIN_ATTEMPTS:
+                return False
+            attempts.append(now)
+            return True
+
+    def _clear_login_rate(self) -> None:
+        key = self._login_rate_key()
+        with self.server._login_attempts_lock:
+            self.server._login_attempts.pop(key, None)
+
     def do_POST(self) -> None:
         endpoint = self.path.partition("?")[0]
         if endpoint == "/api/login":
-            data = self._read_json_body()
+            if not self._check_login_rate():
+                self._send_json(
+                    {"error": "too_many_attempts", "message": "尝试次数过多，请 1 分钟后再试"},
+                    HTTPStatus.TOO_MANY_REQUESTS,
+                )
+                return
+            data = self._read_json_body(maximum=16_384)
             if data is None:
                 return
-            provided = data.get("password")
-            if not isinstance(provided, str) or not hmac.compare_digest(
-                provided, self.server._password
-            ):
-                self._send_error("invalid_password", HTTPStatus.UNAUTHORIZED)
+            api_key = data.get("api_key")
+            if not isinstance(api_key, str):
+                self._send_error("invalid_api_key", HTTPStatus.UNAUTHORIZED)
                 return
+            try:
+                agent = self.server.agent_supervisor.start(api_key)
+            except AgentStartError as exc:
+                if exc.code == "invalid_api_key":
+                    status = HTTPStatus.UNAUTHORIZED
+                elif exc.code == "agent_already_running":
+                    status = HTTPStatus.CONFLICT
+                else:
+                    status = HTTPStatus.SERVICE_UNAVAILABLE
+                self._send_json(
+                    {"error": exc.code, "message": str(exc)},
+                    status,
+                )
+                return
+            if not self.server.control_path.is_file():
+                defaults = load_control(self.server.control_path)
+                save_control(
+                    self.server.control_path,
+                    defaults["mode"],
+                    defaults,
+                )
+            self._clear_login_rate()
             token = secrets.token_urlsafe(32)
             with self.server._tokens_lock:
                 self.server._tokens[token] = time.time() + TOKEN_TTL_SECONDS
             self._send_json(
-                {"token": token, "expires_in": TOKEN_TTL_SECONDS},
+                {
+                    "token": token,
+                    "expires_in": TOKEN_TTL_SECONDS,
+                    "agent": agent,
+                    "config": load_control(self.server.control_path),
+                },
                 HTTPStatus.OK,
             )
             return
@@ -352,9 +401,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             current = load_control(self.server.control_path)
             mode = data.get("mode", current["mode"])
-            recall = data.get("recall", current["recall"])
             try:
-                payload = save_control(self.server.control_path, mode, recall, data)
+                payload = save_control(self.server.control_path, mode, data)
             except ValueError as exc:
                 self._send_error(str(exc), HTTPStatus.BAD_REQUEST)
                 return
@@ -376,17 +424,12 @@ def create_server(
     trail_path: Path | None = None,
     routes_path: Path | None = None,
     events_path: Path | None = None,
-    password: str | None = None,
-    password_file: Path | None = None,
+    agent_supervisor: AgentSupervisor | None = None,
+    host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> DashboardServer:
-    resolved_password = _load_password(
-        env_value=password,
-        password_file=password_file
-        or Path(os.environ.get("ARENA_HERO_DASHBOARD_PASSWORD_FILE", PASSWORD_FILE_NAME)),
-    )
     return DashboardServer(
-        (LOOPBACK_HOST, port),
+        (host, port),
         dashboard_dir=dashboard_dir,
         control_path=control_path or Path(".arena_hero_control.json"),
         stats_path=stats_path or Path(".arena_hero_stats.json"),
@@ -395,13 +438,22 @@ def create_server(
         trail_path=trail_path or Path("arena_hero_core_trail.jsonl"),
         routes_path=routes_path or Path(".arena_hero_routes.json"),
         events_path=events_path or Path("arena_hero_events_zh.jsonl"),
-        password=resolved_password,
+        agent_supervisor=agent_supervisor or AgentSupervisor(),
     )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Arena Hero web dashboard")
-    parser.add_argument("--port", type=int, default=int(os.environ.get("ARENA_HERO_DASHBOARD_PORT", DEFAULT_PORT)))
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("ARENA_HERO_DASHBOARD_HOST", DEFAULT_HOST),
+        help="Listen address (default: 127.0.0.1; use a reverse proxy for public HTTPS).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("ARENA_HERO_DASHBOARD_PORT", DEFAULT_PORT)),
+    )
     parser.add_argument(
         "--dashboard-dir",
         type=Path,
@@ -414,8 +466,16 @@ def main() -> int:
     parser.add_argument("--trail-file", type=Path, default=None)
     parser.add_argument("--routes-file", type=Path, default=None)
     parser.add_argument("--events-file", type=Path, default=None)
-    parser.add_argument("--password", type=str, default=os.environ.get("ARENA_HERO_DASHBOARD_PASSWORD"))
-    parser.add_argument("--password-file", type=Path, default=None)
+    parser.add_argument(
+        "--agent-status-file",
+        type=Path,
+        default=Path(os.environ.get("ARENA_HERO_AGENT_STATUS_FILE", ".arena_hero_agent_status.json")),
+    )
+    parser.add_argument(
+        "--agent-start-timeout",
+        type=float,
+        default=float(os.environ.get("ARENA_HERO_AGENT_START_TIMEOUT", "25")),
+    )
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
@@ -429,12 +489,15 @@ def main() -> int:
         trail_path=args.trail_file,
         routes_path=args.routes_file,
         events_path=args.events_file,
-        password=args.password,
-        password_file=args.password_file,
+        agent_supervisor=AgentSupervisor(
+            status_path=args.agent_status_file,
+            startup_timeout=args.agent_start_timeout,
+        ),
+        host=args.host,
         port=args.port,
     )
     print(
-        f"Arena Hero dashboard listening on http://{LOOPBACK_HOST}:{args.port} "
+        f"Arena Hero dashboard listening on http://{args.host}:{args.port} "
         f"(dashboard={args.dashboard_dir})",
         flush=True,
     )

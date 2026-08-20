@@ -1,19 +1,22 @@
-# Stop only the Arena Hero agent and overlay started from this repository.
-$ErrorActionPreference = "Stop"
+# Stop only Arena Hero processes started from this repository.
+$ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
-$agentEntry = [IO.Path]::GetFullPath((Join-Path $root "arena_hero_tactic.py"))
-$overlayEntry = [IO.Path]::GetFullPath((Join-Path $root "arena_hero_route_overlay_server.py"))
+$entries = @(
+    [IO.Path]::GetFullPath((Join-Path $root 'arena_hero_dashboard_server.py')),
+    [IO.Path]::GetFullPath((Join-Path $root 'arena_hero_route_overlay_server.py')),
+    [IO.Path]::GetFullPath((Join-Path $root 'arena_hero_tactic.py'))
+)
 
 $processes = @(
-    Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+    Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" |
         Where-Object {
-            $_.CommandLine -like "*$agentEntry*" -or
-            $_.CommandLine -like "*$overlayEntry*"
+            $commandLine = $_.CommandLine
+            $null -ne $commandLine -and ($entries | Where-Object { $commandLine -like "*$_*" })
         }
 )
 
 foreach ($process in $processes) {
-    Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
+    Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host "Stopped $($processes.Count) Arena Hero project process(es)."

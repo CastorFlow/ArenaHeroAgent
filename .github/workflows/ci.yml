@@ -39,6 +39,8 @@ jobs:
       - name: Compile Python sources
         run: >-
           python -m compileall -q
+          arena_hero_agent_supervisor.py
+          arena_hero_dashboard_server.py
           arena_hero_tactic.py
           arena_hero_strategy.py
           arena_hero_event_log.py

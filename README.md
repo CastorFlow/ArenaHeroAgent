@@ -1,6 +1,6 @@
 # Arena Hero 自适应战术 Agent
 
-一个面向 Arena Hero 的长期运行战术 Agent。项目使用官方 Python SDK，包含自适应经济、动态产兵、编队推进、Core 斩首、信标控制、运行状态持久化，以及可选的 Chrome 路线与统计叠加层。
+一个面向 Arena Hero 的长期运行战术 Agent。项目使用官方 Python SDK，包含 API Key 登录初始化网页、自适应经济、动态产兵、编队推进、Core 斩首、信标控制、运行状态持久化，以及可选的 Chrome 路线与统计叠加层。
 
 当前兼容基线：
 
@@ -15,7 +15,7 @@
 
 ## 主要能力
 
-- 四种运行模式：发育、侵略、抢信标、迁移。
+- 五种运行模式：发育、侵略、抢信标、迁移、闪电速攻。
 - 工人按当前视野、可信历史、资源刷新分区和浏览器低置信提示分层搜索。
 - 载货工人优先回仓，Core 门口自动排队与腾位，检测静止和小范围打转。
 - 按实时人口调用官方 `unit_cost`，避免跨价格档位时盲目产兵。
@@ -32,32 +32,27 @@
 
 ```powershell
 .\setup.ps1
-.\set_key.ps1
 .\start_all.ps1
 ```
 
-`set_key.ps1` 会使用当前 Windows 用户的 DPAPI 加密 API Key；仓库不会保存明文 Key。`start_all.ps1` 会启动 Agent 和只监听 `127.0.0.1:8765` 的叠加层服务。
+浏览器会打开 `http://127.0.0.1:8766/`。在登录页输入 Arena Hero API Key；Dashboard 会通过官方 SDK 验证，只有鉴权成功并收到首个 Turn 后才启动完成、创建默认 `develop` 配置并进入控制台。API Key 不落盘。
 
-随后在 Chrome/Edge 中：
+`start_all.ps1` 还会启动只监听 `127.0.0.1:8765` 的可选叠加层桥接服务。随后在 Chrome/Edge 中：
 
 1. 打开扩展管理页并启用开发者模式。
 2. 选择“加载已解压的扩展程序”。
 3. 选择仓库中的 `arena_hero_route_overlay` 目录。
 4. 登录拥有该 API Key 的 Arena Hero 账号并打开 Arena 页面。
 
-前台只运行 Agent：
+高级用法：`set_key.ps1` + `start_arena_hero.ps1` 仍可用 DPAPI 在前台直接运行 Agent，不经过网页初始化。
 
-```powershell
-.\start_arena_hero.ps1
-```
-
-停止本仓库启动的 Agent 和叠加层：
+停止本仓库启动的 Dashboard、Agent 和叠加层：
 
 ```powershell
 .\stop_all.ps1
 ```
 
-Linux/macOS 或不使用 DPAPI 时，请按[跨平台安装与凭据配置](docs/USAGE.md#跨平台运行)运行 `arena_hero_tactic.py`。
+Linux/VPS 部署、自定义域名、Nginx HTTPS 和无域名 SSH 隧道见[部署文档](docs/DEPLOYMENT.md)。完整参数见[使用文档](docs/USAGE.md)。
 
 ## 默认策略
 
@@ -77,6 +72,8 @@ Linux/macOS 或不使用 DPAPI 时，请按[跨平台安装与凭据配置](docs
 
 | 路径 | 作用 |
 |---|---|
+| `arena_hero_dashboard_server.py` | API Key 初始化网关、会话鉴权和网页控制台 API |
+| `arena_hero_agent_supervisor.py` | 在验证登录时启动、监控并停止真实 Agent 子进程 |
 | `arena_hero_tactic.py` | SDK 连接、Tick 循环、热加载、遥测与错误处理入口 |
 | `arena_hero_strategy.py` | 战术状态、寻路、经济、战斗、生产和 Core 决策 |
 | `arena_hero_event_log.py` | 脱敏的中文结构化事件日志 |
@@ -84,14 +81,15 @@ Linux/macOS 或不使用 DPAPI 时，请按[跨平台安装与凭据配置](docs
 | `arena_hero_route_overlay/` | Chrome Manifest V3 叠加层扩展 |
 | `start_*.ps1`, `stop_all.ps1` | Windows 启动与停止脚本 |
 | `test_*.py` | 策略、服务、日志和端到端测试 |
-| `docs/` | 使用、配置、策略与发布说明 |
+| `deploy/` | systemd 与 Nginx 部署模板 |
+| `docs/` | 使用、部署、配置、策略与发布说明 |
 
 运行生成的 `.arena_hero_*.json`、遥测、日志、虚拟环境和凭据文件均已被 `.gitignore` 排除。
 
 ## 验证
 
 ```powershell
-.\.venv\Scripts\python.exe -m compileall -q arena_hero_tactic.py arena_hero_strategy.py arena_hero_event_log.py arena_hero_route_overlay_server.py
+.\.venv\Scripts\python.exe -m compileall -q arena_hero_agent_supervisor.py arena_hero_dashboard_server.py arena_hero_tactic.py arena_hero_strategy.py arena_hero_event_log.py arena_hero_route_overlay_server.py
 .\.venv\Scripts\python.exe -m unittest
 node arena_hero_route_overlay\test_overlay_core.js
 .\.venv\Scripts\python.exe -m pip check
@@ -101,7 +99,9 @@ GitHub Actions 会在 Windows 和 Linux 上运行相同的 Python/Node 核心检
 
 ## 安全
 
+- 网页输入的 API Key 只传入 Agent 子进程环境；不会写入磁盘，后续请求使用随机会话 Token。
 - 不要提交 `.env`、`.arena_hero_api_key.dpapi`、运行日志或状态快照。
+- 公网部署必须通过 Nginx/Caddy 提供 HTTPS，应用仍只监听 `127.0.0.1:8766`。
 - 叠加层服务只绑定回环地址，并只允许扩展来源提交控制和浏览器情报。
 - 浏览器中的 Manual 指令优先于 Agent 对同一对象的指令。
 - 发现凭据或安全问题时，请按 [SECURITY.md](SECURITY.md) 处理。

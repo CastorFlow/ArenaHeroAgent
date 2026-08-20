@@ -16,11 +16,25 @@ DEFAULT_DASHBOARD_CONTROL_FIELDS = {
     "core_hold": False,
     "core_target": None,
     "core_transfer_mode": "star",
-    "lightning_ring": [400, 600],
+    "core_evade_enemies": False,
+    "core_chase_enemies": False,
+    "core_pursue_beacon": False,
     "build_queue": [],
-    "spawn_ratio": {"ranger": 3, "worker": 1},
-    "unit_caps": {"ranger": 0, "vanguard": 0, "worker": 0},
+    "spawn_ratio": {"ranger": 1, "vanguard": 1, "worker": 3},
+    "unit_caps": {"ranger": 0, "vanguard": 0, "worker": 20},
+    "replenish_threshold": {"ranger": 0, "vanguard": 0, "worker": 0},
+    "replenish_priority": ["ranger", "worker", "vanguard"],
     "wartime_reserve": 150,
+    "comet_active": False,
+    "comet_mode": "beacon",
+    "comet_target": None,
+    "comet_vanguards": 3,
+    "comet_rangers": 3,
+    "comet_min_reserve_vanguards": 3,
+    "comet_min_reserve_rangers": 3,
+    "comet_wounded_threshold": 0.5,
+    "comet_rally_enabled": False,
+    "comet_rally_distance": 0,
 }
 
 
@@ -28,13 +42,6 @@ def expected_control(**overrides: object) -> dict:
     """构造 /control POST 返回的完整期望字典（旧字段 + 网页控制台新增字段默认值）。"""
     payload: dict = {
         "mode": "develop",
-        "recall": False,
-        "raid_enabled": False,
-        "raid_recall": False,
-        "raid_vanguards": 1,
-        "raid_rangers": 2,
-        "beacon_target_distance": 0,
-        "rally_point": None,
         "aggress_vanguards": 0,
         "aggress_rangers": 0,
     }
@@ -116,7 +123,6 @@ class RouteOverlayServerTests(unittest.TestCase):
                     {
                         "tick": 7,
                         "mode": "aggress",
-                        "recall": False,
                         "resources": 3,
                         "capacity": 25,
                         "population": 5,
@@ -231,20 +237,20 @@ class RouteOverlayServerTests(unittest.TestCase):
 
                 request = Request(
                     f"{base}/control",
-                    data=json.dumps({"mode": "aggress", "recall": True}).encode("utf-8"),
+                    data=json.dumps({"mode": "aggress"}).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                     method="POST",
                 )
                 with urlopen(request, timeout=2) as response:
                     posted = json.load(response)
-                self.assertEqual(posted, expected_control(mode="aggress", recall=True))
+                self.assertEqual(posted, expected_control(mode="aggress"))
 
                 with urlopen(f"{base}/control", timeout=2) as response:
                     after = json.load(response)
-                self.assertEqual(after, expected_control(mode="aggress", recall=True))
+                self.assertEqual(after, expected_control(mode="aggress"))
                 self.assertEqual(
                     json.loads(control_path.read_text(encoding="utf-8")),
-                    expected_control(mode="aggress", recall=True),
+                    expected_control(mode="aggress"),
                 )
             finally:
                 server.shutdown()
@@ -277,7 +283,7 @@ class RouteOverlayServerTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=2)
 
-    def test_control_accepts_independent_raid_settings(self) -> None:
+    def test_control_accepts_independent_comet_settings(self) -> None:
         with TemporaryDirectory() as directory:
             directory_path = Path(directory)
             routes_path = directory_path / ".arena_hero_routes.json"
@@ -296,10 +302,13 @@ class RouteOverlayServerTests(unittest.TestCase):
                     f"http://{host}:{port}/control",
                     data=json.dumps(
                         {
-                            "raid_enabled": True,
-                            "raid_recall": True,
-                            "raid_vanguards": 3,
-                            "raid_rangers": 4,
+                            "comet_active": True,
+                            "comet_mode": "coordinate",
+                            "comet_target": [120, -80],
+                            "comet_vanguards": 2,
+                            "comet_rangers": 5,
+                            "comet_min_reserve_vanguards": 1,
+                            "comet_min_reserve_rangers": 2,
                         }
                     ).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
@@ -315,12 +324,87 @@ class RouteOverlayServerTests(unittest.TestCase):
         self.assertEqual(
             posted,
             expected_control(
-                raid_enabled=True,
-                raid_recall=True,
-                raid_vanguards=3,
-                raid_rangers=4,
+                comet_active=True,
+                comet_mode="coordinate",
+                comet_target=[120, -80],
+                comet_vanguards=2,
+                comet_rangers=5,
+                comet_min_reserve_vanguards=1,
+                comet_min_reserve_rangers=2,
             ),
         )
+
+    def test_core_enemy_bias_and_pursue_beacon_round_trip(self) -> None:
+        # 退避三舍 / 趁胜追击 / 御驾亲征 三个布尔开关 POST→GET 往返。
+        with TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            routes_path = directory_path / ".arena_hero_routes.json"
+            routes_path.write_text("{}", encoding="utf-8")
+            control_path = directory_path / ".arena_hero_control.json"
+            control_path.write_text("{}", encoding="utf-8")
+            server = create_server(
+                routes_path, control_path=control_path, port=0
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address
+            try:
+                request = Request(
+                    f"http://{host}:{port}/control",
+                    data=json.dumps(
+                        {
+                            "core_evade_enemies": True,
+                            "core_chase_enemies": False,
+                            "core_pursue_beacon": True,
+                        }
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(request, timeout=2) as response:
+                    posted = json.load(response)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+        self.assertEqual(
+            posted,
+            expected_control(
+                core_evade_enemies=True,
+                core_chase_enemies=False,
+                core_pursue_beacon=True,
+            ),
+        )
+
+    def test_core_enemy_bias_rejects_non_bool(self) -> None:
+        # 非布尔值必须拒绝（严格校验，抛 ValueError → 400）。
+        with TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            routes_path = directory_path / ".arena_hero_routes.json"
+            routes_path.write_text("{}", encoding="utf-8")
+            control_path = directory_path / ".arena_hero_control.json"
+            control_path.write_text("{}", encoding="utf-8")
+            server = create_server(
+                routes_path, control_path=control_path, port=0
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address
+            try:
+                request = Request(
+                    f"http://{host}:{port}/control",
+                    data=json.dumps({"core_evade_enemies": "yes"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as ctx:
+                    urlopen(request, timeout=2)
+                self.assertEqual(ctx.exception.code, 400)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
 
     def test_partial_control_update_preserves_existing_settings(self) -> None:
         with TemporaryDirectory() as directory:
@@ -332,11 +416,11 @@ class RouteOverlayServerTests(unittest.TestCase):
                 json.dumps(
                     {
                         "mode": "aggress",
-                        "recall": False,
-                        "beacon_target_distance": 50,
-                        "rally_point": [-20, 80],
                         "aggress_vanguards": 6,
                         "aggress_rangers": 7,
+                        "comet_active": True,
+                        "comet_vanguards": 2,
+                        "comet_rangers": 5,
                     }
                 ),
                 encoding="utf-8",
@@ -352,7 +436,7 @@ class RouteOverlayServerTests(unittest.TestCase):
             try:
                 request = Request(
                     f"http://{host}:{port}/control",
-                    data=json.dumps({"recall": True}).encode("utf-8"),
+                    data=json.dumps({"aggress_rangers": 9}).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                     method="POST",
                 )
@@ -367,12 +451,99 @@ class RouteOverlayServerTests(unittest.TestCase):
             posted,
             expected_control(
                 mode="aggress",
-                recall=True,
-                beacon_target_distance=50,
-                rally_point=[-20, 80],
                 aggress_vanguards=6,
-                aggress_rangers=7,
+                aggress_rangers=9,
+                comet_active=True,
+                comet_vanguards=2,
+                comet_rangers=5,
             ),
+        )
+
+    def test_build_system_revamp_fields_round_trip(self) -> None:
+        # 三元比例(含先锋) + 全零囤资源 + 补兵阈值 + 补兵优先级 经 POST→GET 往返。
+        with TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            routes_path = directory_path / ".arena_hero_routes.json"
+            routes_path.write_text("{}", encoding="utf-8")
+            control_path = directory_path / ".arena_hero_control.json"
+            control_path.write_text("{}", encoding="utf-8")
+            server = create_server(
+                routes_path, control_path=control_path, port=0
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address
+            try:
+                # 三元比例 + 阈值 + 优先级（工人优先）
+                request = Request(
+                    f"http://{host}:{port}/control",
+                    data=json.dumps(
+                        {
+                            "spawn_ratio": {
+                                "ranger": 5, "vanguard": 2, "worker": 1,
+                            },
+                            "replenish_threshold": {
+                                "ranger": 8, "vanguard": 3, "worker": 2,
+                            },
+                            "replenish_priority": ["worker", "ranger", "vanguard"],
+                        }
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(request, timeout=2) as response:
+                    posted = json.load(response)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+        self.assertEqual(
+            posted["spawn_ratio"],
+            {"ranger": 5, "vanguard": 2, "worker": 1},
+        )
+        self.assertEqual(
+            posted["replenish_threshold"],
+            {"ranger": 8, "vanguard": 3, "worker": 2},
+        )
+        self.assertEqual(
+            posted["replenish_priority"],
+            ["worker", "ranger", "vanguard"],
+        )
+
+    def test_build_system_all_zero_ratio_is_allowed(self) -> None:
+        # 全零比例 = 停止造兵囤资源，不再被拒绝。
+        with TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            routes_path = directory_path / ".arena_hero_routes.json"
+            routes_path.write_text("{}", encoding="utf-8")
+            control_path = directory_path / ".arena_hero_control.json"
+            control_path.write_text("{}", encoding="utf-8")
+            server = create_server(
+                routes_path, control_path=control_path, port=0
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address
+            try:
+                request = Request(
+                    f"http://{host}:{port}/control",
+                    data=json.dumps(
+                        {"spawn_ratio": {"ranger": 0, "vanguard": 0, "worker": 0}}
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(request, timeout=2) as response:
+                    posted = json.load(response)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+        self.assertEqual(
+            posted["spawn_ratio"],
+            {"ranger": 0, "vanguard": 0, "worker": 0},
         )
 
     def test_control_rejects_web_page_origin(self) -> None:

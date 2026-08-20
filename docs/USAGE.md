@@ -37,17 +37,63 @@
 .\setup.ps1 -Python "C:\Python311\python.exe"
 ```
 
-## 3. 凭据
+## 3. 推荐运行方式：网页输入 API Key
 
-### Windows DPAPI（推荐）
+Windows：
+
+```powershell
+.\start_all.ps1
+```
+
+脚本会启动：
+
+- Dashboard：`http://127.0.0.1:8766/`
+- 可选浏览器叠加层桥接：`http://127.0.0.1:8765/`
+
+Dashboard 启动时 Agent 尚未运行。用户在登录页输入 Arena Hero API Key 后，服务会启动真实 `arena_hero_tactic.py` 子进程，并等待官方 SDK 鉴权成功和首个完整 Turn；成功后才创建完整默认控制配置、签发 12 小时会话并显示控制台。API Key 不写入磁盘。
+
+停止本仓库启动的 Dashboard、Agent 和叠加层：
+
+```powershell
+.\stop_all.ps1
+```
+
+Linux / WSL2：
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+./scripts/start_dashboard.sh
+```
+
+本机默认访问 `http://127.0.0.1:8766/`。VPS、自定义域名、HTTPS 和无域名 SSH 隧道见 [DEPLOYMENT.md](DEPLOYMENT.md)。
+
+### 首次初始化的默认配置
+
+首次成功登录且 `.arena_hero_control.json` 不存在时，服务会写入完整默认值，其中包括：
+
+- 主模式：`develop`
+- Core：不锁定、不迁移、轨道半径 0、转移模式 `star`
+- 造兵队列：空；默认比例为游侠/先锋/工人 `1:1:3`
+- 单位上限：工人 20，游侠/先锋 0（0 表示不设置额外上限）
+- 战时存底：150
+- 哈雷彗星任务：关闭
+
+所有字段以 `.arena_hero_control.example.json` 和网页控制台当前显示为准。
+
+## 4. 高级用法：DPAPI 或命令行直接运行 Agent
+
+网页初始化不需要 `set_key.ps1`。只有绕过 Dashboard、直接启动 Agent 时才需要下面的凭据方式。
+
+### Windows DPAPI
 
 ```powershell
 .\set_key.ps1
+.\start_arena_hero.ps1
 ```
 
-Key 会保存到 `.arena_hero_api_key.dpapi`，只能由当前 Windows 用户在当前机器上解密。该文件已被 Git 忽略，但仍应像凭据一样保护，不应发送给他人。
-
-重新设置 Key 时再次运行 `set_key.ps1`。
+Key 会保存到 `.arena_hero_api_key.dpapi`，只能由当前 Windows 用户在当前机器上解密。该文件已被 Git 忽略，但仍应像凭据一样保护。
 
 ### 环境变量或 `.env`
 
@@ -57,78 +103,35 @@ Key 会保存到 `.arena_hero_api_key.dpapi`，只能由当前 Windows 用户在
 ARENA_HERO_API_KEY=your-key
 ```
 
-可以临时设置环境变量，或以 `.env.example` 为模板创建本地 `.env`。`.env` 是明文文件，只适合受控环境，并已被 Git 忽略。Windows 启动脚本发现明文 `.env` Key 后会将它迁移到 DPAPI 并从 `.env` 删除该行。
+可以临时设置环境变量，或以 `.env.example` 为模板创建本地 `.env`。`.env` 是明文文件，只适合受控环境，并已被 Git 忽略。不要在共享 shell 历史、CI 日志或截图中暴露真实 Key。
 
-程序不会把 Key 写入遥测、中文事件日志或叠加层响应。
-
-## 4. 运行 Agent
-
-### 前台运行
-
-Windows：
-
-```powershell
-.\start_arena_hero.ps1
-```
-
-直接运行 Python：
-
-```powershell
-.\.venv\Scripts\python.exe .\arena_hero_tactic.py
-```
-
-前台模式会逐 Tick 输出资源、人口、敌人数、动作数、上个 Tick 的事件和前几条战术决策。按 `Ctrl+C` 可正常停止。
-
-### 后台运行 Agent 与叠加层
-
-```powershell
-.\start_all.ps1
-```
-
-该脚本只停止并替换当前仓库路径下旧的 `arena_hero_tactic.py` 和 `arena_hero_route_overlay_server.py` 进程，不会匹配其他 Python 项目。输出写入：
-
-- `agent.log`
-- `agent_err.log`
-
-叠加层服务地址为 `http://127.0.0.1:8765`。健康检查：
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8765/health
-```
-
-### 停止
-
-```powershell
-.\stop_all.ps1
-```
-
-### 限定 Tick 数
-
-适合短时间试运行：
+限定 Tick 数：
 
 ```powershell
 .\.venv\Scripts\python.exe .\arena_hero_tactic.py --max-turns 10
 ```
 
-## 5. 跨平台运行
+## 5. Dashboard 参数和健康检查
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -r requirements.txt
-export ARENA_HERO_API_KEY='your-key'
-python arena_hero_tactic.py
+python arena_hero_dashboard_server.py --host 127.0.0.1 --port 8766
 ```
 
-不要在共享 shell 历史、CI 日志或截图中暴露真实 Key。生产环境应使用平台自己的 secret store 注入环境变量。
+| 参数/环境变量 | 默认值 | 作用 |
+|---|---|---|
+| `--host` / `ARENA_HERO_DASHBOARD_HOST` | `127.0.0.1` | Dashboard 监听地址 |
+| `--port` / `ARENA_HERO_DASHBOARD_PORT` | `8766` | Dashboard 端口 |
+| `--agent-status-file` / `ARENA_HERO_AGENT_STATUS_FILE` | `.arena_hero_agent_status.json` | 无凭据 Agent 生命周期状态 |
+| `--agent-start-timeout` / `ARENA_HERO_AGENT_START_TIMEOUT` | `25` 秒 | 等待鉴权和首个 Turn 的上限 |
+| `ARENA_HERO_DASHBOARD_TRUST_PROXY` | false | 信任反代传来的客户端 IP，仅限回环反代部署 |
 
-叠加层服务可以独立启动：
+公开健康检查：
 
 ```bash
-python arena_hero_route_overlay_server.py --port 8765
+curl http://127.0.0.1:8766/api/health
 ```
 
-浏览器扩展目前固定连接 `127.0.0.1:8765`。
+除 `/`、静态资源、`/api/login` 和 `/api/health` 外，其余 Dashboard API 都需要登录成功后签发的 Bearer 会话 Token。
 
 ## 6. 命令行参数
 
@@ -203,12 +206,16 @@ python arena_hero_route_overlay_server.py --port 8765
 
 | 字段 | 类型 | 含义 |
 |---|---|---|
-| `mode` | `develop/aggress/beacon/migrate` | 主模式 |
+| `mode` | `develop/aggress/beacon/migrate/lightning` | 主模式 |
 | `recall` | boolean | 全军召回 |
-| `raid_enabled` | boolean | 独立偷袭编组 |
-| `raid_recall` | boolean | 只召回偷袭编组 |
-| `raid_vanguards` | non-negative integer | 偷袭先锋数 |
-| `raid_rangers` | non-negative integer | 偷袭游侠数 |
+| `comet_active` | boolean | 哈雷彗星任务总开关 |
+| `comet_mode` | `beacon`/`coordinate` | 追踪信标（动态坐标）/ 打击自定义坐标 |
+| `comet_target` | `[x,y]` or null | coordinate 模式打击坐标（beacon 模式每 tick 从信标刷新） |
+| `comet_vanguards` | non-negative integer | 小队先锋数量 |
+| `comet_rangers` | non-negative integer | 小队游侠数量 |
+| `comet_min_reserve_vanguards` | non-negative integer | 轨道最低满血先锋保留（保卫 Core） |
+| `comet_min_reserve_rangers` | non-negative integer | 轨道最低满血游侠保留（保卫 Core） |
+| `comet_wounded_threshold` | 0.0–1.0 | 半血触发替补阈值（hp/max_hp ≤ 此值即换下） |
 | `beacon_target_distance` | non-negative integer | Core 希望与信标保持的曼哈顿距离；0 关闭 |
 | `rally_point` | `[x,y]` or null | 战斗单位人工集结点 |
 | `migration_candidate` | `[x,y]` or null | 工人验证的迁移候选格 |
@@ -224,6 +231,7 @@ python arena_hero_route_overlay_server.py --port 8765
 | 文件 | 内容 | 是否应提交 |
 |---|---|---|
 | `.arena_hero_api_key.dpapi` | Windows 加密 Key | 否 |
+| `.arena_hero_agent_status.json` | Dashboard 与 Agent 间的无凭据生命周期状态 | 否 |
 | `.arena_hero_memory.json` | 地图、敌人、编队、编号和累计战术状态 | 否 |
 | `.arena_hero_routes.json` | 当前 Tick 路线和单位快照 | 否 |
 | `.arena_hero_stats.json` | 叠加层统计快照 | 否 |
@@ -232,7 +240,8 @@ python arena_hero_route_overlay_server.py --port 8765
 | `.arena_hero_recovery_targets.json` | 人工资源恢复/迁移侦察点 | 否 |
 | `arena_hero_telemetry.jsonl` | 每 Tick 决策和事件摘要 | 否 |
 | `arena_hero_events_zh.jsonl` | 脱敏中文事件日志 | 否 |
-| `agent.log`, `agent_err.log` | 后台进程输出 | 否 |
+| `agent.log`, `agent_err.log` | Agent 后台输出 | 否 |
+| `arena_hero_dashboard*.log`, `arena_hero_overlay*.log` | Dashboard/叠加层输出 | 否 |
 
 记忆、遥测和中文日志会限制文件规模；无需手工轮转即可长期运行。
 

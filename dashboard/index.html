@@ -133,6 +133,10 @@
   details.adv summary { cursor: pointer; color: var(--ink-2); font-size: 13px; padding: 6px 0; }
   details.adv .field { margin: 10px 0; }
 
+  /* 配色面板：每行一个颜色选择器 */
+  .clr-row { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
+  .clr-row input[type=color] { width: 28px; height: 22px; padding: 0; border: 1px solid var(--border); border-radius: 6px; background: transparent; cursor: pointer; }
+
   /* ---- 战况 ---- */
   .kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin-bottom: 14px; }
   .kpi { background: var(--surface-2); border-radius: 10px; padding: 10px 12px; }
@@ -145,16 +149,7 @@
   .chart-grid .card { margin-bottom: 0; }
 
   /* ---- 地图 ---- */
-  #map-wrap { position: relative; }
-  #map { width: 100%; height: 520px; display: block; background: #0a0e14;
-    border-radius: 10px; border: 1px solid var(--border); touch-action: none; }
-  #map-toolbar { position: absolute; top: 10px; left: 10px; display: flex; gap: 6px; flex-wrap: wrap; z-index: 5; }
-  #map-toolbar button { background: rgba(26,26,25,.85); border: 1px solid var(--border);
-    color: var(--ink-1); border-radius: 8px; padding: 5px 10px; font-size: 12px; }
-  #map-toolbar button.active { background: var(--accent); border-color: var(--accent); }
-  #map-hint { position: absolute; bottom: 10px; left: 10px; background: rgba(26,26,25,.85);
-    border: 1px solid var(--border); border-radius: 8px; padding: 5px 10px; font-size: 11.5px;
-    color: var(--ink-2); z-index: 5; }
+  #map { width: 100%; height: 560px; min-height: 360px; }
   .legend { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px; font-size: 12px; color: var(--ink-2); }
   .legend .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 4px; vertical-align: -1px; }
 
@@ -178,9 +173,10 @@
 <!-- 登录 -->
 <div id="login-screen">
   <div id="login-box">
-    <h1>🔐 Arena Hero 控制台</h1>
-    <input id="password-input" type="password" placeholder="输入登录密码" autocomplete="current-password">
-    <button id="login-btn">登录</button>
+    <h1>🔐 Arena Hero Agent</h1>
+    <p style="color:var(--muted);line-height:1.65;margin:0 0 14px">输入 Arena Hero API Key。服务端会用官方 SDK 验证；验证成功后才会启动 Agent 并加载默认配置。Key 不会写入磁盘。</p>
+    <input id="password-input" type="password" placeholder="输入 Arena Hero API Key" autocomplete="off" spellcheck="false">
+    <button id="login-btn">验证并启动</button>
     <div id="login-error"></div>
   </div>
 </div>
@@ -211,17 +207,12 @@
       <div class="card">
         <h2>🪐 Core 控制</h2>
         <div class="field">
-          <label>巡逻半径 <span class="val" id="orbit-val">0 (自动)</span></label>
+          <label>恒星轨道半径 <span class="val" id="orbit-val">0 (未设置)</span></label>
           <input type="range" id="orbit-slider" min="0" max="900" step="10" value="0">
           <input type="number" id="orbit-input" min="0" max="900" step="10" value="0">
-        </div>
-        <div class="field">
-          <label>方环内半径 <span class="val" id="ring-inner-val">400</span></label>
-          <input type="number" id="ring-inner" min="1" value="400">
-        </div>
-        <div class="field">
-          <label>方环外半径 <span class="val" id="ring-outer-val">600</span></label>
-          <input type="number" id="ring-outer" min="1" value="600">
+          <div style="font-size:11.5px;color:var(--muted);margin-top:6px">
+            半径 r &gt; 0 时，Core 沿中心原点、边长 2r 的方形周界四角轮转巡逻；r=0 不巡逻。改 r 自动触发恒星模式迁移。
+          </div>
         </div>
         <div class="toggle-row">
           <span class="tlabel">驻扎（Core 停在当前位置）</span>
@@ -247,6 +238,24 @@
           </div>
           <div style="font-size:11.5px;color:var(--muted);margin-top:6px" id="transfer-desc"></div>
         </div>
+        <div class="toggle-row">
+          <span class="tlabel">退避三舍（敌方入视野 → Core 远离）</span>
+          <label class="switch"><input type="checkbox" id="core-evade"><span class="slider"></span></label>
+        </div>
+        <div style="font-size:11.5px;color:var(--muted);margin-top:4px">
+          仅 Core 运动时生效（恒星巡逻 / star·march·fortify 转移）；敌方视野消失即恢复巡逻。优先级低于驻扎；与趁胜追击同时开时退避优先。
+        </div>
+        <div class="toggle-row" style="margin-top:8px">
+          <span class="tlabel">趁胜追击（敌方入视野 → Core 靠近）</span>
+          <label class="switch"><input type="checkbox" id="core-chase"><span class="slider"></span></label>
+        </div>
+        <div class="toggle-row" style="margin-top:8px">
+          <span class="tlabel">御驾亲征（Core 目标 = 信标，动态跟随）</span>
+          <label class="switch"><input type="checkbox" id="core-pursue-beacon"><span class="slider"></span></label>
+        </div>
+        <div style="font-size:11.5px;color:var(--muted);margin-top:4px">
+          开启后 Core 目标每 tick 指向信标当前位置（动态坐标，复用彗星 beacon 逻辑），到达不停驻、持续跟随。优先级低于驻扎，与转移模式叠加；关闭则回落恒星巡逻。
+        </div>
       </div>
 
       <div class="card">
@@ -263,19 +272,63 @@
           </div>
         </div>
         <div class="field">
-          <label>默认比例（游侠 : 工人）</label>
+          <label>默认比例（游侠 : 先锋 : 工人）</label>
           <div class="row">
             <div style="flex:1">
               <label style="font-size:11.5px">游侠</label>
-              <input type="number" id="ratio-ranger" min="0" value="3">
+              <input type="number" id="ratio-ranger" min="0" value="1">
+            </div>
+            <div style="flex:1">
+              <label style="font-size:11.5px">先锋</label>
+              <input type="number" id="ratio-vanguard" min="0" value="1">
             </div>
             <div style="flex:1">
               <label style="font-size:11.5px">工人</label>
-              <input type="number" id="ratio-worker" min="0" value="1">
+              <input type="number" id="ratio-worker" min="0" value="3">
             </div>
           </div>
           <div style="font-size:11.5px;color:var(--muted);margin-top:4px">
-            无队列时 pop≥9 按此比例趋近；二者不可同时为 0。
+            无队列时 pop≥9 按此比例趋近；某兵种填 0 表示停造该兵种；三者全 0 表示停止造兵囤资源。
+          </div>
+        </div>
+        <div class="field">
+          <label>补兵最低阈值（&lt; 此数时主动补）</label>
+          <div class="row">
+            <div style="flex:1">
+              <label style="font-size:11.5px">游侠</label>
+              <input type="number" id="threshold-ranger" min="0" value="0">
+            </div>
+            <div style="flex:1">
+              <label style="font-size:11.5px">先锋</label>
+              <input type="number" id="threshold-vanguard" min="0" value="0">
+            </div>
+            <div style="flex:1">
+              <label style="font-size:11.5px">工人</label>
+              <input type="number" id="threshold-worker" min="0" value="0">
+            </div>
+          </div>
+          <div style="font-size:11.5px;color:var(--muted);margin-top:4px">
+            某兵种当前数低于阈值时优先补该兵种；0 = 不主动补该兵种，仅按比例趋近。
+          </div>
+        </div>
+        <div class="field">
+          <label>补兵优先级（多兵种同时低于阈值时）</label>
+          <div class="row">
+            <div style="flex:1">
+              <label style="font-size:11.5px">第一</label>
+              <select id="priority-1"></select>
+            </div>
+            <div style="flex:1">
+              <label style="font-size:11.5px">第二</label>
+              <select id="priority-2"></select>
+            </div>
+            <div style="flex:1">
+              <label style="font-size:11.5px">第三</label>
+              <select id="priority-3"></select>
+            </div>
+          </div>
+          <div style="font-size:11.5px;color:var(--muted);margin-top:4px">
+            三个下拉必须互不相同；保存时自动校验。
           </div>
         </div>
         <div class="field">
@@ -283,7 +336,7 @@
           <div class="row">
             <div style="flex:1">
               <label style="font-size:11.5px">工人</label>
-              <input type="number" id="cap-worker" min="0" value="0">
+              <input type="number" id="cap-worker" min="0" value="20">
             </div>
             <div style="flex:1">
               <label style="font-size:11.5px">游侠</label>
@@ -313,47 +366,65 @@
       </div>
 
       <div class="card">
-        <details class="adv">
-          <summary>⚙️ 高级控制</summary>
-          <div class="toggle-row">
-            <span class="tlabel">召回（recall）</span>
-            <label class="switch"><input type="checkbox" id="adv-recall"><span class="slider"></span></label>
+        <h2>🪐 哈雷彗星 <span class="hint">追踪信标 / 打击坐标</span></h2>
+        <div class="toggle-row">
+          <span class="tlabel">开启彗星任务</span>
+          <label class="switch"><input type="checkbox" id="adv-comet"><span class="slider"></span></label>
+        </div>
+        <div style="font-size:11.5px;color:var(--muted);margin:2px 0 8px">
+          开启后派出小队追踪信标或打击自定义坐标，外层轨道优先抽调，半血自动替补。
+        </div>
+        <div class="field">
+          <label>模式</label>
+          <select id="adv-comet-mode">
+            <option value="beacon">追踪信标（动态坐标）</option>
+            <option value="coordinate">自定义坐标</option>
+          </select>
+        </div>
+        <div class="field" id="comet-target-field">
+          <label>打击坐标 x / y（必填）</label>
+          <div class="row">
+            <input type="number" id="adv-comet-x" placeholder="x">
+            <input type="number" id="adv-comet-y" placeholder="y">
           </div>
-          <div class="toggle-row">
-            <span class="tlabel">raid 远征</span>
-            <label class="switch"><input type="checkbox" id="adv-raid"><span class="slider"></span></label>
-          </div>
-          <div class="field">
-            <label>raid 先锋</label>
-            <input type="number" id="adv-raid-vg" min="0" value="1">
-          </div>
-          <div class="field">
-            <label>raid 游侠</label>
-            <input type="number" id="adv-raid-rk" min="0" value="2">
-          </div>
-          <div class="field">
-            <label>信标目标距离 <span style="color:var(--warn)">(lightning 须为 0)</span></label>
-            <input type="number" id="adv-beacon-dist" min="0" value="0">
-          </div>
-          <div class="field">
-            <label>集结点 x / y（空 = 无）</label>
-            <div class="row">
-              <input type="number" id="adv-rally-x" placeholder="x">
-              <input type="number" id="adv-rally-y" placeholder="y">
+        </div>
+        <div class="field">
+          <label>小队数量</label>
+          <div class="row">
+            <div style="flex:1">
+              <label style="font-size:11.5px">先锋</label>
+              <input type="number" id="adv-comet-vg" min="0" value="3">
+            </div>
+            <div style="flex:1">
+              <label style="font-size:11.5px">游侠</label>
+              <input type="number" id="adv-comet-rk" min="0" value="3">
             </div>
           </div>
-          <div class="field">
-            <label>迁移目标 x / y（空 = 无）</label>
-            <div class="row">
-              <input type="number" id="adv-migrate-x" placeholder="x">
-              <input type="number" id="adv-migrate-y" placeholder="y">
+        </div>
+        <div class="field">
+          <label>轨道最低满血保留（保卫 Core）</label>
+          <div class="row">
+            <div style="flex:1">
+              <label style="font-size:11.5px">先锋</label>
+              <input type="number" id="adv-comet-rsv-vg" min="0" value="3">
+            </div>
+            <div style="flex:1">
+              <label style="font-size:11.5px">游侠</label>
+              <input type="number" id="adv-comet-rsv-rk" min="0" value="3">
             </div>
           </div>
-          <div class="toggle-row">
-            <span class="tlabel">自动迁移</span>
-            <label class="switch"><input type="checkbox" id="adv-auto-migrate"><span class="slider"></span></label>
-          </div>
-        </details>
+        </div>
+        <div class="toggle-row">
+          <span class="tlabel">首次出发集合（Rally）</span>
+          <label class="switch"><input type="checkbox" id="adv-comet-rally"><span class="slider"></span></label>
+        </div>
+        <div style="font-size:11.5px;color:var(--muted);margin:2px 0 8px">
+          开启后仅首批出发编队先到集合点近旁占位警戒、等齐队友再一起进攻；替补成员不受影响。集合点为障碍物时绕其周围占位即可。
+        </div>
+        <div class="field">
+          <label>集合点距目标点距离（格，0=贴目标点）</label>
+          <input type="number" id="adv-comet-rally-dist" min="0" value="0">
+        </div>
       </div>
 
       <button class="btn primary" id="save-btn">💾 保存全部配置</button>
@@ -366,56 +437,72 @@
         <div class="kpi-row">
           <div class="kpi"><div class="kval" id="kpi-core-kill">—</div><div class="klbl">敌核击杀（累计）</div></div>
           <div class="kpi"><div class="kval" id="kpi-kill">—</div><div class="klbl">击杀 : 阵亡</div></div>
-          <div class="kpi"><div class="kval" id="kpi-hr">—</div><div class="klbl">命中率（最近）</div></div>
           <div class="kpi"><div class="kval" id="kpi-surv">—</div><div class="klbl">存活率</div></div>
         </div>
         <div class="chart-grid">
           <div class="card">
-            <h2>敌方击杀（累计）</h2>
-            <div class="chart-box" id="chart-kills"></div>
+            <h2>敌方击杀（按小时）</h2>
+            <div class="chart-box tall" id="chart-kills-hour"></div>
           </div>
           <div class="card">
-            <h2>我方阵亡（累计）</h2>
-            <div class="chart-box" id="chart-losses"></div>
+            <h2>我方阵亡（按小时）</h2>
+            <div class="chart-box tall" id="chart-losses-hour"></div>
           </div>
           <div class="card">
-            <h2>命中率（滚动窗口）</h2>
-            <div class="chart-box" id="chart-hitrate"></div>
+            <h2>敌方击杀（按天）</h2>
+            <div class="chart-box tall" id="chart-kills-day"></div>
           </div>
           <div class="card">
-            <h2>人口 · 资源 · 敌情</h2>
-            <div class="chart-box" id="chart-pop"></div>
+            <h2>我方阵亡（按天）</h2>
+            <div class="chart-box tall" id="chart-losses-day"></div>
           </div>
         </div>
       </div>
 
       <div class="card">
-        <h2>🗺️ Core 轨迹 <span class="hint" id="map-mode-hint"></span></h2>
-        <div id="map-wrap">
-          <div id="map-toolbar">
-            <button id="map-follow">◎ 跟随 Core</button>
-            <button id="map-reset">⤢ 重置视图</button>
-            <button id="map-clear-trail">✕ 清轨迹</button>
+        <h2>🪐 ArenaHero 宇宙地图 <span class="hint" id="map-mode-hint">滚轮缩放 · 拖拽平移</span></h2>
+        <details class="adv" id="map-palette">
+          <summary>🎨 配色面板（每种角色一个颜色，自动保存）</summary>
+          <div class="field" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px 14px;margin-top:10px">
+            <label class="clr-row"><input type="color" data-clr="core"><span>我方 Core</span></label>
+            <label class="clr-row"><input type="color" data-clr="ranger"><span>游侠</span></label>
+            <label class="clr-row"><input type="color" data-clr="vanguard"><span>先锋</span></label>
+            <label class="clr-row"><input type="color" data-clr="worker"><span>工人</span></label>
+            <label class="clr-row"><input type="color" data-clr="enemy"><span>敌方（红环）</span></label>
+            <label class="clr-row"><input type="color" data-clr="beacon"><span>信标</span></label>
+            <label class="clr-row"><input type="color" data-clr="orbit"><span>恒星轨道/轨迹</span></label>
+            <label class="clr-row"><input type="color" data-clr="target"><span>目标 X</span></label>
+            <label class="clr-row"><input type="color" data-clr="background"><span>背景</span></label>
+            <label class="clr-row"><input type="color" data-clr="axis"><span>坐标轴</span></label>
           </div>
-          <canvas id="map"></canvas>
-          <div id="map-hint">点击地图设定 Core 目标坐标 · 滚轮缩放 · 拖拽平移</div>
-        </div>
-        <div class="legend">
-          <span><span class="dot" style="background:#3987e5"></span>游侠</span>
-          <span><span class="dot" style="background:#d95926"></span>先锋</span>
-          <span><span class="dot" style="background:#199e70"></span>工人</span>
-          <span><span class="dot" style="background:#e66767"></span>敌方</span>
-          <span><span class="dot" style="background:#4ade80"></span>资源</span>
-          <span><span class="dot" style="background:#ffffff"></span>Core 轨迹</span>
+          <div class="field" style="margin-top:8px">
+            <button class="btn small" id="map-palette-reset">恢复默认配色</button>
+            <button class="btn small" id="map-fit-core">回到 Core 周围</button>
+          </div>
+        </details>
+        <div class="chart-box" id="map" style="height:560px"></div>
+        <div class="legend" id="map-legend">
+          <span><span class="dot" data-clr-dot="core"></span>我方 Core</span>
+          <span><span class="dot" data-clr-dot="ranger"></span>游侠</span>
+          <span><span class="dot" data-clr-dot="vanguard"></span>先锋</span>
+          <span><span class="dot" data-clr-dot="worker"></span>工人</span>
+          <span><span class="dot" data-clr-dot="enemy"></span>敌方(内点=角色色+红环)</span>
+          <span><span class="dot" data-clr-dot="beacon"></span>信标</span>
+          <span><span class="dot" data-clr-dot="orbit"></span>━━实走轨迹 ┄┄预设轨道</span>
+          <span><span class="dot" data-clr-dot="target"></span>目标/彗星 X</span>
         </div>
       </div>
 
-      <div class="card">
-        <h2>📜 决策日志 <span class="hint">telemetry decisions</span></h2>
-        <div class="log-list" id="decision-log"><pre>加载中…</pre></div>
-      </div>
       <div class="card">
         <h2>⚡ 实时事件 <span class="hint">事件流</span></h2>
+        <div class="seg" id="event-tabs" style="margin-bottom:10px">
+          <button class="active" data-tab="all">全部</button>
+          <button data-tab="enemy">敌情</button>
+          <button data-tab="core">Core</button>
+          <button data-tab="worker">工人</button>
+          <button data-tab="ranger">游侠</button>
+          <button data-tab="vanguard">先锋</button>
+        </div>
         <div class="log-list" id="event-log"><pre>加载中…</pre></div>
       </div>
     </div>
@@ -428,20 +515,20 @@
 "use strict";
 /* ============ 状态 ============ */
 const state = {
-  token: localStorage.getItem("ah_dash_token") || "",
+  token: sessionStorage.getItem("ah_dash_token") || "",
   config: null,        // 控制文件 + effective
   stats: null,         // .arena_hero_stats.json
-  telemetry: [],       // 决策日志/人口曲线
   battle: [],          // 战况历史
   trail: [],           // Core 轨迹
   trailMaxTick: 0,
   routes: { resources: [] },
   events: [],
-  mapFollow: true,
-  trailVisible: true,
-  chartRange: 500,
+  chartRange: 2000,
   lastEventTitle: null,
+  eventTab: "all",
   localTransferMode: null, // 用户点选但尚未保存的转移模式，避免被轮询回填覆盖
+  localToggles: new Set(), // 用户拨动但尚未保存的开关(checkbox id)，避免被轮询回弹
+  localQueueDirty: false, // 用户编辑过造兵队列但未保存，避免被轮询 renderQueue 清空
 };
 
 /* 单位/兵种标签 */
@@ -450,6 +537,48 @@ const TYPE_COLOR = {
   RANGER: "#3987e5", WORKER: "#199e70", VANGUARD: "#d95926",
   CORE: "#e66767", UNKNOWN: "#9085e9",
 };
+
+/* ============ 宇宙地图配色（前端可配，localStorage 持久化）============ */
+const MAP_COLOR_DEFAULTS = {
+  core: "#39e85a",      // 我方 Core（绿）
+  ranger: "#3987e5",    // 游侠（蓝）
+  vanguard: "#e88a26",  // 先锋（橙）
+  worker: "#e6c200",    // 工人（黄）
+  enemy: "#e6453f",     // 敌方红环
+  beacon: "#ffd700",    // 信标（金）
+  orbit: "#fab219",     // 恒星轨道虚线 + 实走轨迹（黄）
+  target: "#ff5bc8",    // 目标/彗星 X
+  background: "#0a0e14",
+  axis: "#5a5a52",
+};
+const MAP_COLOR_KEY = "ah_map_colors_v1";
+function loadMapColors() {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(MAP_COLOR_KEY) || "{}"); } catch (e) {}
+  return Object.assign({}, MAP_COLOR_DEFAULTS, saved);
+}
+function saveMapColors(c) { try { localStorage.setItem(MAP_COLOR_KEY, JSON.stringify(c)); } catch (e) {} }
+let MAP_COLORS = loadMapColors();
+// 把一个 hex 转成 rgba(hex, alpha) ——兼容 #rgb / #rrggbb。
+function hexAlpha(hex, a) {
+  let h = String(hex || "#000000").replace("#", "");
+  if (h.length === 3) h = h.split("").map((c) => c + c).join("");
+  const r = parseInt(h.slice(0, 2), 16) || 0;
+  const g = parseInt(h.slice(2, 4), 16) || 0;
+  const b = parseInt(h.slice(4, 6), 16) || 0;
+  return `rgba(${r},${g},${b},${a})`;
+}
+// 把已渲染的配色面板 input 和图例色块同步成当前 MAP_COLORS。
+function syncPaletteUI() {
+  document.querySelectorAll("#map-palette input[type=color]").forEach((el) => {
+    const k = el.getAttribute("data-clr");
+    if (MAP_COLORS[k]) el.value = MAP_COLORS[k];
+  });
+  document.querySelectorAll("#map-legend .dot[data-clr-dot]").forEach((el) => {
+    const k = el.getAttribute("data-clr-dot");
+    if (MAP_COLORS[k]) el.style.background = MAP_COLORS[k];
+  });
+}
 
 /* ============ API 封装 ============ */
 async function api(path, opts = {}) {
@@ -465,32 +594,46 @@ async function api(path, opts = {}) {
     throw err;
   }
   setConn(true);
-  if (res.status === 401) {
-    logout("会话已过期，请重新登录");
-    throw new Error("unauthorized");
+  if (res.status === 401 && path !== "/api/login") {
+    logout("会话已过期，请重新输入 API Key");
+    throw Object.assign(new Error("unauthorized"), { status: res.status });
   }
   const payload = await res.json().catch(() => ({}));
-  if (!res.ok) throw Object.assign(new Error(payload.error || res.statusText), { status: res.status });
+  if (!res.ok) throw Object.assign(new Error(payload.message || payload.error || res.statusText), { status: res.status });
   return payload;
 }
 
 /* ============ 登录 ============ */
 async function doLogin() {
-  const password = document.getElementById("password-input").value;
+  const input = document.getElementById("password-input");
+  const button = document.getElementById("login-btn");
+  const apiKey = input.value.trim();
   const errBox = document.getElementById("login-error");
   errBox.textContent = "";
+  if (!apiKey) { errBox.textContent = "请输入 API Key"; return; }
+  button.disabled = true;
+  button.textContent = "正在验证并等待首个 Turn…";
   try {
-    const payload = await api("/api/login", { method: "POST", body: JSON.stringify({ password }) });
+    const payload = await api("/api/login", { method: "POST", body: JSON.stringify({ api_key: apiKey }) });
+    input.value = "";
     state.token = payload.token;
-    localStorage.setItem("ah_dash_token", state.token);
+    state.config = payload.config || null;
+    sessionStorage.setItem("ah_dash_token", state.token);
     enterApp();
   } catch (err) {
-    errBox.textContent = err.status === 401 ? "密码错误" : ("登录失败：" + (err.message || err));
+    if (err.status === 401) {
+      errBox.textContent = "API Key 无效、已停用或不属于可用账号";
+    } else {
+      errBox.textContent = "初始化失败：" + (err.message || err);
+    }
+  } finally {
+    button.disabled = false;
+    button.textContent = "验证并启动";
   }
 }
 function logout(msg) {
   state.token = "";
-  localStorage.removeItem("ah_dash_token");
+  sessionStorage.removeItem("ah_dash_token");
   document.getElementById("app").classList.remove("show");
   document.getElementById("login-screen").style.display = "flex";
   document.getElementById("password-input").value = "";
@@ -502,7 +645,6 @@ function enterApp() {
   initCharts();
   refreshConfig();
   refreshStats();
-  refreshTelemetry();
   refreshBattle();
   refreshTrail();
   refreshRoutes();
@@ -510,7 +652,6 @@ function enterApp() {
   // 轮询
   setInterval(refreshConfig, 2000);
   setInterval(refreshStats, 2000);
-  setInterval(refreshTelemetry, 6000);
   setInterval(refreshBattle, 6000);
   setInterval(refreshTrail, 8000);
   setInterval(refreshRoutes, 10000);
@@ -559,48 +700,84 @@ function renderControlPanel() {
   //   3) 输入框当前值 != 上次回填的值（用户改了但还没保存）→ 跳过，保留用户输入。
   // 这彻底修复“数字输不进去 / 点保存前被轮询清空”的竞态。
   state.lastReflected = state.lastReflected || {};
+  // state.userEdited = set of input ids 用户改动过但未保存。保存后清空。
+  state.userEdited = state.userEdited || new Set();
   const reflect = (id, value) => {
     const el = document.getElementById(id);
     if (!el) return;
     if (document.activeElement === el) return; // 用户正在输
-    if (el.value === state.lastReflected[id]) {
-      // 用户没动过这个框，安全回填新值
-      el.value = value;
-      state.lastReflected[id] = String(value);
+    if (state.userEdited.has(id)) return;     // 用户改过未保存，不回弹
+    // 首次回填(lastReflected 未记)或框内值等于上次回填值(用户没动过)→ 安全更新
+    const strVal = String(value);
+    if (state.lastReflected[id] === undefined || el.value === state.lastReflected[id]) {
+      el.value = strVal;
+      state.lastReflected[id] = strVal;
     }
     // 否则保留用户输入
+  };
+  // 开关与文本框同病：2s 轮询会拿后端旧值直接 .checked= 回弹用户刚拨的开关。
+  // 复选框没有“正在编辑”的 focus 态，改用 localToggles 记下用户拨过但未保存的开关，
+  // 轮询时跳过它们；saveConfig 后清空（已落盘，恢复跟随后端）。
+  const reflectCheck = (id, value) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (state.localToggles.has(id)) return; // 用户已拨动，未保存前不回弹
+    el.checked = !!value;
   };
   const setText2 = (id, value) => {
     const el = document.getElementById(id);
     if (el) el.textContent = value; // 文本展示不涉及用户编辑，直接更新
   };
-  // 巡逻半径
+  // 恒星轨道半径
   const orbit = c.core_orbit_radius || 0;
   reflect("orbit-input", orbit);
   reflect("orbit-slider", orbit);
-  document.getElementById("orbit-val").textContent = orbit > 0 ? String(orbit) : "0 (自动)";
-  // 方环
-  if (Array.isArray(c.lightning_ring) && c.lightning_ring.length === 2) {
-    reflect("ring-inner", c.lightning_ring[0]);
-    reflect("ring-outer", c.lightning_ring[1]);
-    setText2("ring-inner-val", c.lightning_ring[0]);
-    setText2("ring-outer-val", c.lightning_ring[1]);
-  }
+  document.getElementById("orbit-val").textContent = orbit > 0 ? String(orbit) : "0 (未设置)";
+  // 运行时生效值（Core 到达用户目标后会 auto 设 hold=true + 清 target 并写回控制文件，
+  // 但 effective 反映更及时）。
+  const eff = (c.effective || {});
+  const effHold = (eff.core_hold !== undefined) ? eff.core_hold : c.core_hold;
+  const effTarget = (eff.core_target !== undefined) ? eff.core_target : c.core_target;
   // 驻扎
-  document.getElementById("core-hold").checked = !!c.core_hold;
+  reflectCheck("core-hold", effHold);
+  // 退避三舍 / 趁胜追击 / 御驾亲征：effective 优先（热加载后更及时），回退 control 文件值。
+  const effEvade = (eff.core_evade_enemies !== undefined) ? eff.core_evade_enemies : c.core_evade_enemies;
+  const effChase = (eff.core_chase_enemies !== undefined) ? eff.core_chase_enemies : c.core_chase_enemies;
+  const effPursue = (eff.core_pursue_beacon !== undefined) ? eff.core_pursue_beacon : c.core_pursue_beacon;
+  reflectCheck("core-evade", effEvade);
+  reflectCheck("core-chase", effChase);
+  reflectCheck("core-pursue-beacon", effPursue);
   // 目标
-  if (c.core_target && Array.isArray(c.core_target)) {
-    reflect("target-x", c.core_target[0]);
-    reflect("target-y", c.core_target[1]);
-    const eff = (c.effective || {});
+  const targetXEl = document.getElementById("target-x");
+  const targetYEl = document.getElementById("target-y");
+  const targetSetBtn = document.getElementById("target-set");
+  const targetClearBtn = document.getElementById("target-clear");
+  // 御驾亲征开启时禁用手设目标输入（信标动态跟随，手设坐标无效）。
+  const pursueActive = !!(effPursue || c.core_pursue_beacon);
+  [targetXEl, targetYEl].forEach((el) => { el.disabled = pursueActive; });
+  if (targetSetBtn) targetSetBtn.disabled = pursueActive;
+  if (targetClearBtn) targetClearBtn.disabled = pursueActive;
+  if (pursueActive) {
+    const s = state.stats;
+    const beaconPos = s && s.beacon_position ? s.beacon_position : null;
+    const tsEl = document.getElementById("target-status");
+    tsEl.textContent = beaconPos
+      ? `御驾亲征 · 信标 ${beaconPos[0]},${beaconPos[1]}`
+      : "御驾亲征 · 跟随信标";
+    tsEl.style.color = "var(--accent)";
+    reflect("target-x", "");
+    reflect("target-y", "");
+  } else if (effTarget && Array.isArray(effTarget)) {
+    reflect("target-x", effTarget[0]);
+    reflect("target-y", effTarget[1]);
     const s = state.stats;
     let arrived = false;
     if (s && s.core_position && Array.isArray(s.core_position)) {
-      arrived = manhattan(s.core_position, c.core_target) <= 8;
+      arrived = manhattan(s.core_position, effTarget) <= 8;
     }
     const tsEl = document.getElementById("target-status");
     tsEl.textContent =
-      `已设 ${c.core_target[0]},${c.core_target[1]}${arrived ? "（已到达）" : ""}`;
+      `已设 ${effTarget[0]},${effTarget[1]}${arrived ? "（已到达）" : ""}`;
     tsEl.style.color = arrived ? "var(--good)" : "";
   } else {
     reflect("target-x", "");
@@ -624,40 +801,51 @@ function renderControlPanel() {
   }[curMode] || "";
   document.getElementById("transfer-desc").textContent = desc;
   // 造兵
-  renderQueue(c.build_queue || []);
+  // 用户在队列编辑器里加行/改类型/改数量/删/排序而未保存时，轮询不得用后端旧
+  // build_queue 调 renderQueue 清空——否则“加了行一会儿就消失”。保存后清 dirty。
+  if (!state.localQueueDirty) {
+    renderQueue(c.build_queue || []);
+  }
   const ratio = c.spawn_ratio || {};
-  reflect("ratio-ranger", ratio.ranger ?? 3);
-  reflect("ratio-worker", ratio.worker ?? 1);
+  reflect("ratio-ranger", ratio.ranger ?? 1);
+  reflect("ratio-vanguard", ratio.vanguard ?? 1);
+  reflect("ratio-worker", ratio.worker ?? 3);
   const caps = c.unit_caps || {};
-  reflect("cap-worker", caps.worker ?? 0);
+  reflect("cap-worker", caps.worker ?? 20);
   reflect("cap-ranger", caps.ranger ?? 0);
   reflect("cap-vanguard", caps.vanguard ?? 0);
+  // 补兵阈值
+  const thr = c.replenish_threshold || {};
+  reflect("threshold-ranger", thr.ranger ?? 0);
+  reflect("threshold-vanguard", thr.vanguard ?? 0);
+  reflect("threshold-worker", thr.worker ?? 0);
+  // 补兵优先级（三个下拉互斥回填）
+  reflectPriority(c.replenish_priority || ["ranger", "worker", "vanguard"]);
   // 存底
   const reserve = c.wartime_reserve ?? 150;
   reflect("reserve-input", reserve);
   reflect("reserve-slider", reserve);
   setText2("reserve-val", reserve);
-  // 高级
-  document.getElementById("adv-recall").checked = !!c.recall;
-  document.getElementById("adv-raid").checked = !!c.raid_enabled;
-  reflect("adv-raid-vg", c.raid_vanguards ?? 1);
-  reflect("adv-raid-rk", c.raid_rangers ?? 2);
-  reflect("adv-beacon-dist", c.beacon_target_distance ?? 0);
-  if (c.rally_point && Array.isArray(c.rally_point)) {
-    reflect("adv-rally-x", c.rally_point[0]);
-    reflect("adv-rally-y", c.rally_point[1]);
-  } else {
-    reflect("adv-rally-x", "");
-    reflect("adv-rally-y", "");
+  // 哈雷彗星
+  reflectCheck("adv-comet", c.comet_active);
+  // 模式下拉同开关病：2s 轮询直接 .value= 会回弹用户刚选的模式。
+  if (!state.localToggles.has("adv-comet-mode")) {
+    const cometMode = c.comet_mode === "coordinate" ? "coordinate" : "beacon";
+    document.getElementById("adv-comet-mode").value = cometMode;
   }
-  if (c.migration_candidate && Array.isArray(c.migration_candidate)) {
-    reflect("adv-migrate-x", c.migration_candidate[0]);
-    reflect("adv-migrate-y", c.migration_candidate[1]);
+  if (c.comet_target && Array.isArray(c.comet_target)) {
+    reflect("adv-comet-x", c.comet_target[0]);
+    reflect("adv-comet-y", c.comet_target[1]);
   } else {
-    reflect("adv-migrate-x", "");
-    reflect("adv-migrate-y", "");
+    reflect("adv-comet-x", "");
+    reflect("adv-comet-y", "");
   }
-  document.getElementById("adv-auto-migrate").checked = !!c.auto_migrate;
+  reflect("adv-comet-vg", c.comet_vanguards ?? 3);
+  reflect("adv-comet-rk", c.comet_rangers ?? 3);
+  reflect("adv-comet-rsv-vg", c.comet_min_reserve_vanguards ?? 3);
+  reflect("adv-comet-rsv-rk", c.comet_min_reserve_rangers ?? 3);
+  reflectCheck("adv-comet-rally", c.comet_rally_enabled);
+  reflect("adv-comet-rally-dist", c.comet_rally_distance ?? 0);
 }
 
 /* ---- 造兵队列编辑器：行 = {type, qty}，序列化展开成扁平列表 ---- */
@@ -689,13 +877,13 @@ function drawQueue() {
       if (row.type === t) opt.selected = true;
       sel.appendChild(opt);
     }
-    sel.addEventListener("change", () => { queueRows[idx].type = sel.value; });
+    sel.addEventListener("change", () => { queueRows[idx].type = sel.value; state.localQueueDirty = true; });
     const qty = document.createElement("input");
     qty.type = "number"; qty.min = "1"; qty.value = row.qty;
-    qty.addEventListener("input", () => { queueRows[idx].qty = Math.max(1, parseInt(qty.value, 10) || 1); });
-    const up = mkMini("↑", () => { swap(idx, idx - 1); });
-    const down = mkMini("↓", () => { swap(idx, idx + 1); });
-    const del = mkMini("✕", () => { queueRows.splice(idx, 1); drawQueue(); });
+    qty.addEventListener("input", () => { queueRows[idx].qty = Math.max(1, parseInt(qty.value, 10) || 1); state.localQueueDirty = true; });
+    const up = mkMini("↑", () => { swap(idx, idx - 1); state.localQueueDirty = true; });
+    const down = mkMini("↓", () => { swap(idx, idx + 1); state.localQueueDirty = true; });
+    const del = mkMini("✕", () => { queueRows.splice(idx, 1); state.localQueueDirty = true; drawQueue(); });
     div.append(sel, qty, up, down, del);
     box.appendChild(div);
   });
@@ -716,27 +904,92 @@ function queueFlat() {
   return flat;
 }
 
+/* ---- 补兵优先级三选（互斥下拉） ---- */
+const PRIORITY_OPTIONS = [
+  { v: "ranger", label: "游侠" },
+  { v: "vanguard", label: "先锋" },
+  { v: "worker", label: "工人" },
+];
+function initPrioritySelects() {
+  for (const idx of [1, 2, 3]) {
+    const sel = document.getElementById(`priority-${idx}`);
+    if (!sel || sel.options.length) continue;
+    for (const opt of PRIORITY_OPTIONS) {
+      const o = document.createElement("option");
+      o.value = opt.v; o.textContent = opt.label;
+      sel.appendChild(o);
+    }
+    sel.addEventListener("change", () => {
+      enforcePriorityUniqueness(idx);
+      state.localToggles.add(`priority-${idx}`); // 用户改过，未保存前轮询不回弹
+      // enforcePriorityUniqueness 可能联动改了其他下拉，一并标记
+      for (const other of [1, 2, 3]) {
+        if (other !== idx) state.localToggles.add(`priority-${other}`);
+      }
+    });
+  }
+}
+function enforcePriorityUniqueness(changedIdx) {
+  // 保证三个下拉互不相同：与"已改变"的那个冲突的另一处，自动换成原值。
+  const changed = document.getElementById(`priority-${changedIdx}`);
+  const changedVal = changed.value;
+  for (const other of [1, 2, 3]) {
+    if (other === changedIdx) continue;
+    const oSel = document.getElementById(`priority-${other}`);
+    if (oSel.value === changedVal) {
+      // 找一个尚未被占用的值填回去
+      const used = new Set([1, 2, 3].filter(i => i !== other).map(i => document.getElementById(`priority-${i}`).value));
+      const free = PRIORITY_OPTIONS.find(o => !used.has(o.v));
+      if (free) oSel.value = free.v;
+    }
+  }
+}
+function reflectPriority(priority) {
+  // 用户改过任一优先级下拉但未保存时，轮询不得回弹（与开关/队列同病：2s 用后端旧值覆盖）。
+  const touched = [1, 2, 3].some((i) => state.localToggles.has(`priority-${i}`));
+  if (touched) {
+    initPrioritySelects(); // 仍确保 option 列表已填充，但不覆盖用户选择
+    return;
+  }
+  initPrioritySelects();
+  const seq = (priority && priority.length === 3)
+    ? priority.slice(0, 3)
+    : ["ranger", "worker", "vanguard"];
+  for (let i = 0; i < 3; i++) {
+    const sel = document.getElementById(`priority-${i + 1}`);
+    if (sel) sel.value = seq[i];
+  }
+}
+
 /* ---- 保存 ---- */
 function collectConfig() {
   const c = state.config || {};
   const payload = {};
   const orbit = Math.max(0, parseInt(document.getElementById("orbit-input").value, 10) || 0);
   payload.core_orbit_radius = orbit;
-  const inner = Math.max(1, parseInt(document.getElementById("ring-inner").value, 10) || 400);
-  const outer = Math.max(inner, parseInt(document.getElementById("ring-outer").value, 10) || 600);
-  payload.lightning_ring = [inner, outer];
   payload.core_hold = document.getElementById("core-hold").checked;
-  const tx = document.getElementById("target-x").value.trim();
-  const ty = document.getElementById("target-y").value.trim();
-  if (tx !== "" && ty !== "") {
-    payload.core_target = [parseInt(tx, 10), parseInt(ty, 10)];
-  } else {
+  const pursueBeacon = document.getElementById("core-pursue-beacon").checked;
+  // 御驾亲征开启时 core_target 由策略每 tick 动态指向信标，前端不写死坐标：
+  // 清掉持久化 target，避免遗留旧目标在关闭御驾亲征后复活。
+  if (pursueBeacon) {
     payload.core_target = null;
+  } else {
+    const tx = document.getElementById("target-x").value.trim();
+    const ty = document.getElementById("target-y").value.trim();
+    if (tx !== "" && ty !== "") {
+      payload.core_target = [parseInt(tx, 10), parseInt(ty, 10)];
+    } else {
+      payload.core_target = null;
+    }
   }
   payload.core_transfer_mode = document.querySelector("#transfer-seg button.active")?.dataset.mode || "star";
+  payload.core_evade_enemies = document.getElementById("core-evade").checked;
+  payload.core_chase_enemies = document.getElementById("core-chase").checked;
+  payload.core_pursue_beacon = pursueBeacon;
   payload.build_queue = queueFlat();
   payload.spawn_ratio = {
     ranger: Math.max(0, parseInt(document.getElementById("ratio-ranger").value, 10) || 0),
+    vanguard: Math.max(0, parseInt(document.getElementById("ratio-vanguard").value, 10) || 0),
     worker: Math.max(0, parseInt(document.getElementById("ratio-worker").value, 10) || 0),
   };
   payload.unit_caps = {
@@ -744,20 +997,38 @@ function collectConfig() {
     ranger: Math.max(0, parseInt(document.getElementById("cap-ranger").value, 10) || 0),
     vanguard: Math.max(0, parseInt(document.getElementById("cap-vanguard").value, 10) || 0),
   };
+  payload.replenish_threshold = {
+    ranger: Math.max(0, parseInt(document.getElementById("threshold-ranger").value, 10) || 0),
+    vanguard: Math.max(0, parseInt(document.getElementById("threshold-vanguard").value, 10) || 0),
+    worker: Math.max(0, parseInt(document.getElementById("threshold-worker").value, 10) || 0),
+  };
+  // 补兵优先级：保证三个下拉互不相同（collectConfig 兜底，防用户绕过校验）
+  initPrioritySelects();
+  const priorityVals = [1, 2, 3].map(i => document.getElementById(`priority-${i}`).value);
+  const seen = new Set();
+  for (let i = 0; i < priorityVals.length; i++) {
+    if (seen.has(priorityVals[i])) {
+      // 冲突：找未使用的值替换
+      const free = PRIORITY_OPTIONS.find(o => !seen.has(o.v) && !priorityVals.includes(o.v));
+      if (free) priorityVals[i] = free.v;
+    }
+    seen.add(priorityVals[i]);
+  }
+  payload.replenish_priority = priorityVals;
   payload.wartime_reserve = Math.max(0, parseInt(document.getElementById("reserve-input").value, 10) || 0);
-  // 高级
-  payload.recall = document.getElementById("adv-recall").checked;
-  payload.raid_enabled = document.getElementById("adv-raid").checked;
-  payload.raid_vanguards = Math.max(0, parseInt(document.getElementById("adv-raid-vg").value, 10) || 0);
-  payload.raid_rangers = Math.max(0, parseInt(document.getElementById("adv-raid-rk").value, 10) || 0);
-  payload.beacon_target_distance = Math.max(0, parseInt(document.getElementById("adv-beacon-dist").value, 10) || 0);
-  const rlx = document.getElementById("adv-rally-x").value.trim();
-  const rly = document.getElementById("adv-rally-y").value.trim();
-  payload.rally_point = (rlx !== "" && rly !== "") ? [parseInt(rlx, 10), parseInt(rly, 10)] : null;
-  const mgx = document.getElementById("adv-migrate-x").value.trim();
-  const mgy = document.getElementById("adv-migrate-y").value.trim();
-  payload.migration_candidate = (mgx !== "" && mgy !== "") ? [parseInt(mgx, 10), parseInt(mgy, 10)] : null;
-  payload.auto_migrate = document.getElementById("adv-auto-migrate").checked;
+  // 哈雷彗星
+  payload.comet_active = document.getElementById("adv-comet").checked;
+  const cometModeSel = document.getElementById("adv-comet-mode");
+  payload.comet_mode = cometModeSel.value === "coordinate" ? "coordinate" : "beacon";
+  const cmx = document.getElementById("adv-comet-x").value.trim();
+  const cmy = document.getElementById("adv-comet-y").value.trim();
+  payload.comet_target = (cmx !== "" && cmy !== "") ? [parseInt(cmx, 10), parseInt(cmy, 10)] : null;
+  payload.comet_vanguards = Math.max(0, parseInt(document.getElementById("adv-comet-vg").value, 10) || 0);
+  payload.comet_rangers = Math.max(0, parseInt(document.getElementById("adv-comet-rk").value, 10) || 0);
+  payload.comet_min_reserve_vanguards = Math.max(0, parseInt(document.getElementById("adv-comet-rsv-vg").value, 10) || 0);
+  payload.comet_min_reserve_rangers = Math.max(0, parseInt(document.getElementById("adv-comet-rsv-rk").value, 10) || 0);
+  payload.comet_rally_enabled = document.getElementById("adv-comet-rally").checked;
+  payload.comet_rally_distance = Math.max(0, parseInt(document.getElementById("adv-comet-rally-dist").value, 10) || 0);
   return payload;
 }
 
@@ -766,6 +1037,10 @@ async function saveConfig() {
   try {
     await api("/api/config", { method: "POST", body: JSON.stringify(payload) });
     state.localTransferMode = null; // 已落盘，恢复跟随后端
+    state.localToggles.clear(); // 已落盘，开关恢复跟随后端
+    state.localQueueDirty = false; // 已落盘，队列编辑器恢复跟随后端
+    state.userEdited = state.userEdited || new Set();
+    state.userEdited.clear(); // 已落盘，数值输入恢复跟随后端
     state.lastReflected = {}; // 保存后所有输入框视为“已同步”，允许下一轮回填
     toast("已保存，代理将在下一 tick 生效 ✓");
     refreshConfig();
@@ -781,14 +1056,6 @@ async function refreshStats() {
     renderTopbar();
     renderKpis();
     drawMap();
-  } catch (err) {}
-}
-async function refreshTelemetry() {
-  try {
-    const payload = await api("/api/telemetry?limit=" + state.chartRange);
-    state.telemetry = payload.rows || [];
-    renderDecisionLog();
-    drawCharts();
   } catch (err) {}
 }
 async function refreshBattle() {
@@ -823,6 +1090,7 @@ async function refreshEvents() {
   try {
     const payload = await api("/api/events?limit=120");
     const entries = payload.entries || [];
+    state.lastEvents = entries;
     // load_logs 返回按 tick 升序（旧在前，新在末尾）。
     const latest = entries.length ? entries[entries.length - 1] : null;
     if (latest) {
@@ -843,10 +1111,6 @@ function renderKpis() {
   const s = state.stats;
   if (!s) return;
   setText2("kpi-core-kill", s.enemy_cores_destroyed ?? 0);
-  const shotsHit = s.shots_hit ?? 0;
-  const shotsFired = s.shots_fired ?? 0;
-  const hitRate = shotsFired > 0 ? Math.round((shotsHit / shotsFired) * 100) + "%" : "—";
-  setText2("kpi-hr", hitRate);
   const unitsLost = s.units_lost ?? 0;
   const unitsBuilt = s.units_built ?? 0;
   const survived = unitsBuilt + unitsLost > 0 ? Math.round((unitsBuilt / (unitsBuilt + unitsLost)) * 100) + "%" : "—";
@@ -868,13 +1132,15 @@ let chartsReady = false;
 function initCharts() {
   // #app 刚 display:block 时布局可能未完成，等下一帧再 init，确保容器有尺寸。
   requestAnimationFrame(() => {
-    charts.kills = echarts.init(document.getElementById("chart-kills"));
-    charts.losses = echarts.init(document.getElementById("chart-losses"));
-    charts.hitrate = echarts.init(document.getElementById("chart-hitrate"));
-    charts.pop = echarts.init(document.getElementById("chart-pop"));
+    charts.killsHour = echarts.init(document.getElementById("chart-kills-hour"));
+    charts.lossesHour = echarts.init(document.getElementById("chart-losses-hour"));
+    charts.killsDay = echarts.init(document.getElementById("chart-kills-day"));
+    charts.lossesDay = echarts.init(document.getElementById("chart-losses-day"));
+    charts.map = echarts.init(document.getElementById("map"));
     chartsReady = true;
     Object.values(charts).forEach((c) => { try { c.resize(); } catch (e) {} });
     drawCharts();
+    drawMap();
   });
   window.addEventListener("resize", () => {
     if (!chartsReady) return;
@@ -882,292 +1148,424 @@ function initCharts() {
   });
 }
 
-function chartSeries(kind, rows) {
-  if (!rows.length) return { x: [], series: [] };
-  const x = rows.map((r) => r.tick);
-  const defs = {
-    kills: [
-      { key: "enemy_ranger", name: "敌游侠", color: TYPE_COLOR.RANGER },
-      { key: "enemy_vanguard", name: "敌先锋", color: TYPE_COLOR.VANGUARD },
-      { key: "enemy_worker", name: "敌工人", color: TYPE_COLOR.WORKER },
-      { key: "enemy_core", name: "敌核", color: TYPE_COLOR.CORE },
-      { key: "enemy_unknown", name: "其他", color: TYPE_COLOR.UNKNOWN },
-    ],
-    losses: [
-      { key: "worker", name: "工人", color: TYPE_COLOR.WORKER },
-      { key: "ranger", name: "游侠", color: TYPE_COLOR.RANGER },
-      { key: "vanguard", name: "先锋", color: TYPE_COLOR.VANGUARD },
-    ],
-  };
-  const series = defs[kind].map((def) => {
-    let cum = 0;
-    const bucketKey = kind; // "kills" 或 "losses"
-    const data = rows.map((r) => {
-      cum += (r[bucketKey] || {})[def.key] || 0;
-      return cum;
-    });
-    return { name: def.name, type: "line", showSymbol: false, smooth: true,
-      lineStyle: { width: 2 }, itemStyle: { color: def.color }, data };
-  });
-  return { x, series };
+/* ============ 轨道几何（前端复刻 arena_hero_strategy 公式）============ */
+const ORBIT_NEAR_RADIUS = 5;        // LIGHTNING_NEAR_ORBIT_RADIUS（先锋近行星轨道）
+const ORBIT_LANE_GAP = { RANGER: 5, WORKER: 3, VANGUARD: 4 }; // 各 role 视野/间距
+const ORBIT_MIN_PER = 3;            // LIGHTNING_MIN_UNITS_PER_ORBIT
+const ORBIT_IDEAL = { RANGER: 10, WORKER: 6, VANGUARD: 8 };
+
+/** 电子排布风格轨道分配：层容量 2n，循环队列填充。返回 [{radius, count}]。 */
+function orbitDistribution(total, innerRadius, gap) {
+  if (total <= 0) return [];
+  let maxLayers = 1;
+  while (maxLayers * (maxLayers + 1) < total) maxLayers += 1;
+  maxLayers = Math.min(maxLayers + 1, 20);
+  const layers = [];
+  for (let n = 1; n <= maxLayers; n++) {
+    layers.push({ idx: n - 1, radius: innerRadius + (n - 1) * gap, capacity: 2 * n, count: 0 });
+  }
+  let active = layers.slice(0, Math.min(3, layers.length)).map((l) => l.idx);
+  let remaining = total;
+  while (remaining > 0 && active.length) {
+    for (const i of active.slice()) {
+      if (remaining <= 0) break;
+      const layer = layers[i];
+      layer.count += 1;
+      remaining -= 1;
+      if (layer.count >= layer.capacity) {
+        active = active.filter((x) => x !== i);
+        const maxActive = active.length ? Math.max(...active) : layers.filter((l) => l.count > 0).length - 1;
+        const nextIdx = maxActive + 1;
+        if (nextIdx < layers.length && remaining > 0) active.push(nextIdx);
+      }
+    }
+  }
+  return layers.filter((l) => l.count > 0).map((l) => ({ radius: l.radius, count: l.count }));
 }
 
-function chartBase(xData, series) {
+/** 同半径 N 个单位铺 M=max(4, next_pow2(N)) 个均匀点位。 */
+function orbitWaypointCount(n) {
+  if (n < 1) return 0;
+  let m = 4;
+  while (m < n) m <<= 1;
+  return m;
+}
+
+/** 方形周界上 count 个均匀点位（index 0 在右下角，逆时针）。center=[cx,cy]。 */
+function ringWaypoints(center, radius, count) {
+  if (count <= 0 || radius < 1) return [];
+  const [cx, cy] = center;
+  const r = Math.max(1, radius);
+  const perimeter = 8 * r;
+  const pts = [];
+  for (let k = 0; k < count; k++) {
+    const arc = (k * perimeter / count) | 0;
+    if (arc < 2 * r) pts.push([cx + r, cy + r - arc]);
+    else if (arc < 4 * r) pts.push([cx + r - (arc - 2 * r), cy - r]);
+    else if (arc < 6 * r) pts.push([cx - r, cy - r + (arc - 4 * r)]);
+    else pts.push([cx - r + (arc - 6 * r), cy + r]);
+  }
+  return pts;
+}
+
+/** 计算所有预设轨道：先锋近轨 + 游侠/工人中轨。只有分配了单位的轨道才返回。 */
+function computeOrbits(stats, corePos) {
+  const center = corePos || [0, 0];
+  const result = [];
+  const vanguardN = stats ? (stats.vanguards || 0) : 0;
+  const rangerN = stats ? (stats.rangers || 0) : 0;
+  const workerN = stats ? (stats.workers || 0) : 0;
+  // 先锋近行星轨道
+  if (vanguardN > 0) {
+    const m = orbitWaypointCount(vanguardN);
+    result.push({ kind: "vanguard", radius: ORBIT_NEAR_RADIUS, count: vanguardN, waypoints: ringWaypoints(center, ORBIT_NEAR_RADIUS, m) });
+  }
+  // 游侠+工人共享中行星轨道
+  const total = rangerN + workerN;
+  if (total > 0) {
+    const gap = ORBIT_LANE_GAP.RANGER;
+    const innerRadius = ORBIT_NEAR_RADIUS + gap;
+    const dist = orbitDistribution(total, innerRadius, gap);
+    for (const layer of dist) {
+      const m = orbitWaypointCount(layer.count);
+      result.push({ kind: "shared", radius: layer.radius, count: layer.count, waypoints: ringWaypoints(center, layer.radius, m) });
+    }
+  }
+  return result;
+}
+
+/** 恒星轨道（Core 巡逻）：半径 r，4 个角。r>0 才返回。 */
+function computeStellarOrbit(stats) {
+  const eff = (state.stats && state.stats.effective_control) || {};
+  const pr = eff.core_orbit_radius || (state.config && state.config.core_orbit_radius) || 0;
+  if (!pr || pr <= 0) return null;
+  return { radius: pr, corners: [[pr, pr], [pr, -pr], [-pr, -pr], [-pr, pr]] };
+}
+
+/* ============ 战况柱状图 ============ */
+const KILL_DEFS = [
+  { key: "enemy_ranger", name: "敌游侠", color: TYPE_COLOR.RANGER },
+  { key: "enemy_vanguard", name: "敌先锋", color: TYPE_COLOR.VANGUARD },
+  { key: "enemy_worker", name: "敌工人", color: TYPE_COLOR.WORKER },
+  { key: "enemy_core", name: "敌核", color: TYPE_COLOR.CORE },
+  { key: "enemy_unknown", name: "其他", color: TYPE_COLOR.UNKNOWN },
+];
+const LOSS_DEFS = [
+  { key: "worker", name: "工人", color: TYPE_COLOR.WORKER },
+  { key: "ranger", name: "游侠", color: TYPE_COLOR.RANGER },
+  { key: "vanguard", name: "先锋", color: TYPE_COLOR.VANGUARD },
+];
+
+function bucketKey(ts, mode) {
+  const d = new Date(ts * 1000);
+  if (isNaN(d.getTime())) return null;
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  return mode === "hour" ? `${m}-${day} ${hh}:00` : `${y}-${m}-${day}`;
+}
+
+/** 把战况行聚合到时间桶。返回 { labels: [...], series: [...] }。 */
+function aggregateBattle(mode, defs, bucket) {
+  const order = [];
+  const orderSet = new Set();
+  const sums = {};
+  for (const def of defs) sums[def.key] = {};
+  for (const row of state.battle) {
+    const ts = row.ts;
+    if (typeof ts !== "number") continue;
+    const key = bucketKey(ts, mode);
+    if (!key) continue;
+    if (!orderSet.has(key)) { orderSet.add(key); order.push(key); }
+    for (const def of defs) {
+      const v = (row[bucket] || {})[def.key] || 0;
+      sums[def.key][key] = (sums[def.key][key] || 0) + v;
+    }
+  }
+  order.sort((a, b) => {
+    // hour 桶 "MM-DD HH:00"（长度 11）补年份后比较；day 桶 "YYYY-MM-DD" 直接比较
+    const ta = Date.parse(a.length === 11 ? "2026-" + a : a);
+    const tb = Date.parse(b.length === 11 ? "2026-" + b : b);
+    return (ta || 0) - (tb || 0);
+  });
+  const series = defs.map((def) => ({
+    name: def.name, type: "bar", stack: "total",
+    itemStyle: { color: def.color },
+    emphasis: { focus: "series" },
+    data: order.map((k) => sums[def.key][k] || 0),
+  }));
+  return { labels: order, series };
+}
+
+function barChartOption(labels, series, yName) {
   return {
     backgroundColor: "transparent",
-    grid: { left: 46, right: 16, top: 28, bottom: 26 },
-    legend: { textStyle: { color: "#c3c2b7" }, top: 0, left: 0 },
-    tooltip: { trigger: "axis", backgroundColor: "#1a1a19", borderColor: "rgba(255,255,255,0.15)",
+    grid: { left: 48, right: 16, top: 30, bottom: 40 },
+    legend: { textStyle: { color: "#c3c2b7" }, top: 0, left: 0, type: "scroll" },
+    tooltip: { trigger: "axis", axisPointer: { type: "shadow" },
+      backgroundColor: "#1a1a19", borderColor: "rgba(255,255,255,0.15)",
       textStyle: { color: "#fff", fontSize: 12 } },
-    xAxis: { type: "category", data: xData, axisLine: { lineStyle: { color: "#383835" } },
-      axisLabel: { color: "#898781" }, axisTick: { show: false } },
-    yAxis: { type: "value", splitLine: { lineStyle: { color: "#2c2c2a" } },
-      axisLabel: { color: "#898781" } },
+    xAxis: { type: "category", data: labels, axisLine: { lineStyle: { color: "#383835" } },
+      axisLabel: { color: "#898781", rotate: labels.length > 8 ? 35 : 0, fontSize: 10 },
+      axisTick: { show: false } },
+    yAxis: { type: "value", name: yName, nameTextStyle: { color: "#898781" },
+      splitLine: { lineStyle: { color: "#2c2c2a" } }, axisLabel: { color: "#898781" } },
     series,
+    dataZoom: labels.length > 12 ? [{ type: "inside" }, { type: "slider", height: 14, bottom: 6 }] : [],
   };
 }
 
 function drawCharts() {
   if (!chartsReady) return;
-  // 敌方击杀累计
-  const kills = chartSeries("kills", state.battle);
-  charts.kills.setOption(chartBase(kills.x, kills.series), true);
-  // 我方阵亡累计
-  const losses = chartSeries("losses", state.battle);
-  charts.losses.setOption(chartBase(losses.x, losses.series), true);
-  // 命中率滚动窗口（每 tick 命中/总射击，平滑）
-  const hrX = [];
-  const hrData = [];
-  for (const row of state.battle) {
-    const shots = row.shots || {};
-    const total = (shots.hit || 0) + (shots.miss || 0);
-    hrX.push(row.tick);
-    hrData.push(total > 0 ? Math.round((shots.hit / total) * 1000) / 10 : null);
-  }
-  charts.hitrate.setOption(chartBase(hrX, [
-    { name: "命中率 %", type: "line", showSymbol: false, data: hrData,
-      lineStyle: { width: 2, color: "#3987e5" }, itemStyle: { color: "#3987e5" },
-      connectNulls: true, markLine: { silent: true, symbol: "none",
-        lineStyle: { color: "#383835" }, data: [{ yAxis: 50 }] } },
-  ]), true);
-  // 人口与编成（telemetry 只有 population/resources/visible_enemies，无兵种时序）
-  const t = state.telemetry;
-  const popX = t.map((r) => r.tick);
-  const mkSeries = (name, key, color) => ({
-    name, type: "line", showSymbol: false, smooth: true,
-    lineStyle: { width: 2 }, itemStyle: { color },
-    data: t.map((r) => (typeof r[key] === "number" ? r[key] : null)),
-  });
-  charts.pop.setOption(chartBase(popX, [
-    mkSeries("总人口", "population", "#ffffff"),
-    mkSeries("可见敌人", "visible_enemies", TYPE_COLOR.CORE),
-    mkSeries("资源", "resources", "#4ade80"),
-  ]), true);
-  // 布局完成后强制 resize，避免容器 0 宽导致图表不显示。
+  const kh = aggregateBattle("hour", KILL_DEFS, "kills");
+  charts.killsHour.setOption(barChartOption(kh.labels, kh.series, "击杀"), true);
+  const lh = aggregateBattle("hour", LOSS_DEFS, "losses");
+  charts.lossesHour.setOption(barChartOption(lh.labels, lh.series, "阵亡"), true);
+  const kd = aggregateBattle("day", KILL_DEFS, "kills");
+  charts.killsDay.setOption(barChartOption(kd.labels, kd.series, "击杀"), true);
+  const ld = aggregateBattle("day", LOSS_DEFS, "losses");
+  charts.lossesDay.setOption(barChartOption(ld.labels, ld.series, "阵亡"), true);
   Object.values(charts).forEach((c) => { try { c.resize(); } catch (e) {} });
 }
 
-/* ============ 地图 ============ */
-const mapView = { cx: 500, cy: -200, scale: 4 };
-let drag = null;
+/* ============ ArenaHero 宇宙地图（echarts custom + line）============ */
+const MAP_SCALE = 4; // 视图缩放：世界坐标 → echarts 数据坐标
 function setupMap() {
-  const canvas = document.getElementById("map");
-  canvas.addEventListener("wheel", (ev) => {
-    ev.preventDefault();
-    const factor = ev.deltaY < 0 ? 1.15 : 1 / 1.15;
-    const rect = canvas.getBoundingClientRect();
-    const px = ev.clientX - rect.left, py = ev.clientY - rect.top;
-    const wx = mapView.cx + (px - rect.width / 2) / mapView.scale;
-    const wy = mapView.cy + (py - rect.height / 2) / mapView.scale;
-    mapView.scale = Math.max(0.5, Math.min(60, mapView.scale * factor));
-    mapView.cx = wx - (px - rect.width / 2) / mapView.scale;
-    mapView.cy = wy - (py - rect.height / 2) / mapView.scale;
-    drawMap();
-  }, { passive: false });
-  canvas.addEventListener("mousedown", (ev) => {
-    drag = { x: ev.clientX, y: ev.clientY, moved: false };
-  });
-  window.addEventListener("mousemove", (ev) => {
-    if (!drag) return;
-    const dx = ev.clientX - drag.x, dy = ev.clientY - drag.y;
-    if (Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
-    if (drag.moved) {
-      mapView.cx -= dx / mapView.scale;
-      mapView.cy -= dy / mapView.scale;
-      drag.x = ev.clientX; drag.y = ev.clientY;
-      drawMap();
-    }
-  });
-  window.addEventListener("mouseup", (ev) => {
-    if (drag && !drag.moved) { // 视为点击 → 设定目标
-      const rect = canvas.getBoundingClientRect();
-      const wx = Math.round(mapView.cx + (ev.clientX - rect.left - rect.width / 2) / mapView.scale);
-      const wy = Math.round(mapView.cy + (ev.clientY - rect.top - rect.height / 2) / mapView.scale);
-      document.getElementById("target-x").value = wx;
-      document.getElementById("target-y").value = wy;
-      setTarget(wx, wy);
-    }
-    drag = null;
-  });
-  document.getElementById("map-follow").addEventListener("click", () => {
-    state.mapFollow = !state.mapFollow;
-    document.getElementById("map-follow").classList.toggle("active", state.mapFollow);
-    if (state.mapFollow) followCore();
-    drawMap();
-  });
-  document.getElementById("map-reset").addEventListener("click", () => {
-    mapView.scale = 4;
-    followCore();
-    drawMap();
-  });
-  document.getElementById("map-clear-trail").addEventListener("click", () => {
-    state.trail = [];
-    state.trailMaxTick = 0;
-    drawMap();
-  });
-  document.getElementById("map-follow").classList.add("active");
+  const el = document.getElementById("map");
+  // 视图中心：默认跟随 Core，首次若无 stats 用 (500,-200)。
+  state.mapCenter = [500, -200];
+  state.mapFitPending = true; // 首帧自动放大到 Core 周围
+  el.addEventListener("dblclick", () => { /* 预留 */ });
 }
 
-function followCore() {
-  if (state.stats && state.stats.core_position && Array.isArray(state.stats.core_position)) {
-    mapView.cx = state.stats.core_position[0];
-    mapView.cy = state.stats.core_position[1];
+/** 我方单位（含 Core）在世界坐标的包围盒。返回 {minX,minY,maxX,maxY} 或 null。 */
+function ownBBox(s, corePos) {
+  const xs = [], ys = [];
+  if (corePos) { xs.push(corePos[0]); ys.push(corePos[1]); }
+  for (const u of (s && s.units) || []) {
+    if (Array.isArray(u.position)) { xs.push(u.position[0]); ys.push(u.position[1]); }
   }
+  if (!xs.length) return null;
+  return { minX: Math.min(...xs), maxX: Math.max(...xs), minY: Math.min(...ys), maxY: Math.max(...ys) };
 }
 
-function toScreen(wx, wy) {
-  const canvas = document.getElementById("map");
-  const rect = canvas.getBoundingClientRect();
-  return {
-    x: rect.width / 2 + (wx - mapView.cx) * mapView.scale,
-    y: rect.height / 2 + (wy - mapView.cy) * mapView.scale,
-  };
+/** 把 dataZoom 调到给定世界坐标窗口（含留白）。 */
+function fitMapToBBox(bbox) {
+  if (!bbox || !charts.map) return;
+  const padX = Math.max(60, (bbox.maxX - bbox.minX) * 0.25 + 40);
+  const padY = Math.max(60, (bbox.maxY - bbox.minY) * 0.25 + 40);
+  const x0 = bbox.minX - padX, x1 = bbox.maxX + padX;
+  const y0 = bbox.minY - padY, y1 = bbox.maxY + padY;
+  charts.map.setOption({
+    dataZoom: [
+      { type: "inside", xAxisIndex: 0, filterMode: "none", startValue: x0, endValue: x1 },
+      { type: "inside", yAxisIndex: 0, filterMode: "none", startValue: y0, endValue: y1 },
+    ],
+  });
 }
 
 function drawMap() {
-  const canvas = document.getElementById("map");
-  const ctx = canvas.getContext("2d");
-  const rect = canvas.getBoundingClientRect();
-  if (canvas.width !== rect.width) canvas.width = rect.width;
-  if (canvas.height !== rect.height) canvas.height = rect.height;
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  if (state.mapFollow) followCore();
+  if (!chartsReady || !charts.map) return;
+  const s = state.stats;
+  const corePos = (s && Array.isArray(s.core_position)) ? s.core_position : null;
+  // 视图中心跟随 Core（无交互点击设定目标，跟随语义保留）。
+  if (corePos) state.mapCenter = corePos;
 
-  // 网格
-  ctx.strokeStyle = "rgba(255,255,255,0.04)";
-  ctx.lineWidth = 1;
-  const gridStep = 50;
-  const worldLeft = mapView.cx - canvas.width / 2 / mapView.scale;
-  const worldTop = mapView.cy - canvas.height / 2 / mapView.scale;
-  const startX = Math.floor(worldLeft / gridStep) * gridStep;
-  const startY = Math.floor(worldTop / gridStep) * gridStep;
-  for (let gx = startX; gx < worldLeft + canvas.width / mapView.scale; gx += gridStep) {
-    const p = toScreen(gx, worldTop);
-    ctx.beginPath(); ctx.moveTo(p.x, 0); ctx.lineTo(p.x, canvas.height); ctx.stroke();
-  }
-  for (let gy = startY; gy < worldTop + canvas.height / mapView.scale; gy += gridStep) {
-    const p = toScreen(worldLeft, gy);
-    ctx.beginPath(); ctx.moveTo(0, p.y); ctx.lineTo(canvas.width, p.y); ctx.stroke();
-  }
+  const C = MAP_COLORS;
+  const series = [];
+  const axisMin = -1500, axisMax = 1500;
 
-  // 方环（巡逻边界）
-  const ring = state.config && state.config.lightning_ring;
-  if (ring && ring.length === 2) {
-    ctx.strokeStyle = "rgba(57,135,229,0.35)";
-    ctx.setLineDash([6, 4]);
-    strokeSquare(ring[0]);
-    ctx.strokeStyle = "rgba(57,135,229,0.5)";
-    strokeSquare(ring[1]);
-    ctx.setLineDash([]);
-  }
-
-  // Core 轨迹
-  if (state.trailVisible && state.trail.length > 1) {
-    ctx.strokeStyle = "#ffffff";
-    ctx.lineWidth = 1.4;
-    ctx.beginPath();
-    let first = true;
-    for (const row of state.trail) {
-      const p = toScreen(row.pos[0], row.pos[1]);
-      if (p.x < -50 || p.x > canvas.width + 50 || p.y < -50 || p.y > canvas.height + 50) {
-        first = true; continue;
+  // 捕获用户当前 dataZoom 窗口（滚轮/拖拽后的视图），避免轮询重绘把它重置。
+  // 首帧（charts.map 无 option）或 mapFitPending 时跳过，交给下面的 fit 逻辑。
+  let savedZoom = null;
+  if (!state.mapFitPending) {
+    try {
+      const prev = charts.map.getOption().dataZoom;
+      if (prev && prev.length === 2 && prev[0].startValue != null) {
+        savedZoom = prev;
       }
-      if (first) { ctx.moveTo(p.x, p.y); first = false; }
-      else ctx.lineTo(p.x, p.y);
+    } catch (e) {}
+  }
+  const eff = (s && s.effective_control) || {};
+  const cfg = state.config || {};
+  const orbitR = eff.core_orbit_radius || cfg.core_orbit_radius || 0;
+  const coreHold = !!(eff.core_hold ?? cfg.core_hold);
+  const coreTarget = eff.core_target !== undefined ? eff.core_target : cfg.core_target;
+  const coreTargetKind = eff.core_target_kind || cfg.core_target_kind || "user";
+  const cometActive = !!(cfg.comet_active);
+  const cometTarget = (cfg.comet_target && Array.isArray(cfg.comet_target)) ? cfg.comet_target : null;
+
+  // ---- 恒星轨道虚线方环 ----
+  // 规则：r>0 且 非驻扎 → 画虚线。例外：
+  //   ① 驻扎模式(core_hold) → 取消虚线
+  //   ② 换半径迁移中(target_kind=orbit 且 target≠null，Core 正走向新周界角) → 取消虚线
+  // 目标模式(target_kind=user) → 保留虚线（用户要求）
+  const orbitMigrating = coreTargetKind === "orbit" && coreTarget != null;
+  const inStellarOrbit = orbitR > 0 && !coreHold && !orbitMigrating;
+  if (inStellarOrbit) {
+    const corners = [[orbitR, orbitR], [orbitR, -orbitR], [-orbitR, -orbitR], [-orbitR, orbitR]];
+    const ringPts = [...corners, corners[0]]; // 绕原点 (0,0)
+    series.push({
+      name: "恒星轨道", type: "line", coordinateSystem: "cartesian2d",
+      data: ringPts, showSymbol: false, silent: true,
+      lineStyle: { color: C.orbit, width: 1.3, type: "dashed", opacity: 0.7 },
+    });
+  }
+
+  // ---- Core 实走轨迹：黄色实线 ----
+  if (state.trail.length > 1) {
+    const line = state.trail.map((r) => r.pos);
+    series.push({
+      name: "Core 轨迹", type: "line", coordinateSystem: "cartesian2d",
+      data: line, showSymbol: false, silent: true,
+      lineStyle: { color: C.orbit, width: 1.5, opacity: 0.85 },
+    });
+  }
+
+  // ---- 信标：金色点 ----
+  const beaconPos = (s && Array.isArray(s.beacon_position)) ? s.beacon_position : null;
+  if (beaconPos) {
+    series.push({
+      name: "信标", type: "scatter", coordinateSystem: "cartesian2d",
+      data: [{ value: beaconPos }], symbol: "circle", symbolSize: 11, silent: true,
+      itemStyle: { color: C.beacon, borderColor: hexAlpha(C.beacon, 0.4), borderWidth: 2 },
+    });
+  }
+
+  // ---- 我方单位（按兵种分 series，对应颜色）----
+  const ROLE_OF = { RANGER: "ranger", WORKER: "worker", VANGUARD: "vanguard" };
+  const byType = { RANGER: [], WORKER: [], VANGUARD: [] };
+  for (const u of (s && s.units) || []) {
+    if (byType[u.type]) byType[u.type].push({ value: u.position, hp: u.hp, id: u.id });
+  }
+  for (const [t, arr] of Object.entries(byType)) {
+    if (!arr.length) continue;
+    series.push({
+      name: TYPE_LABEL[t] || t, type: "scatter", coordinateSystem: "cartesian2d",
+      data: arr, symbolSize: 9,
+      itemStyle: { color: C[ROLE_OF[t]] }, emphasis: { scale: 1.4 },
+    });
+  }
+
+  // ---- 敌方单位：custom series，内点=对应角色色，外环=红色 ----
+  // type 映射到角色色；CORE 敌核用 enemy 红做内点。
+  const enemies = (s && s.enemy_units) || [];
+  if (enemies.length) {
+    const enemyData = enemies.map((e) => ({
+      value: e.position, hp: e.hp, id: e.id, type: e.type,
+    }));
+    series.push({
+      name: "敌方", type: "custom", coordinateSystem: "cartesian2d",
+      data: enemyData, silent: false,
+      renderItem: (params, api) => {
+        const pt = api.coord(api.value(0), api.value(1));
+        const e = enemies[params.dataIndex] || {};
+        const isCore = e.type === "CORE";
+        const innerColor = isCore ? C.enemy : (C[ROLE_OF[e.type]] || C.enemy);
+        const r = isCore ? 7 : 5;
+        return {
+          type: "group",
+          children: [
+            // 外环红
+            { type: "circle", shape: { cx: pt[0], cy: pt[1], r: r + 3 },
+              style: { fill: "transparent", stroke: C.enemy, lineWidth: 2 } },
+            // 内点角色色
+            { type: "circle", shape: { cx: pt[0], cy: pt[1], r },
+              style: { fill: innerColor } },
+          ],
+        };
+      },
+      tooltip: { show: true },
+      emphasis: { scale: 1.3 },
+      // 让 hover 能命中：保留 z
+      z: 10,
+    });
+  }
+
+  // ---- 我方 Core：绿色点 ----
+  if (corePos) {
+    series.push({
+      name: "Core", type: "scatter", coordinateSystem: "cartesian2d",
+      data: [{ value: corePos, hp: s.core_hp, shield: s.core_shield }], symbolSize: 13,
+      itemStyle: { color: C.core, borderColor: hexAlpha(C.core, 0.5), borderWidth: 2 },
+      emphasis: { scale: 1.2 },
+    });
+  }
+
+  // ---- 目标 / 彗星目标 X：用 custom series 画 cross ----
+  const targets = [];
+  if (coreTarget && Array.isArray(coreTarget) && coreTargetKind === "user") {
+    targets.push({ value: coreTarget, label: "目标" });
+  }
+  if (cometActive && cometTarget) {
+    targets.push({ value: cometTarget, label: "彗星目标" });
+  }
+  if (targets.length) {
+    series.push({
+      name: "目标", type: "custom", coordinateSystem: "cartesian2d",
+      data: targets, silent: true,
+      renderItem: (params, api) => {
+        const pt = api.coord(api.value(0), api.value(1));
+        const s2 = 7; // 半臂长
+        return {
+          type: "group",
+          children: [
+            { type: "line", shape: { x1: pt[0] - s2, y1: pt[1] - s2, x2: pt[0] + s2, y2: pt[1] + s2 },
+              style: { stroke: C.target, lineWidth: 2.5 } },
+            { type: "line", shape: { x1: pt[0] - s2, y1: pt[1] + s2, x2: pt[0] + s2, y2: pt[1] - s2 },
+              style: { stroke: C.target, lineWidth: 2.5 } },
+          ],
+        };
+      },
+      z: 12,
+    });
+  }
+
+  const axisColor = C.axis;
+  charts.map.setOption({
+    backgroundColor: C.background,
+    animation: false,
+    grid: { left: 50, right: 16, top: 16, bottom: 40 },
+    legend: { textStyle: { color: "#c3c2b7" }, top: 6, left: 8, type: "scroll" },
+    tooltip: {
+      backgroundColor: "#1a1a19", borderColor: "rgba(255,255,255,0.15)",
+      textStyle: { color: "#fff", fontSize: 12 },
+      formatter: (p) => {
+        const v = p.value;
+        const name = p.seriesName;
+        const extra = p.data && p.data.hp != null ? `　HP${p.data.hp}` : "";
+        return `${name}<br/>${v[0]}, ${v[1]}${extra}`;
+      },
+    },
+    xAxis: {
+      type: "value", name: "x", min: axisMin, max: axisMax,
+      nameTextStyle: { color: axisColor },
+      axisLine: { lineStyle: { color: axisColor } },
+      axisLabel: { color: axisColor },
+      splitLine: { lineStyle: { color: hexAlpha(axisColor, 0.12) } },
+    },
+    yAxis: {
+      type: "value", name: "y", min: axisMin, max: axisMax,
+      nameTextStyle: { color: axisColor },
+      axisLine: { lineStyle: { color: axisColor } },
+      axisLabel: { color: axisColor },
+      splitLine: { lineStyle: { color: hexAlpha(axisColor, 0.12) } },
+    },
+    series,
+    dataZoom: savedZoom || [
+      { type: "inside", xAxisIndex: 0, filterMode: "none" },
+      { type: "inside", yAxisIndex: 0, filterMode: "none" },
+    ],
+  }, true);
+
+  // 首帧或用户点"回到 Core 周围"：放大到我方单位包围盒。
+  if (state.mapFitPending) {
+    const bbox = ownBBox(s, corePos);
+    if (bbox) {
+      fitMapToBBox(bbox);
+      state.mapFitPending = false;
     }
-    ctx.stroke();
-  }
-
-  // 资源点
-  const resources = state.routes.resources || [];
-  ctx.fillStyle = "#4ade80";
-  for (const [rx, ry] of resources) {
-    const p = toScreen(rx, ry);
-    if (p.x < -10 || p.x > canvas.width + 10 || p.y < -10 || p.y > canvas.height + 10) continue;
-    ctx.fillRect(p.x - 1.5, p.y - 1.5, 3, 3);
-  }
-
-  // 我方单位
-  const units = (state.stats && state.stats.units) || [];
-  for (const u of units) {
-    const p = toScreen(u.position[0], u.position[1]);
-    if (p.x < -10 || p.x > canvas.width + 10 || p.y < -10 || p.y > canvas.height + 10) continue;
-    ctx.beginPath();
-    ctx.fillStyle = TYPE_COLOR[u.type] || "#cccccc";
-    ctx.arc(p.x, p.y, u.type === "VANGUARD" ? 4 : 3, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.strokeStyle = "rgba(0,0,0,0.6)"; ctx.lineWidth = 1; ctx.stroke();
-  }
-
-  // 敌方单位
-  const enemies = (state.stats && state.stats.enemy_units) || [];
-  for (const e of enemies) {
-    const p = toScreen(e.position[0], e.position[1]);
-    if (p.x < -10 || p.x > canvas.width + 10 || p.y < -10 || p.y > canvas.height + 10) continue;
-    ctx.beginPath();
-    ctx.fillStyle = TYPE_COLOR.CORE;
-    const size = e.type === "CORE" ? 6 : 4;
-    ctx.moveTo(p.x, p.y - size); ctx.lineTo(p.x + size, p.y);
-    ctx.lineTo(p.x, p.y + size); ctx.lineTo(p.x - size, p.y); ctx.closePath();
-    ctx.fill();
-    ctx.strokeStyle = "rgba(0,0,0,0.6)"; ctx.lineWidth = 1; ctx.stroke();
-  }
-
-  // 目标标记
-  const target = state.config && state.config.core_target;
-  if (target && Array.isArray(target)) {
-    const p = toScreen(target[0], target[1]);
-    ctx.strokeStyle = "#fab219"; ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.arc(p.x, p.y, 9, 0, Math.PI * 2); ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(p.x - 5, p.y); ctx.lineTo(p.x + 5, p.y);
-    ctx.moveTo(p.x, p.y - 5); ctx.lineTo(p.x, p.y + 5);
-    ctx.stroke();
-  }
-
-  // Core 当前位置
-  if (state.stats && state.stats.core_position && Array.isArray(state.stats.core_position)) {
-    const p = toScreen(state.stats.core_position[0], state.stats.core_position[1]);
-    const s = state.stats;
-    const ring = mapView.scale > 14;
-    ctx.beginPath();
-    ctx.fillStyle = "#ffffff";
-    ctx.arc(p.x, p.y, ring ? 6 : 4, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.strokeStyle = "#3987e5"; ctx.lineWidth = 2; ctx.stroke();
-    if (ring) {
-      ctx.fillStyle = "#3987e5"; ctx.font = "11px system-ui";
-      ctx.fillText(`${s.core_position[0]},${s.core_position[1]}`, p.x + 9, p.y - 7);
-      const hp = s.core_hp ?? 0;
-      ctx.fillStyle = "#c3c2b7"; ctx.font = "10px system-ui";
-      ctx.fillText(`HP${hp}/${s.core_shield ?? 0}`, p.x + 9, p.y + 6);
-    }
-  }
-
-  function strokeSquare(radius) {
-    const a = toScreen(-radius, -radius);
-    const b = toScreen(radius, radius);
-    ctx.strokeRect(a.x, a.y, b.x - a.x, b.y - a.y);
   }
 }
 
@@ -1176,28 +1574,54 @@ async function setTarget(x, y) {
   try {
     await api("/api/config", { method: "POST", body: JSON.stringify({ core_target: [x, y] }) });
     state.lastReflected = {}; // 保存后允许回填新值
+    state.userEdited = state.userEdited || new Set();
+    state.userEdited.delete("target-x");
+    state.userEdited.delete("target-y");
     toast(`目标设为 ${x},${y} ✓`);
     refreshConfig();
   } catch (err) { toast("设目标失败：" + (err.message || err), true); }
 }
 
 /* ============ 日志 ============ */
-function renderDecisionLog() {
-  const box = document.getElementById("decision-log");
-  if (!state.telemetry.length) { box.innerHTML = "<pre>暂无数据</pre>"; return; }
-  const rows = state.telemetry.slice(-40).reverse();
-  const html = rows.map((r) => {
-    const decisions = (r.decisions || []).join(" | ");
-    const accepted = r.accepted === false ? ` <span style='color:var(--crit)'>[rejected ${r.error || ""}]</span>` : "";
-    return `<div class="log-row"><span class="lt">t${r.tick}</span><span class="lm">${esc(decisions || "wait")}${accepted}</span></div>`;
-  }).join("");
-  box.innerHTML = html;
+// 事件分类：从 event_type / actor / target 推断所属角色标签。
+function eventRoleTag(e) {
+  const et = (e.event_type || "").toUpperCase();
+  const actor = String(e.actor || "");
+  const target = String(e.target || "");
+  // 敌情：敌方相关事件
+  if (et.startsWith("ENEMY_") || /敌方/.test(actor) || /敌方/.test(target) ||
+      et === "CORE_DESTROYED" || et === "CORE_DAMAGED" || et === "CORE_ATTACKED") {
+    return "enemy";
+  }
+  // Core 自身
+  if (et.startsWith("CORE_") || actor === "我方 Core" || target === "我方 Core" || actor.includes("Core") || target.includes("Core")) {
+    return "core";
+  }
+  // 工人
+  if (et.startsWith("WORKER_") || et.startsWith("HARVEST_") || et.startsWith("DEPOSIT_") ||
+      actor.includes("工人") || target.includes("工人")) {
+    return "worker";
+  }
+  // 先锋
+  if (actor.includes("先锋") || target.includes("先锋") || et.startsWith("VANGUARD_")) {
+    return "vanguard";
+  }
+  // 游侠
+  if (actor.includes("游侠") || target.includes("游侠") || et.startsWith("RANGER_") || et.startsWith("SHOT_") || et.startsWith("SWEEP_")) {
+    return "ranger";
+  }
+  // 生产/移动/资源/维护等通用事件：归 Core（策略层行为）
+  if (et.startsWith("CORE_SPAWN_") || et === "UPKEEP_PAID") return "core";
+  return "core"; // 兜底
 }
+
 function renderEventLog(entries) {
   const box = document.getElementById("event-log");
-  if (!entries.length) { box.innerHTML = "<pre>暂无事件</pre>"; return; }
+  const tab = state.eventTab;
+  const filtered = entries.filter((e) => tab === "all" || eventRoleTag(e) === tab);
+  if (!filtered.length) { box.innerHTML = "<pre>暂无事件</pre>"; return; }
   // 反转：最新事件显示在顶部。
-  const html = entries.slice().reverse().map((e) => {
+  const html = filtered.slice().reverse().map((e) => {
     const cls = e.level === "danger" ? "danger" : e.level === "warning" ? "warn" : e.level === "success" ? "success" : "";
     return `<div class="log-row ${cls}"><span class="lt">t${e.tick}</span><span class="lm">${esc(e.title)}：${esc(e.message || "")}</span></div>`;
   }).join("");
@@ -1227,9 +1651,10 @@ document.getElementById("logout-btn").addEventListener("click", () => logout());
 document.getElementById("save-btn").addEventListener("click", saveConfig);
 document.getElementById("queue-add").addEventListener("click", () => {
   queueRows.push({ type: "RANGER", qty: 1 });
+  state.localQueueDirty = true;
   drawQueue();
 });
-document.getElementById("queue-clear").addEventListener("click", () => { queueRows = []; drawQueue(); });
+document.getElementById("queue-clear").addEventListener("click", () => { queueRows = []; state.localQueueDirty = true; drawQueue(); });
 document.getElementById("orbit-slider").addEventListener("input", (e) => {
   document.getElementById("orbit-input").value = e.target.value;
   document.getElementById("orbit-val").textContent = e.target.value > 0 ? e.target.value : "0 (自动)";
@@ -1237,13 +1662,7 @@ document.getElementById("orbit-slider").addEventListener("input", (e) => {
 document.getElementById("orbit-input").addEventListener("input", (e) => {
   const v = Math.max(0, parseInt(e.target.value, 10) || 0);
   document.getElementById("orbit-slider").value = Math.min(900, v);
-  document.getElementById("orbit-val").textContent = v > 0 ? v : "0 (自动)";
-});
-document.getElementById("ring-inner").addEventListener("input", (e) => {
-  document.getElementById("ring-inner-val").textContent = e.target.value;
-});
-document.getElementById("ring-outer").addEventListener("input", (e) => {
-  document.getElementById("ring-outer-val").textContent = e.target.value;
+  document.getElementById("orbit-val").textContent = v > 0 ? v : "0 (未设置)";
 });
 document.getElementById("reserve-slider").addEventListener("input", (e) => {
   document.getElementById("reserve-input").value = e.target.value;
@@ -1267,12 +1686,61 @@ document.querySelectorAll("#transfer-seg button").forEach((btn) => {
     document.getElementById("transfer-desc").textContent = desc;
   });
 });
+// 开关：用户拨动后暂存到 localToggles，避免 2s 轮询用后端旧值回弹（“点了就自动关上”）。
+// 保存或点对端按钮(取消目标等)后由 saveConfig/对应处理清空，恢复跟随后端。
+["core-hold", "adv-comet", "adv-comet-rally"].forEach((id) => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener("change", () => state.localToggles.add(id));
+});
+// 数值/坐标输入：用户改动未保存前，轮询不得回弹（修 reflect 首次回填后必须配合）。
+// saveConfig 成功后清空 userEdited，恢复跟随后端。
+[
+  "orbit-input", "orbit-slider",
+  "reserve-input", "reserve-slider", "target-x", "target-y",
+  "ratio-ranger", "ratio-vanguard", "ratio-worker",
+  "cap-worker", "cap-ranger", "cap-vanguard",
+  "threshold-ranger", "threshold-vanguard", "threshold-worker",
+  "adv-comet-x", "adv-comet-y", "adv-comet-vg", "adv-comet-rk",
+  "adv-comet-rsv-vg", "adv-comet-rsv-rk", "adv-comet-rally-dist",
+].forEach((id) => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener("input", () => {
+    state.userEdited = state.userEdited || new Set();
+    state.userEdited.add(id);
+  });
+});
+// 彗星模式切换：coordinate 模式才需要填坐标，beacon 模式禁用坐标输入。
+(function () {
+  const modeSel = document.getElementById("adv-comet-mode");
+  const targetField = document.getElementById("comet-target-field");
+  function syncCometTargetField() {
+    if (!modeSel || !targetField) return;
+    const isCoord = modeSel.value === "coordinate";
+    targetField.style.opacity = isCoord ? "1" : "0.5";
+    targetField.style.pointerEvents = isCoord ? "auto" : "none";
+  }
+  if (modeSel) {
+    modeSel.addEventListener("change", () => {
+      state.localToggles.add("adv-comet-mode");
+      syncCometTargetField();
+    });
+  }
+  syncCometTargetField();
+  // renderControlPanel 后端回填会重置 mode，需重新同步显隐。
+  const origRender = window.renderControlPanel;
+  if (typeof origRender === "function") {
+    window.renderControlPanel = function () { origRender(); syncCometTargetField(); };
+  }
+})();
 document.getElementById("target-clear").addEventListener("click", async () => {
   document.getElementById("target-x").value = "";
   document.getElementById("target-y").value = "";
   try {
     await api("/api/config", { method: "POST", body: JSON.stringify({ core_target: null }) });
     state.lastReflected = {};
+    state.userEdited = state.userEdited || new Set();
+    state.userEdited.delete("target-x");
+    state.userEdited.delete("target-y");
     toast("目标已取消 ✓");
     refreshConfig();
   } catch (err) { toast("取消失败：" + (err.message || err), true); }
@@ -1283,9 +1751,40 @@ document.getElementById("target-set").addEventListener("click", () => {
   if (x === "" || y === "") { toast("请填写目标 x 和 y", true); return; }
   setTarget(parseInt(x, 10), parseInt(y, 10));
 });
+// 事件标签切换：全部/敌情/Core/工人/游侠/先锋
+document.querySelectorAll("#event-tabs button").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("#event-tabs button").forEach((b) => b.classList.toggle("active", b === btn));
+    state.eventTab = btn.dataset.tab;
+    // 用最近一次缓存的事件重渲染（不必重新拉取）
+    renderEventLog(state.lastEvents || []);
+  });
+});
 
 /* ============ 启动 ============ */
 setupMap();
+syncPaletteUI();
+// 配色面板：颜色改动即存即重绘。
+document.querySelectorAll("#map-palette input[type=color]").forEach((el) => {
+  el.addEventListener("input", () => {
+    MAP_COLORS[el.getAttribute("data-clr")] = el.value;
+    saveMapColors(MAP_COLORS);
+    syncPaletteUI();
+    drawMap();
+  });
+});
+document.getElementById("map-palette-reset").addEventListener("click", () => {
+  MAP_COLORS = Object.assign({}, MAP_COLOR_DEFAULTS);
+  saveMapColors(MAP_COLORS);
+  syncPaletteUI();
+  drawMap();
+  toast("配色已恢复默认");
+});
+document.getElementById("map-fit-core").addEventListener("click", () => {
+  state.mapFitPending = true;
+  drawMap();
+  toast("已放大到 Core 周围");
+});
 if (state.token) {
   // 尝试恢复会话
   api("/api/config").then(() => enterApp()).catch(() => {});
