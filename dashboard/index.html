@@ -1397,12 +1397,11 @@ function drawMap() {
   const cometTarget = (cfg.comet_target && Array.isArray(cfg.comet_target)) ? cfg.comet_target : null;
 
   // ---- 恒星轨道虚线方环 ----
-  // 规则：r>0 且 非驻扎 → 画虚线。例外：
-  //   ① 驻扎模式(core_hold) → 取消虚线
-  //   ② 换半径迁移中(target_kind=orbit 且 target≠null，Core 正走向新周界角) → 取消虚线
-  // 目标模式(target_kind=user) → 保留虚线（用户要求）
-  const orbitMigrating = coreTargetKind === "orbit" && coreTarget != null;
-  const inStellarOrbit = orbitR > 0 && !coreHold && !orbitMigrating;
+  // 规则：r>0 且 非驻扎 → 画虚线。
+  //   驻扎模式(core_hold) → 取消虚线（Core 已脱离轨道语义）
+  // 即使 Core 还在去轨道路的迁移中(target_kind=orbit 且 target≠null)，也提前标出
+  // 目标轨道，便于用户直观看到即将进入的周界。目标模式(target_kind=user) 同样保留。
+  const inStellarOrbit = orbitR > 0 && !coreHold;
   if (inStellarOrbit) {
     const corners = [[orbitR, orbitR], [orbitR, -orbitR], [-orbitR, -orbitR], [-orbitR, orbitR]];
     const ringPts = [...corners, corners[0]]; // 绕原点 (0,0)
@@ -1687,10 +1686,11 @@ document.querySelectorAll("#transfer-seg button").forEach((btn) => {
   });
 });
 // 开关：用户拨动后暂存到 localToggles，避免 2s 轮询用后端旧值回弹（“点了就自动关上”）。
+// 自动收集所有带 id 的 checkbox——以后新加开关默认被登记，不再需要手动维护数组
+// （否则 reflectCheck 调了、change 没登记，就会 2s 后被盖回，即“开关自己关上”）。
 // 保存或点对端按钮(取消目标等)后由 saveConfig/对应处理清空，恢复跟随后端。
-["core-hold", "adv-comet", "adv-comet-rally"].forEach((id) => {
-  const el = document.getElementById(id);
-  if (el) el.addEventListener("change", () => state.localToggles.add(id));
+document.querySelectorAll('input[type="checkbox"][id]').forEach((el) => {
+  el.addEventListener("change", () => state.localToggles.add(el.id));
 });
 // 数值/坐标输入：用户改动未保存前，轮询不得回弹（修 reflect 首次回填后必须配合）。
 // saveConfig 成功后清空 userEdited，恢复跟随后端。
