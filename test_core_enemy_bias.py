@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 
 import arena_hero_strategy as strategy_module
 from test_arena_hero_tactic import (
@@ -194,7 +195,6 @@ class CorePursueBeaconTests(unittest.TestCase):
 
 class CoreEnemyBiasPersistTests(unittest.TestCase):
     def _tmp_control(self, tmpdir, payload) -> "Path":
-        from pathlib import Path
         import json
         path = Path(tmpdir) / ".arena_hero_control.json"
         path.write_text(json.dumps(payload), encoding="utf-8")
@@ -236,7 +236,6 @@ class CoreEnemyBiasPersistTests(unittest.TestCase):
 
     def test_save_load_round_trips_new_flags(self) -> None:
         import tempfile
-        from pathlib import Path
         memory = TacticMemory()
         memory.core_evade_enemies = True
         memory.core_chase_enemies = True

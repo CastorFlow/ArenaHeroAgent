@@ -12,8 +12,6 @@ memory 字段；write_stats 只是把它们提升为顶层字段供 nightwatch �
 
 from __future__ import annotations
 
-import io
-import json
 import unittest
 from pathlib import Path
 from typing import Protocol

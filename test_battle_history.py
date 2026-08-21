@@ -25,7 +25,6 @@ from test_arena_hero_tactic import (
     ENEMY_RANGER_ID,
     WORKER_LOW,
     core,
-    enemy_ranger,
     make_turn,
     worker,
 )

@@ -2,7 +2,6 @@
 """测试复杂口袋地形的逃生循环问题"""
 
 from uuid import UUID
-from arena_hero import Position
 from arena_hero_strategy import (
     TacticMemory,
     SmartTactic,
@@ -42,7 +41,7 @@ def test_complex_pocket_escape():
 
     print("=== 模拟复杂口袋逃生测试 ===\n")
     print(f"游侠起始位置: {r_unit.position}")
-    print(f"目标: (620, 600) (在左边，需要穿过复杂地形)")
+    print("目标: (620, 600) (在左边，需要穿过复杂地形)")
     print(f"逃生持续: {LIGHTNING_ESCAPE_DURATION_TICKS} ticks")
     print(f"检测窗口: {LIGHTNING_ESCAPE_DETECT_WINDOW} ticks")
     print()
@@ -125,11 +124,11 @@ def test_complex_pocket_escape():
                   f"revisit={revisits} "
                   f"visited={memory.visited.get(positions_log[-1], 0)}")
 
-    print(f"\n=== 逃生事件汇总 ===")
+    print("\n=== 逃生事件汇总 ===")
     for tick, event, pos in escape_events:
         print(f"tick={tick:3d} {event:5s} at {pos}")
 
-    print(f"\n=== 分析 ===")
+    print("\n=== 分析 ===")
     start_count = sum(1 for _, event, _ in escape_events if event == "START")
     print(f"逃生触发次数: {start_count}")
 
@@ -149,7 +148,7 @@ def test_complex_pocket_escape():
         print("\n✅ 单次逃生成功")
 
     # 分析 visited 累积
-    print(f"\n=== visited 累积分析 ===")
+    print("\n=== visited 累积分析 ===")
     high_visited = [(pos, count) for pos, count in memory.visited.items() if count >= 3]
     high_visited.sort(key=lambda x: x[1], reverse=True)
     print(f"visited >= 3 的位置: {len(high_visited)} 个")
@@ -160,7 +159,7 @@ def test_complex_pocket_escape():
 
     # 分析位置轨迹
     unique_positions = len(set(positions_log))
-    print(f"\n位置统计:")
+    print("\n位置统计:")
     print(f"  - 总移动: {len(positions_log)} 步")
     print(f"  - 不同位置: {unique_positions} 个")
     print(f"  - 重复率: {(1 - unique_positions/len(positions_log))*100:.1f}%")
@@ -169,7 +168,7 @@ def test_complex_pocket_escape():
     from collections import Counter
     pos_counts = Counter(positions_log)
     most_common = pos_counts.most_common(5)
-    print(f"\n重复最多的位置:")
+    print("\n重复最多的位置:")
     for pos, count in most_common:
         print(f"  {pos}: {count} 次")
 

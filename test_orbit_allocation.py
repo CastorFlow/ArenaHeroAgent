@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 """测试基于周长的轨道分配算法"""
 
-from arena_hero import UnitType
-
-
 def calculate_circumference_based_orbits(
     unit_count: int,
-    vision_radius: int,
     gap: int,
     inner_radius: int,
-    min_units_per_orbit: int = 3,
     ideal_interval: int = 10,
 ) -> list[tuple[int, int]]:
     """基于周长的动态轨道分配：从内到外填充，避免外层过于稀疏"""
@@ -97,7 +92,7 @@ def print_allocation(role: str, unit_count: int, result: list[tuple[int, int]]):
     print('-' * 60)
     print(f"总分配: {total_assigned} (目标: {unit_count})")
     if total_assigned != unit_count:
-        print(f"⚠️  警告: 分配数量不匹配!")
+        print("⚠️  警告: 分配数量不匹配!")
 
 
 def compare_with_electron_model(unit_count: int):
@@ -110,7 +105,7 @@ def compare_with_electron_model(unit_count: int):
     electron_shells = [2, 8, 18, 32, 50, 72]
     radii = [5, 10, 15, 20, 25, 30]
 
-    print(f"\n电子排布 (2n²):")
+    print("\n电子排布 (2n²):")
     print(f"{'层':<6} {'容量':<8} {'累计':<8} {'半径':<8} {'周长':<8} {'间距'}")
     print('-' * 60)
 
@@ -134,7 +129,7 @@ def compare_with_electron_model(unit_count: int):
     if cumulative > unit_count:
         print(f"  → 外层半空({radii[n-1]}半径处只有{actual_cap}个，容量{electron_shells[n-1]})")
     else:
-        print(f"  → 刚好填满")
+        print("  → 刚好填满")
 
 
 def test_scenarios():
@@ -151,7 +146,7 @@ def test_scenarios():
 
     for role, count, inner, gap, interval in test_cases:
         result = calculate_circumference_based_orbits(
-            count, 5, gap, inner, min_units_per_orbit=3, ideal_interval=interval
+            count, gap, inner, ideal_interval=interval
         )
         print_allocation(role, count, result)
 
@@ -170,7 +165,7 @@ def test_scenarios():
 
     for role, count, inner, gap, interval in vanguard_cases:
         result = calculate_circumference_based_orbits(
-            count, 4, gap, inner, min_units_per_orbit=3, ideal_interval=interval
+            count, gap, inner, ideal_interval=interval
         )
         print_allocation(role, count, result)
 
@@ -186,7 +181,7 @@ def test_scenarios():
 
     for role, count, inner, gap, interval in worker_cases:
         result = calculate_circumference_based_orbits(
-            count, 3, gap, inner, min_units_per_orbit=3, ideal_interval=interval
+            count, gap, inner, ideal_interval=interval
         )
         print_allocation(role, count, result)
 
@@ -201,7 +196,6 @@ if __name__ == "__main__":
 核心改进:
 1. ✓ 按周长比例分配 → 外层轨道单位更多，覆盖面积大
 2. ✓ 动态容量计算 → 周长/间距，而非固定2n²
-3. ✓ 最少3单位/层 → 减少外层稀疏盲区
 4. ✓ 优先铺外层 → 早期就能建立大防御圈
 
 与电子排布对比:
@@ -210,7 +204,4 @@ if __name__ == "__main__":
 - 游戏优势: 早期防御圈大，响应速度快，覆盖无盲区
 
 推荐配置:
-- LIGHTNING_MIN_UNITS_PER_ORBIT = 3 (从2提到3)
-- LIGHTNING_IDEAL_INTERVAL = {VANGUARD:8, RANGER:10, WORKER:6}
-  (调整为视野直径的2倍，平衡覆盖与防御圈大小)
 """)

@@ -41,8 +41,6 @@ def _drive_escape(memory, tactic, start, goal, obstacles, ticks, uid,
         )
         decisions = []
         planner = MovementPlanner(turn, memory, decisions)
-        escape_until = memory.lightning_unit_escape_until.get(uid, 0)
-        was_escaping = tick < escape_until
         moved = tactic._lightning_step_toward(turn, planner, turn.rangers[0], goal, "test")
         if moved:
             md = [d for d in decisions if "move" in d]

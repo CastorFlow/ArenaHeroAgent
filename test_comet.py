@@ -8,17 +8,14 @@ from uuid import UUID
 from arena_hero import (
     BeaconStatus,
     ChampionBeacon,
-    CoreState,
-    CoreView,
     Direction,
     MoveAction,
     ShootAction,
     UnitType,
-    UnitView,
     WaitAction,
 )
 
-from arena_hero_strategy import SmartTactic, TacticMemory, _distance
+from arena_hero_strategy import SmartTactic, TacticMemory
 
 # 复用 tactic 测试里的工厂函数，保证 fixture 与生产路径一致。
 from test_arena_hero_tactic import (

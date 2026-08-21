@@ -135,7 +135,7 @@ tick, rangers, vanguards, workers = extract_positions(tick_line)
 
 print(f"\n{'#'*75}")
 print(f"# 轨道分配快照 - Tick {tick}")
-print(f"# 新算法: 基于周长动态分配")
+print("# 新算法: 基于周长动态分配")
 print(f"{'#'*75}")
 
 # 分析游侠

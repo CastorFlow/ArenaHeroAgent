@@ -10,38 +10,26 @@ from uuid import UUID
 
 from arena_hero import (
     Accepted,
-    BeaconStatus,
     ChampionBeacon,
-    CancelMoveAction,
     CommandSource,
     CoreState,
     CoreView,
-    DepositAction,
     Direction,
-    DropBeaconAction,
-    HarvestAction,
-    HealAction,
     MoveAction,
     PlayerState,
     PlayerStatus,
-    PickupBeaconAction,
-    RepairShieldAction,
     ResolutionEvent,
     ShootAction,
     SpawnAction,
     StartMoveAction,
-    SweepAction,
     TerrainView,
     Turn,
     UnitType,
     UnitView,
-    WaitAction,
-    unit_cost,
 )
 
-from arena_hero_tactic import _write_agent_status, choose_actions
+from arena_hero_tactic import _write_agent_status
 from arena_hero_strategy import (
-    MODE_LIGHTNING,
     MovementPlanner,
     SmartTactic,
     TacticMemory,
@@ -433,7 +421,7 @@ class LightningModeTests(unittest.TestCase):
             units=(worker(WORKER_LOW, (540, -201)),),
             enemies=(enemy_vanguard((536, -201)),),
         )
-        summary = SmartTactic(TacticMemory()).choose_actions(turn)
+        SmartTactic(TacticMemory()).choose_actions(turn)
         self.assertIsNone(turn.plan.core_action)
 
     def test_patrol_moves_toward_waypoint_not_origin(self) -> None:
@@ -495,11 +483,8 @@ class LightningModeTests(unittest.TestCase):
             obstacle_cells=walls,
         )
         memory.known_obstacles = set(walls)
-        decisions: list[str] = []
-        planner = MovementPlanner(turn, memory, decisions)
         # 连走 6 步,每步重建 planner 模拟游侠移动,断言不在两格间横跳。
         positions = [(650, -653)]
-        uid = str(turn.rangers[0].id)
         for _ in range(6):
             decisions_step: list[str] = []
             r_unit = ranger(positions[-1], UUID(int=0xB006))
@@ -740,7 +725,6 @@ class LightningModeTests(unittest.TestCase):
         memory = TacticMemory()
         tactic = SmartTactic(memory)
         uid = str(UUID(int=0xB040))
-        friendly_uid = str(UUID(int=0xB041))
         # 本单位的角点(最近角,半径 14 → (646,646));目标在 +x 远端。
         turn, _ = make_turn(
             own_core=core((600, 600)),
@@ -1062,7 +1046,7 @@ class LightningModeTests(unittest.TestCase):
 
         # 11 个游侠，gap=5，inner=10
         result = tactic._lightning_calculate_outer_first_orbits(
-            unit_count=11, vision_radius=5, gap=5, inner_radius=10, min_units_per_orbit=3
+            unit_count=11, gap=5, inner_radius=10
         )
 
         # 总数必须恰好 11
@@ -1079,7 +1063,7 @@ class LightningModeTests(unittest.TestCase):
         tactic = SmartTactic(memory)
 
         result = tactic._lightning_calculate_outer_first_orbits(
-            unit_count=25, vision_radius=5, gap=5, inner_radius=10, min_units_per_orbit=3
+            unit_count=25, gap=5, inner_radius=10
         )
 
         self.assertEqual(sum(c for _, c in result), 25)
@@ -1096,7 +1080,7 @@ class LightningModeTests(unittest.TestCase):
         tactic = SmartTactic(memory)
 
         result = tactic._lightning_calculate_outer_first_orbits(
-            unit_count=50, vision_radius=5, gap=5, inner_radius=10, min_units_per_orbit=3
+            unit_count=50, gap=5, inner_radius=10
         )
 
         # 不丢单位
@@ -1410,9 +1394,9 @@ class SpawnRatioTests(unittest.TestCase):
             UnitType.RANGER.name,
         )
 
-        # 模拟 _select_spawn 被调两次(预检 + 决策):两次都应读同一个 died。
-        pick1 = tactic._select_spawn(turn2, 1000)
-        pick2 = tactic._select_spawn(turn2, 1000)
+        # 模拟产兵预检和决策各调用一次:两次都应读同一个 died。
+        pick1 = tactic._select_spawn_with_source(turn2, 1000)[0]
+        pick2 = tactic._select_spawn_with_source(turn2, 1000)[0]
         # 新补兵逻辑不再"死什么补什么":rk=5 wk=2 vg=1 比例 1:1:3 归一化
         # rk=5, wk≈0.67, vg=1 → 工人最低 → 补工人;两次调用应返回同一选择
         # (阵亡信息不被消费)。
@@ -1577,8 +1561,6 @@ class StandoffRelayAndBlindSpotTests(unittest.TestCase):
 
     def test_enemy_watchers_only_ranger_and_vanguard(self) -> None:
         # 敌方工人与 Core 不参与盲区计算（用户拍板）。
-        memory = TacticMemory()
-        tactic = SmartTactic(memory)
         turn, _ = make_turn(
             own_core=core((560, 600)),
             units=(ranger((600, 600)),),
@@ -1596,8 +1578,6 @@ class StandoffRelayAndBlindSpotTests(unittest.TestCase):
     def test_blind_cell_behind_obstacle(self) -> None:
         # 石墙挡住敌游侠到 (600,597) 的对角视线 → 该格是盲区火力位。
         # (600,603) 曼哈顿 6 > R5 同为盲格；(601,602) 曼哈顿 4 且视线无阻 → 可见。
-        memory = TacticMemory()
-        tactic = SmartTactic(memory)
         turn, _ = make_turn(
             own_core=core((560, 600)),
             units=(ranger((570, 590)),),
@@ -1620,9 +1600,10 @@ class StandoffRelayAndBlindSpotTests(unittest.TestCase):
                 enemies=(enemy_ranger((603, 600)),),
             )
             tactic.memory.observe(turn)
-        standoff = tactic._lightning_standoff_enemy(turn)
+        standoff = tactic._detect_strategic_standoff(turn)
         self.assertIsNotNone(standoff)
-        self.assertEqual(standoff.position, (603, 600))
+        assert standoff is not None
+        self.assertEqual(standoff.enemy.position, (603, 600))
 
     def test_standoff_relay_picks_blind_diagonal_cell(self) -> None:
         # 对峙时换血位优先选盲区对角远位（石墙背后），而非明处对角。
@@ -1829,7 +1810,7 @@ class CoreReserveFloorTests(unittest.TestCase):
         memory = TacticMemory()
         tactic = SmartTactic(memory)
         turn = self._turn_with(rk=14, wk=5, vg=1, resources=17)
-        pick = tactic._select_spawn(turn, 17)
+        pick = tactic._select_spawn_with_source(turn, 17)[0]
         self.assertIsNotNone(pick)
 
     def test_growth_phase_cap30_still_builds(self) -> None:
@@ -1837,7 +1818,7 @@ class CoreReserveFloorTests(unittest.TestCase):
         memory = TacticMemory()
         tactic = SmartTactic(memory)
         turn = self._turn_with(rk=21, wk=8, vg=1, resources=30)
-        pick = tactic._select_spawn(turn, 30)
+        pick = tactic._select_spawn_with_source(turn, 30)[0]
         self.assertIsNotNone(pick)
 
     def test_mature_phase_holds_floor_when_poor(self) -> None:
@@ -1846,7 +1827,7 @@ class CoreReserveFloorTests(unittest.TestCase):
         memory = TacticMemory()
         tactic = SmartTactic(memory)
         turn = self._turn_with(rk=33, wk=11, vg=1, resources=180)
-        pick = tactic._select_spawn(turn, 180)
+        pick = tactic._select_spawn_with_source(turn, 180)[0]
         self.assertIsNone(pick)
 
     def test_mature_phase_builds_above_floor(self) -> None:
@@ -1854,7 +1835,7 @@ class CoreReserveFloorTests(unittest.TestCase):
         memory = TacticMemory()
         tactic = SmartTactic(memory)
         turn = self._turn_with(rk=33, wk=11, vg=1, resources=220)
-        pick = tactic._select_spawn(turn, 220)
+        pick = tactic._select_spawn_with_source(turn, 220)[0]
         self.assertIsNotNone(pick)
 
     def test_combat_yields_floor(self) -> None:
@@ -1865,7 +1846,7 @@ class CoreReserveFloorTests(unittest.TestCase):
         turn = self._turn_with(
             rk=33, wk=11, vg=1, resources=60, enemies=(enemy_vanguard((604, 600)),)
         )
-        pick = tactic._select_spawn(turn, 60)
+        pick = tactic._select_spawn_with_source(turn, 60)[0]
         self.assertIsNotNone(pick)
 
 
@@ -2395,7 +2376,7 @@ class ScoringPreaimAndSoloKillTests(unittest.TestCase):
             units=(own_injured, support), enemies=(enemy,),
         )
         # 不预 observe:choose_actions 内部 observe + FLEE_AMBUSH 预标记会读 hp。
-        summary = tactic.choose_actions(turn)
+        tactic.choose_actions(turn)
         # FLEE_AMBUSH 预标记 + 第二游侠射追兵 + ambush_trade≥1。
         self.assertGreaterEqual(memory.decision_totals["ranger:ambush_trade"], 1)
 

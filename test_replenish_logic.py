@@ -1,7 +1,6 @@
 """验证阈值驱动的补兵逻辑 + 比例停造/全零囤资源。"""
 import sys
 sys.path.insert(0, ".")
-from collections import namedtuple
 from arena_hero_strategy import (
     SmartTactic,
     UnitType,

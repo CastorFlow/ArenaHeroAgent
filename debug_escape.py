@@ -9,7 +9,6 @@ from arena_hero_strategy import (
     LIGHTNING_ESCAPE_DETECT_SPAN,
     LIGHTNING_ESCAPE_DETECT_WINDOW,
     LIGHTNING_ESCAPE_REVISIT_MIN,
-    LIGHTNING_ESCAPE_TRIGGER_HITS,
     MovementPlanner,
     SmartTactic,
     TacticMemory,

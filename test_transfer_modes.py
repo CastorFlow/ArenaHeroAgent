@@ -11,8 +11,6 @@
 from __future__ import annotations
 
 import unittest
-from uuid import UUID
-
 import arena_hero_strategy as strategy_module
 from test_arena_hero_tactic import (
     RANGER_ID,

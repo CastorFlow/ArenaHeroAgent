@@ -17,9 +17,7 @@ import unittest
 from pathlib import Path
 from uuid import UUID
 
-from arena_hero import ResolutionEvent, UnitType
-from uuid import UUID
-
+from arena_hero import ResolutionEvent
 from arena_hero_strategy import SmartTactic, TacticMemory
 from test_arena_hero_tactic import (
     ENEMY_RANGER_ID,

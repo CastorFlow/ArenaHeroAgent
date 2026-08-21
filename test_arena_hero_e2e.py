@@ -15,10 +15,8 @@ from arena_hero import (
     CommandSource,
     CoreState,
     CoreView,
-    Direction,
     PlayerState,
     PlayerStatus,
-    TerrainView,
     Turn,
     UnitType,
     UnitView,
@@ -98,7 +96,7 @@ class EndToEndTests(unittest.TestCase):
             turn = _turn(
                 12,
                 resources=25,
-                units=(_core(), _worker(), ranger := UnitView(
+                units=(_core(), _worker(), UnitView(
                     kind="UNIT",
                     id=RANGER_A,
                     controlled=True,

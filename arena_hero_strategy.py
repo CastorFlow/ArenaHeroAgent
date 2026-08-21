@@ -37,7 +37,6 @@ CHUNK_SIZE = 32
 ROUTES_FILENAME = ".arena_hero_routes.json"
 RECOVERY_TARGETS_FILENAME = ".arena_hero_recovery_targets.json"
 CONTROL_FILENAME = ".arena_hero_control.json"
-STATS_FILENAME = ".arena_hero_stats.json"
 BROWSER_INTEL_FILENAME = ".arena_hero_browser_intel.json"
 ROUTE_OVERLAY_VERSION = 2
 # 战况历史 / Core 轨迹 JSONL 滚动上限（行）。tick≈15s，10 万行 ≈ 17 天战况；
@@ -59,10 +58,8 @@ MAX_BUILD_QUEUE_LENGTH = 20
 # 转移状态机，到达后在新轨道上继续巡逻。
 # 战斗单位各自独立路线扫场，不组队。
 # 巡逻点沿半径 r 的方形周界四角轮转；到位（进入 CORE_BEACON_HYSTERESIS 死区）后换下一角。
-# 闪电模式常驻兵力软顶(经济软天花板)。100~110 是软天花板:游侠单价随 pop 涨价
-# (k=max(0,floor((pop-20)/5)+1, 单价=round(base×1.3^k)),pop100 时游侠≈1038、容量 500,
-# 造一个要攒 2+ tick,极慢但不停产。3:1 产能(游侠:工人)在此区间继续运作。
-LIGHTNING_MAX_POPULATION = 100
+# 闪电模式在 ABSOLUTE_MAX_POPULATION 前持续按比例/补兵规则产兵；游侠成本随人口增长，
+# 因此高人口时自然变成经济软限制，而不是额外的人口硬顶。
 # 绝对人口硬上限(兜底):比软顶多 5,防意外溢出。到此后不再产兵。
 ABSOLUTE_MAX_POPULATION = 105
 # Core 战备资源存底(用户定稿 2026-08-14):和平期保底 150 资源,留给战时给
@@ -85,8 +82,6 @@ LIGHTNING_LOCAL_THREAT_RADIUS = 8
 # 不得继续无脑推进。敌方游侠射程 3、先锋近战 1，取 3 作统一警戒圈——
 # 进到这个圈里再往前就等于一头扎进敌方火力射程送。
 COMET_THREAT_RADIUS = 3
-# 彗星游侠还击射程上限（=游侠射程），用于就近挑能打到的敌方战斗单位先开火清障。
-COMET_RANGER_FIRE_RANGE = 3
 # 集合点"到达"判定半径：成员所在格距集合点曼哈顿距离 ≤ 此值即算到达集合点
 # 近旁（集合点本身可能是障碍物，成员绕其周围近邻占位即可）。1 = 贴集合点周围
 # 一圈；因集合点常为障碍/不可占格，取 1 让成员在集合点相邻格散开占位警戒。
@@ -102,16 +97,6 @@ LIGHTNING_ORBIT_LANE_GAP_RADIUS: dict[UnitType, int] = {
     UnitType.WORKER: 3,
     UnitType.RANGER: 5,
 }
-# 基于周长分配的理想单位间距（格）：在视野覆盖和响应速度间平衡。
-# 间距过小（<视野直径）→ 视野重叠浪费；间距过大（>视野*2）→ 盲区大、单位稀疏。
-# 设定原则：间距 ≈ 视野直径 * 1.5~2.0（适度盲区换取更大防御圈）。
-LIGHTNING_IDEAL_INTERVAL: dict[UnitType, int] = {
-    UnitType.VANGUARD: 8,   # 视野4, 间距8 (2倍，近战需密集)
-    UnitType.RANGER: 10,    # 视野5, 间距10 (2倍，平衡覆盖与数量)
-    UnitType.WORKER: 6,     # 视野3, 间距6 (2倍，工人主要经济不需全覆盖)
-}
-# 每层轨道最少单位数（铺开领土阶段）：从2提到3，减少外层稀疏盲区。
-LIGHTNING_MIN_UNITS_PER_ORBIT = 3
 # 行星轨道叠格死区（到点位多久推下一点位）沿用 CORE_BEACON_HYSTERESIS=8。
 # === 轨道点位环（替代软斥力，防同层扎堆）===
 # 同层扎堆的根源：目标只有 4 个角，同层 >4 时必有单位共享角点且同节奏推进 → 永远
@@ -167,7 +152,6 @@ STUCK_TICKS = 16
 SPIN_POSITION_BUDGET = 6
 # 单位满血值
 MAX_HP = {UnitType.WORKER: 2, UnitType.VANGUARD: 4, UnitType.RANGER: 2}
-CORE_EMERGENCY_THREAT_RADIUS = 6
 # Lightning 游侠预测敌方移动时，把接近 Core 的敌人锚定到 Core。
 LIGHTNING_CORE_ALERT_RADIUS = 10
 CORE_DAMAGE_EMERGENCY_TICKS = 24
@@ -226,18 +210,7 @@ AIM_COVERAGE_BONUS = 6.0
 AIM_AMBUSH_STAY_SCORE = 90.0
 # 游侠单杀先锋舞步 kiting 接战距离(单位:格)。
 VANGUARD_DANCE_ENGAGE_RADIUS = 3
-# Mode B 各 phase 名。
-VANGUARD_DANCE_PHASES = (
-    "APPROACH_GAP",
-    "ADJACENT_BACK",
-    "REAIM_GAP_HP2",
-    "FLEE_AMBUSH",
-)
 CORE_DIRECTION_COMMIT_TICKS = 8
-RANGER_DEFENSE_LEASH_RADIUS = 8
-CORE_PATROL_RANGER_COUNT = 2
-CORE_PATROL_RADIUS = 2
-CORE_PATROL_ROTATION_TICKS = 8
 # 射失后的短期记忆：避免对同一敌人和同一格连续浪费行动。
 RANGER_SHOT_MISS_MEMORY_TICKS = 8
 # 45°支援游侠追逐移动中的 relay_cell(敌每 tick 移动→relay_cell 跟着移)可能永远到不了
@@ -245,9 +218,6 @@ RANGER_SHOT_MISS_MEMORY_TICKS = 8
 # 表现为贴墙不动不攻击)。连续未开火达到此阈值即冷却该游侠若干 tick,回落常规分支。
 STANDOFF_SUPPORT_MAX_STALL_TICKS = 4
 STANDOFF_SUPPORT_COOLDOWN_TICKS = 12
-CORE_AUTO_MOBILITY_MIN_VANGUARDS = 1
-CORE_AUTO_MOBILITY_MIN_RANGERS = 1
-CORE_AUTO_MOBILITY_MIN_COMBAT = 2
 REFILL_PROBE_MAX_DISTANCE = 40
 REFILL_PROBE_BACKTRACK_DISTANCE = 12
 REFILL_PROBE_CORE_LEASH_DISTANCE = 24
@@ -262,13 +232,7 @@ BROWSER_INTEL_MAX_AGE_SECONDS = 12
 BROWSER_RESOURCE_REQUIRE_QUOTA_PLAUSIBILITY = True
 # 浏览器地图只作为近处低可信提示；远处坐标必须由游戏视野重新确认，
 # 否则一次旧快照会把所有工人拖离采集区。
-BROWSER_RESOURCE_HINT_MAX_DISTANCE = 32
-BROWSER_RESOURCE_SCOUT_LIMIT = 1
 CORE_LOGISTICS_CORRIDOR_LENGTH = 3
-CORE_TERRAIN_PROFILE_RADIUS = 3
-CORE_TERRAIN_MAX_OPEN_RANGED_CELLS = 12
-CORE_TERRAIN_OPEN_HALF_RATIO_NUMERATOR = 3
-CORE_TERRAIN_OPEN_HALF_RATIO_DENOMINATOR = 4
 @dataclass(frozen=True)
 class CoreAnchorState(str, Enum):
     """Core movement state for the current Tick, derived from actual defensive work."""
@@ -289,7 +253,6 @@ class OrbitGeometry:
     gap: int
     r_commit: int
     r_screen: int
-    lane_by_unit: dict[str, tuple[int, int]]
 
 
 @dataclass(frozen=True)
@@ -307,9 +270,6 @@ class Vacancy:
     ranger_id: UUID
     sector: str
     t_home: int
-    t_queue: int
-    t_heal: int
-    t_return: int
     t_medical_gap: int
     fire_position: Position
 
@@ -317,8 +277,6 @@ class Vacancy:
 @dataclass(frozen=True)
 class ReliefAssignment:
     ranger_id: UUID
-    vacancy_ranger_id: UUID
-    t_relief: int
     fire_position: Position
 
 
@@ -335,7 +293,6 @@ class ShotIntent:
     ranger_id: UUID
     target_id: UUID
     expected_cell: Position
-    predicted: bool
 
 
 @dataclass
@@ -354,7 +311,7 @@ class ShotLedger:
     def assign(self, ranger: Ranger, enemy: UnitView | CoreView, cell: Position) -> None:
         self.assigned_damage[enemy.id] += 1
         self.intents.append(
-            ShotIntent(ranger.id, enemy.id, cell, cell != enemy.position)
+            ShotIntent(ranger.id, enemy.id, cell)
         )
 
 
@@ -479,9 +436,7 @@ class TacticMemory:
     last_core_damaged_tick: int = 0
     last_core_destroyed_tick: int = 0
     last_core_respawn_tick: int = 0
-    unit_label_mapping: dict[str, str] = field(default_factory=dict)
     last_events: list[dict] = field(default_factory=list)
-    unit_positions_for_overlay: dict[str, Position] = field(default_factory=dict)
     last_tick: int = 0
     # 哈雷彗星：派出小队追踪信标或打击自定义坐标的持续任务。
     comet_active: bool = False
@@ -507,7 +462,7 @@ class TacticMemory:
     # 时进入"集合中"——靠 rally_ready_ids 仍有待到成员来识别；全员到齐后置 True，
     # 后续替补成员直接奔目标。
     comet_rally_done: bool = False
-    # 闪电模式状态：当前巡逻点、轮转相位、每单位 claim 的敌方 Core、扇区分配。
+    # 闪电模式状态：当前巡逻点和轮转相位。
     lightning_patrol_waypoint: tuple[int, int] | None = None
     lightning_patrol_phase: int = 0
     # === 网页控制台新增控制字段（load_control 写入，save/load 持久化）===
@@ -557,9 +512,6 @@ class TacticMemory:
         default_factory=lambda: ["ranger", "worker", "vanguard"]
     )
     wartime_reserve: int = 150  # Core 战备资源存底（原硬编码 CORE_WARTIME_RESOURCE_FLOOR）
-    # 先锋敌方 Core 猎杀链已废弃:lightning_claims/lightning_blacklist 字段随
-    # _lightning_acquire_target 等函数一并删除。先锋只守近轨,不再 claim 敌方 Core。
-    lightning_sectors: dict[str, tuple[int, int]] = field(default_factory=dict)
     # 绕 Core 转的行星轨道点位环：每单位相对自己 anchor 的推进步数 offset(0..M-1)，
     # 到点死区后推进。圆心是 core.position；M=next_pow2(层内单位数) 的动态点位网格。
     lightning_orbit_phase: dict[str, int] = field(default_factory=dict)
@@ -568,8 +520,6 @@ class TacticMemory:
     # anchor 变化时，_lightning_orbit_waypoint 会据此把 offset 重置回 0（到自己的
     # anchor 重新锚定），避免存量单位起点撞车、同一点位扎堆。
     lightning_orbit_anchor: dict[str, int] = field(default_factory=dict)
-    # 已废弃(开路轨道删除后运行时无人读写):仅保留 save/load 以兼容旧 memory 文件。
-    lightning_breakthrough_phase: dict[str, int] = field(default_factory=dict)
     # 行星轨道 lane 分配缓存：role(str) → UUID → (radius, group_idx)。
     # RANGER/WORKER 的 lanes 由 _lightning_assign_shared_middle_lanes 从统一队列派生
     # (游侠占内层、工人接外层,共享同一组同心半径);VANGUARD 独立(近行星)。
@@ -578,9 +528,6 @@ class TacticMemory:
     # 工人段 [rk,total)。新游侠出生→游侠段扩 1→挤出最靠内的工人→该工人落到队尾。
     # 总数(rk+wk)不变时不重算,保证位置稳定不抖动。
     lightning_shared_orbit_seq: dict[str, int] = field(default_factory=dict)
-    # 上一 tick 存活单位 {uid: unit_type 名},用于"阵亡补同种"判定:对比当前存活,
-    # 差集即本 tick 阵亡的单位及其兵种,据此决定 pop≥9 时补造哪一类兵。
-    lightning_last_alive_uids: dict[str, str] = field(default_factory=dict)
     # 本 tick 阵亡单位 {uid: unit_type 名},由 observe 每 tick 重算(运行时,
     # 不序列化)。_select_spawn 只读它,保证被多次调用(预检 + 真正决策)时结果一致。
     lightning_recent_deaths: dict[str, str] = field(default_factory=dict, repr=False)
@@ -589,7 +536,6 @@ class TacticMemory:
     # 鬼打墙逃生：UUID → 逃生模式截止 tick。逃生期间忽略巡逻目标，
     # 只往"开阔 + 低 visited 密度"方向走，强制脱出障碍死角。
     lightning_unit_escape_until: dict[str, int] = field(default_factory=dict)
-    attacked_units: dict[str, int] = field(default_factory=dict)
     replacement_queue: Counter[str] = field(default_factory=Counter)
     control_mtime: int = 0
     total_resources_harvested: int = 0
@@ -613,7 +559,6 @@ class TacticMemory:
     current_units: dict[str, OverlayUnit] = field(default_factory=dict, repr=False)
     current_resource_cells: set[Position] = field(default_factory=set, repr=False)
     browser_resource_hints: set[Position] = field(default_factory=set, repr=False)
-    browser_intel_captured_at: str | None = field(default=None, repr=False)
     browser_intel_age_seconds: int = field(default=0, repr=False)
     browser_intel_online: bool = field(default=False, repr=False)
     observations: list[str] = field(default_factory=list, repr=False)
@@ -948,12 +893,6 @@ class TacticMemory:
                 0,
                 int(data.get("wartime_reserve", CORE_WARTIME_RESOURCE_FLOOR)),
             )
-            raw_sectors = data.get("lightning_sectors", {})
-            memory.lightning_sectors = {
-                str(unit_id): (int(sector[0]), int(sector[1]))
-                for unit_id, sector in raw_sectors.items()
-                if isinstance(sector, list) and len(sector) == 2
-            }
             memory.lightning_orbit_phase = {
                 str(unit_id): int(phase)
                 for unit_id, phase in data.get("lightning_orbit_phase", {}).items()
@@ -961,10 +900,6 @@ class TacticMemory:
             memory.lightning_orbit_anchor = {
                 str(unit_id): int(anchor)
                 for unit_id, anchor in data.get("lightning_orbit_anchor", {}).items()
-            }
-            memory.lightning_breakthrough_phase = {
-                str(unit_id): int(phase) % 4
-                for unit_id, phase in data.get("lightning_breakthrough_phase", {}).items()
             }
             raw_orbit_lanes = data.get("lightning_orbit_lanes", {})
             memory.lightning_orbit_lanes = {
@@ -980,10 +915,6 @@ class TacticMemory:
             memory.lightning_shared_orbit_seq = {
                 str(uid): int(seq)
                 for uid, seq in data.get("lightning_shared_orbit_seq", {}).items()
-            }
-            memory.lightning_last_alive_uids = {
-                str(uid): str(t)
-                for uid, t in data.get("lightning_last_alive_uids", {}).items()
             }
             memory.lightning_unit_stuck_counters = {
                 str(unit_id): int(count)
@@ -1136,24 +1067,14 @@ class TacticMemory:
             "replenish_threshold": dict(self.replenish_threshold),
             "replenish_priority": list(self.replenish_priority),
             "wartime_reserve": self.wartime_reserve,
-            "lightning_sectors": {
-                unit_id: [sector[0], sector[1]]
-                for unit_id, sector in sorted(self.lightning_sectors.items())
-            },
             "lightning_orbit_phase": dict(sorted(self.lightning_orbit_phase.items())),
             "lightning_orbit_anchor": dict(sorted(self.lightning_orbit_anchor.items())),
-            "lightning_breakthrough_phase": dict(
-                sorted(self.lightning_breakthrough_phase.items())
-            ),
             "lightning_orbit_lanes": {
                 role: dict(sorted(lanes.items()))
                 for role, lanes in sorted(self.lightning_orbit_lanes.items())
             },
             "lightning_shared_orbit_seq": dict(
                 sorted(self.lightning_shared_orbit_seq.items())
-            ),
-            "lightning_last_alive_uids": dict(
-                sorted(self.lightning_last_alive_uids.items())
             ),
             "lightning_unit_stuck_counters": dict(
                 sorted(self.lightning_unit_stuck_counters.items())
@@ -1286,15 +1207,11 @@ class TacticMemory:
         lost_unit_ids = previous_unit_ids - live_unit_ids
         self.units_lost += len(lost_unit_ids)
         # 阵亡补同种:本 tick 阵亡的单位及其兵种(用清理前的 unit_labels 查 type)。
-        # _select_spawn 读 lightning_recent_deaths 决定 pop≥9 补哪类兵;同时把
-        # 当前存活编制快照到 lightning_last_alive_uids 供下 tick 算差集。
+        # _select_spawn 读取 lightning_recent_deaths 决定 pop≥9 补哪类兵。
         self.lightning_recent_deaths = {
             uid: previous_labels[uid].object_type
             for uid in lost_unit_ids
             if uid in previous_labels
-        }
-        self.lightning_last_alive_uids = {
-            str(unit.id): unit.unit_type.name for unit in turn.units
         }
         self.replacement_queue.clear()
         self.unit_labels = {
@@ -1348,11 +1265,6 @@ class TacticMemory:
                 self.core_heading = None
                 self.last_core_move_tick = 0
                 self.clear_comet_state()
-            # 广播系统：单位被攻击 → 记录并通知其他单位支援
-            if event.event_type == "UNIT_DAMAGED" and event.target_id is not None:
-                target_key = str(event.target_id)
-                if target_key in self.unit_labels:
-                    self.attacked_units[target_key] = turn.tick
             # 记录战斗事件（供 overlay 快速定位）
             if event.event_type in {
                 "SHOT_HIT",
@@ -1479,8 +1391,6 @@ class TacticMemory:
                 self.axis_miss_ticks.pop(axis_key, None)
                 self.axis_miss_counts.pop(axis_key, None)
         visible_enemy_ids = {str(enemy.id) for enemy in turn.visible_enemies}
-        if visible_enemy_ids:
-            self.last_enemy_visible_tick = turn.tick
         for enemy in turn.visible_enemies:
             # 敌方 Core 坐标不再记入 sightings:先锋猎杀链已废弃,Core 坐标在活跃代码里
             # 零依赖(御驾亲征用 live beacon position、Core 击杀走 enemy_type_snapshot)。
@@ -1926,7 +1836,6 @@ class TacticMemory:
     def refresh_browser_intel(self, path: Path | None = None) -> None:
         """Load expiring browser-map coordinates as low-confidence hints."""
         self.browser_resource_hints.clear()
-        self.browser_intel_captured_at = None
         self.browser_intel_age_seconds = 0
         self.browser_intel_online = False
         intel_path = path or Path(
@@ -1943,7 +1852,6 @@ class TacticMemory:
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
             age = max(0, int(time.time() - parsed.timestamp()))
-            self.browser_intel_captured_at = captured_at[:64]
             self.browser_intel_age_seconds = age
             if age > BROWSER_INTEL_MAX_AGE_SECONDS:
                 return
@@ -2222,70 +2130,6 @@ def _shot_axis_key(target_id: UUID | str, target_pos: Position, expected_cell: P
 def _cell_sort_key(cell: Position) -> tuple[int, int]:
     """格的确定性排序键(供打分平手决胜用)。"""
     return (cell[0], cell[1])
-
-
-def _core_attack_surface_profile(
-    anchor: Position,
-    obstacles: set[Position],
-) -> tuple[int, Position | None, int, int]:
-    """Trace the Ranger's eight rays; rocks block every farther cell on a ray."""
-    open_ranged_offsets: list[Position] = []
-    melee_open = 0
-    for dx, dy in RANGER_LINE_DELTAS:
-        for distance in range(1, CORE_TERRAIN_PROFILE_RADIUS + 1):
-            position = (
-                anchor[0] + dx * distance,
-                anchor[1] + dy * distance,
-            )
-            if position in obstacles:
-                break
-            if distance == 1:
-                melee_open += 1
-            else:
-                open_ranged_offsets.append((dx * distance, dy * distance))
-    best_axis: Position | None = None
-    best_count = -1
-    for axis_x, axis_y in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-        count = sum(
-            offset_x * axis_x + offset_y * axis_y >= 0
-            for offset_x, offset_y in open_ranged_offsets
-        )
-        if count > best_count:
-            best_axis = (axis_x, axis_y)
-            best_count = count
-    return (
-        len(open_ranged_offsets),
-        best_axis,
-        max(0, best_count),
-        melee_open,
-    )
-
-
-def _terrain_guard_offsets(
-    anchor: Position,
-    obstacles: set[Position],
-    offsets: tuple[Position, ...],
-) -> tuple[Position, ...]:
-    """Prefer Core guard slots on the open half of a rock-backed position."""
-    open_count, open_axis, concentrated_count, _ = _core_attack_surface_profile(
-        anchor,
-        obstacles,
-    )
-    if (
-        open_axis is None
-        or open_count > CORE_TERRAIN_MAX_OPEN_RANGED_CELLS
-        or concentrated_count * CORE_TERRAIN_OPEN_HALF_RATIO_DENOMINATOR
-        < open_count * CORE_TERRAIN_OPEN_HALF_RATIO_NUMERATOR
-    ):
-        return offsets
-    axis_x, axis_y = open_axis
-    open_half = [
-        offset
-        for offset in offsets
-        if offset[0] * axis_x + offset[1] * axis_y >= 0
-    ]
-    blocked_half = [offset for offset in offsets if offset not in open_half]
-    return tuple(open_half + blocked_half)
 
 
 def _sign(value: int) -> int:
@@ -2593,7 +2437,6 @@ def _find_path(
     threat: Counter[Position],
     visited: Counter[Position],
     max_expansions: int = 30000,
-    ignore_occupancy_goals: bool = True,
 ) -> tuple[Direction, ...]:
     if start == goal:
         return ()
@@ -2842,71 +2685,6 @@ class MovementPlanner:
         candidates = sorted(DIRECTION_ORDER, key=score)
         return any(self._queue(unit, direction, reason) for direction in candidates)
 
-    def flee(self, unit: Unit, threats: Iterable[Position], reason: str) -> bool:
-        threat_cells = tuple(threats)
-        candidates = sorted(
-            DIRECTION_ORDER,
-            key=lambda direction: (
-                self.threat.get(_destination(unit.position, direction), 0),
-                -min(
-                    _distance(_destination(unit.position, direction), threat)
-                    for threat in threat_cells
-                ),
-                self.memory.visited.get(_destination(unit.position, direction), 0),
-                DIRECTION_RANK[direction],
-            ),
-        )
-        return any(self._queue(unit, direction, reason) for direction in candidates)
-
-    def flee_open(
-        self,
-        unit: Unit,
-        threats: Iterable[Position],
-        core_position: Position | None,
-        reason: str,
-        *,
-        avoid: Iterable[Position] = (),
-    ) -> bool:
-        threat_cells = tuple(threats)
-        avoid_cells = frozenset(avoid)
-
-        def score(direction: Direction) -> tuple[int, int, int, int, int, int, int]:
-            destination = _destination(unit.position, direction)
-            nearby_obstacles = sum(
-                1
-                for obstacle in self.obstacles
-                if _distance(destination, obstacle) <= 2
-            )
-            exits = sum(
-                1
-                for candidate_direction in DIRECTION_ORDER
-                if self._can_enter(_destination(destination, candidate_direction))
-            )
-            threat_distance = (
-                min(_distance(destination, threat) for threat in threat_cells)
-                if threat_cells
-                else 0
-            )
-            core_distance = (
-                _distance(destination, core_position)
-                if core_position is not None
-                else 0
-            )
-            return (
-                self.threat.get(destination, 0),
-                nearby_obstacles,
-                -exits,
-                -threat_distance,
-                -core_distance,
-                self.memory.visited.get(destination, 0),
-                DIRECTION_RANK[direction],
-            )
-
-        candidates = sorted(DIRECTION_ORDER, key=score)
-        return any(
-            self._queue(unit, direction, reason, avoid_cells)
-            for direction in candidates
-        )
 
 
 
@@ -4437,11 +4215,8 @@ class SmartTactic:
     def _lightning_calculate_outer_first_orbits(
         self,
         unit_count: int,
-        vision_radius: int,
         gap: int,
         inner_radius: int,
-        min_units_per_orbit: int = 3,
-        ideal_interval: int = 10,
     ) -> list[tuple[int, int]]:
         """电子排布风格的轨道分配：层容量=2n，循环队列填充。
 
@@ -4476,7 +4251,6 @@ class SmartTactic:
         # 循环队列填充
         active_layers = list(range(min(3, len(layers))))  # 初始活跃层：前3层
         remaining = unit_count
-        unit_idx = 0
 
         while remaining > 0 and active_layers:
             # 轮流填充活跃层
@@ -4486,7 +4260,6 @@ class SmartTactic:
                 layer = layers[i]
                 layer['count'] += 1
                 remaining -= 1
-                unit_idx += 1
 
                 # 层满时移除
                 if layer['count'] >= layer['capacity']:
@@ -4547,18 +4320,13 @@ class SmartTactic:
             self.memory.lightning_shared_orbit_seq = {}
             return {}
 
-        # 统一电子排布:inner=10(先锋层外), gap=5(游侠视野), ideal_interval=10。
+        # 统一电子排布:inner=10(先锋层外), gap=5(游侠视野)。
         gap = LIGHTNING_ORBIT_LANE_GAP_RADIUS[UnitType.RANGER]
         inner_radius = LIGHTNING_NEAR_ORBIT_RADIUS + gap
-        ideal_interval = LIGHTNING_IDEAL_INTERVAL[UnitType.RANGER]
-        vision_radius = LIGHTNING_ORBIT_LANE_GAP_RADIUS[UnitType.RANGER]
         distribution = self._lightning_calculate_outer_first_orbits(
             total,
-            vision_radius,
             gap,
             inner_radius,
-            min_units_per_orbit=LIGHTNING_MIN_UNITS_PER_ORBIT,
-            ideal_interval=ideal_interval,
         )
         # 展开成全局位置序列(内→外),每个位置 = (radius, group_idx)。
         positions = [(r, g) for r, cnt in distribution for g in range(cnt)]
@@ -6019,8 +5787,15 @@ class SmartTactic:
         r_commit = max(r_vanguard + 1, r_ranger_inner - max(1, gap // 2))
         r_screen = max(r_commit + 1, r_ranger_inner)
         r_sensor_outer = max(occupied_outer, r_ranger_outer + gap * (2 + math.isqrt(max(1, len(lanes) + len(turn.vanguards)))))
-        return OrbitGeometry(r_vanguard, r_ranger_inner, r_ranger_outer,
-                             r_sensor_outer, gap, r_commit, r_screen, lanes)
+        return OrbitGeometry(
+            r_vanguard,
+            r_ranger_inner,
+            r_ranger_outer,
+            r_sensor_outer,
+            gap,
+            r_commit,
+            r_screen,
+        )
 
     @staticmethod
     def _lightning_sector(origin: Position, position: Position) -> str:
@@ -6088,13 +5863,8 @@ class SmartTactic:
             sector = self._lightning_sector(turn.core.position, ranger.position)
             fire = self._lightning_sector_fire_position(turn.core.position, sector, geometry.r_ranger_inner)
             t_home = planner.eta(ranger, turn.core.position)
-            t_queue = core_queue
-            t_heal = 1
-            t_return = _distance(turn.core.position, fire)
-            vacancies.append(Vacancy(
-                ranger.id, sector, t_home, t_queue, t_heal, t_return,
-                t_home + t_queue + t_heal + t_return, fire,
-            ))
+            t_medical_gap = t_home + core_queue + 1 + _distance(turn.core.position, fire)
+            vacancies.append(Vacancy(ranger.id, sector, t_home, t_medical_gap, fire))
         healthy = [r for r in turn.rangers if r.hp >= 2]
         reliefs: list[ReliefAssignment] = []
         reserved: set[UUID] = set()
@@ -6115,7 +5885,7 @@ class SmartTactic:
             eta, _, ranger = min(candidates)
             if eta < vacancy.t_medical_gap and eta <= pressure:
                 reserved.add(ranger.id)
-                reliefs.append(ReliefAssignment(ranger.id, vacancy.ranger_id, eta, vacancy.fire_position))
+                reliefs.append(ReliefAssignment(ranger.id, vacancy.fire_position))
         return tuple(vacancies), tuple(reliefs)
 
     def _lightning_plan_funnel(self, turn: Turn, planner: MovementPlanner,
@@ -6299,17 +6069,6 @@ class SmartTactic:
                 vanguard.wait()
             acted_units.add(vanguard.id)
 
-
-    def _lightning_standoff_enemy(self, turn: Turn) -> UnitView | None:
-        """返回游侠互瞄僵局中的敌方游侠。
-
-        这是 Lightning 相持检测的窄接口；其他类型的战略相持由
-        ``_detect_strategic_standoff`` 统一处理。
-        """
-        standoff = self._detect_strategic_standoff(turn)
-        if standoff is None or standoff.kind != "ranger_ranger":
-            return None
-        return standoff.enemy
 
     def _detect_strategic_standoff(self, turn: Turn) -> StrategicStandoff | None:
         """泛化战略相持检测:不止游侠-游侠互瞄,还包括被围的低血敌先锋、被堵的逃命敌工人。
@@ -7531,14 +7290,6 @@ class SmartTactic:
         return None, from_queue  # 攒钱下个 tick（保留队列优先级意图）
 
 
-    def _select_spawn(
-        self,
-        turn: Turn,
-        projected_resources: int,
-    ) -> UnitType | None:
-        """返回当前资源预算下的 Lightning 产兵选择。"""
-        return self._select_spawn_with_source(turn, projected_resources)[0]
-
     def _persist_core_hold_after_arrival(self) -> None:
         """Core 到达用户目标后自动开启驻扎：把控制文件 core_target=null、
         core_hold=true 原子写回，让前端轮询时同步显示。memory 里的值已由
@@ -7762,7 +7513,6 @@ class SmartTactic:
                     decisions,
                     migration_target=core_target,
                     noncombat_enemies_safe=True,
-                    ignore_beacon_progress=True,
                     user_directed_transfer=fast_transfer,
                     enemy_bias=self._core_enemy_bias(turn),
                 )
@@ -7810,8 +7560,7 @@ class SmartTactic:
                     decisions,
                     migration_target=core_target,
                     noncombat_enemies_safe=True,
-                    ignore_beacon_progress=True,
-                    user_directed_transfer=fast_transfer,
+                            user_directed_transfer=fast_transfer,
                     enemy_bias=self._core_enemy_bias(turn),
                 )
                 return
@@ -7839,7 +7588,6 @@ class SmartTactic:
             decisions,
             beacon_target=waypoint,
             noncombat_enemies_safe=True,
-            ignore_beacon_progress=True,
             enemy_bias=self._core_enemy_bias(turn),
         )
 
@@ -7850,10 +7598,8 @@ class SmartTactic:
         incoming_deposit: int,
         decisions: list[str],
         beacon_target: Position | None = None,
-        shelter_target: Position | None = None,
         migration_target: Position | None = None,
         noncombat_enemies_safe: bool = False,
-        ignore_beacon_progress: bool = False,
         user_directed_transfer: bool = False,
         enemy_bias: str = "none",
     ) -> None:
@@ -7919,9 +7665,6 @@ class SmartTactic:
         if migration_target is not None:
             targets = [migration_target]
             reason = "migration_target"
-        elif shelter_target is not None:
-            targets = [shelter_target]
-            reason = "shelter"
         elif beacon_target is not None:
             targets = [beacon_target]
             reason = "beacon_distance_ctrl"
@@ -7991,7 +7734,6 @@ class SmartTactic:
                 if (
                     beacon_progress < 0
                     and beacon_target is None
-                    and shelter_target is None
                     and migration_target is None
                 ):
                     continue
@@ -8050,11 +7792,6 @@ class SmartTactic:
                 # 4 tick,离开格已累积 +4 visited,若是加成会把 Core 拉回刚离开的
                 # 格形成 ping-pong 鬼打墙。惩罚权重与掉头罚同量级,压死角横跳。
                 + min(8.0, self.memory.visited.get(destination, 0) * 0.3)
-                - (
-                    beacon_progress * BEACON_PROGRESS_WEIGHT
-                    if shelter_target is None and not ignore_beacon_progress
-                    else 0
-                )
             )
             candidates.append(
                 (score, DIRECTION_RANK[direction], direction, destination)

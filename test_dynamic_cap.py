@@ -104,7 +104,7 @@ def compare_allocation(rangers, workers, label):
     old_sparse = sum(1 for r, c in rk_old if (8*r)//c > 20)
     new_sparse = sum(1 for r, c in rk_new if (8*r)//c > 20)
 
-    print(f"\n改进:")
+    print("\n改进:")
     print(f"  最大间距: {old_max_interval}格 → {new_max_interval}格 (减少{old_max_interval-new_max_interval}格)")
     print(f"  稀疏层数: {old_sparse}层 → {new_sparse}层 (减少{old_sparse-new_sparse}层)")
 

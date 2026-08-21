@@ -106,7 +106,7 @@ log_text = result.stdout
 rangers, vanguards, workers = extract_positions(log_text)
 
 print(f"\n{'#'*70}")
-print(f"# 轨道分配快照分析")
+print("# 轨道分配快照分析")
 print(f"{'#'*70}")
 
 # 分析游侠

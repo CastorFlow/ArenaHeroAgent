@@ -1,3 +1,5 @@
+> **历史文档提示：** 本文描述的是已退出运行时的轨道/突破行为，不是当前策略规范。当前行为请以 `README.md`、`docs/STRATEGY.md`、`docs/USAGE.md` 以及现行代码为准。
+
 # 轨道重构 + 3:1 产能补兵 开发计划
 
 > 本文件是给执行会话的开发指令书。执行会话在 ArenaHero 项目工作树 `/home/xiao/projects/ArenaHero` 下,

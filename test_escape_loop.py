@@ -2,7 +2,6 @@
 """测试逃生机制的循环问题"""
 
 from uuid import UUID
-from arena_hero import Position
 from arena_hero_strategy import (
     TacticMemory,
     SmartTactic,
@@ -34,8 +33,8 @@ def test_escape_loop_in_u_pocket():
     print("=== 模拟 U 型死角逃生测试 ===\n")
     print(f"障碍物: {obstacles}")
     print(f"游侠起始位置: {r_unit.position}")
-    print(f"目标: (620, 600) (在左边，但需要绕过 U 型)")
-    print(f"\n逃生参数:")
+    print("目标: (620, 600) (在左边，但需要绕过 U 型)")
+    print("\n逃生参数:")
     print(f"  - 检测窗口: {LIGHTNING_ESCAPE_DETECT_WINDOW} ticks")
     print(f"  - 逃生持续: {LIGHTNING_ESCAPE_DURATION_TICKS} ticks")
     print()
@@ -113,11 +112,11 @@ def test_escape_loop_in_u_pocket():
                   f"escaping={is_escaping} span={span} "
                   f"visited={memory.visited.get(positions_log[-1], 0)}")
 
-    print(f"\n=== 逃生事件汇总 ===")
+    print("\n=== 逃生事件汇总 ===")
     for tick, event, pos in escape_events:
         print(f"tick={tick:3d} {event:5s} at {pos}")
 
-    print(f"\n=== 分析 ===")
+    print("\n=== 分析 ===")
     print(f"总逃生事件: {len(escape_events)}")
 
     # 统计循环次数
@@ -135,7 +134,7 @@ def test_escape_loop_in_u_pocket():
 
     # 分析位置轨迹
     unique_positions = len(set(positions_log))
-    print(f"\n位置统计:")
+    print("\n位置统计:")
     print(f"  - 总移动: {len(positions_log)} 步")
     print(f"  - 不同位置: {unique_positions} 个")
     print(f"  - 重复率: {(1 - unique_positions/len(positions_log))*100:.1f}%")

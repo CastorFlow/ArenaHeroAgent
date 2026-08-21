@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-实时监控轨道行为脚本
+实时监控轨道行为脚本（历史/兼容工具）。
 
-监控目标：
-1. 游侠是否按轨道巡逻（开路/中轨）
-2. 先锋是否守在近轨道（r=5）
-3. 威胁响应行为（NEAR/MID/FAR）
-4. 开路游侠的战术响应（逃跑/游击/巡逻）
+.. deprecated::
+   This monitor predates the shared Lightning orbit logs and still interprets
+   retired breakthrough/NEAR/MID/FAR labels.  For current runtime behavior,
+   prefer ``analyze_orbit_live.py`` or ``track_unit_orbit.py`` against telemetry.
+
+It is intentionally kept for operators who still need to inspect historical
+logs; it is not the current strategy specification.
 """
 
 import re
@@ -28,84 +30,6 @@ class OrbitMonitor:
     def distance(self, pos1, pos2):
         """曼哈顿距离"""
         return abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
-
-    def classify_ranger_role(self, unit_id, rangers_seen):
-        """分类游侠角色：开路(前4) vs 中轨(第5+)"""
-        sorted_rangers = sorted(rangers_seen)
-        if unit_id in sorted_rangers[:4]:
-            return "breakthrough"
-        else:
-            return "mid_orbit"
-
-    def check_near_orbit_adherence(self, unit_id, position, tick):
-        """检查先锋是否守在近轨道（r=5附近）"""
-        if self.core_position is None:
-            return None
-
-        dist_to_core = self.distance(position, self.core_position)
-        near_radius = 5
-        tolerance = 3  # 允许±3格容差
-
-        if dist_to_core > near_radius + tolerance:
-            violation = {
-                "tick": tick,
-                "unit_id": unit_id,
-                "type": "vanguard_too_far",
-                "dist_to_core": dist_to_core,
-                "expected": near_radius,
-                "position": position
-            }
-            self.orbit_violations.append(violation)
-            return False
-        return True
-
-    def check_breakthrough_orbit_adherence(self, unit_id, position, tick):
-        """检查开路游侠是否在开路轨道范围内（r=650-680）"""
-        origin = (0, 0)
-        dist_to_origin = self.distance(position, origin)
-
-        # 开路轨道半径范围
-        inner_radius = 650
-        outer_radius = 680
-        tolerance = 20
-
-        if dist_to_origin < inner_radius - tolerance or dist_to_origin > outer_radius + tolerance:
-            violation = {
-                "tick": tick,
-                "unit_id": unit_id,
-                "type": "breakthrough_out_of_range",
-                "dist_to_origin": dist_to_origin,
-                "expected_range": f"{inner_radius}-{outer_radius}",
-                "position": position
-            }
-            self.orbit_violations.append(violation)
-            return False
-        return True
-
-    def check_mid_orbit_adherence(self, unit_id, position, tick):
-        """检查中轨游侠是否在中轨范围内（r=10-40）"""
-        if self.core_position is None:
-            return None
-
-        dist_to_core = self.distance(position, self.core_position)
-
-        # 中轨半径范围
-        inner_radius = 10
-        outer_radius = 40
-        tolerance = 10
-
-        if dist_to_core < inner_radius - tolerance or dist_to_core > outer_radius + tolerance:
-            violation = {
-                "tick": tick,
-                "unit_id": unit_id,
-                "type": "mid_orbit_out_of_range",
-                "dist_to_core": dist_to_core,
-                "expected_range": f"{inner_radius}-{outer_radius}",
-                "position": position
-            }
-            self.orbit_violations.append(violation)
-            return False
-        return True
 
     def parse_log_line(self, line):
         """解析日志行"""
@@ -186,13 +110,13 @@ class OrbitMonitor:
         rangers = [uid for uid, utype in self.unit_types.items() if utype == "ranger"]
         workers = [uid for uid, utype in self.unit_types.items() if utype == "worker"]
 
-        print(f"\n单位统计:")
+        print("\n单位统计:")
         print(f"  先锋: {len(vanguards)} | 游侠: {len(rangers)} | 工人: {len(workers)}")
         if self.core_position:
             print(f"  Core位置: {self.core_position}")
 
         # 决策类型统计
-        print(f"\n决策统计（累计）:")
+        print("\n决策统计（累计）:")
         if self.decision_counts:
             for decision_type, count in sorted(self.decision_counts.items()):
                 print(f"  {decision_type}: {count}")
@@ -202,7 +126,7 @@ class OrbitMonitor:
         # 威胁事件
         recent_threats = [t for t in self.threat_events if t[1] > self.last_tick - 100]
         if recent_threats:
-            print(f"\n最近威胁事件（近100 tick）:")
+            print("\n最近威胁事件（近100 tick）:")
             threat_summary = defaultdict(int)
             for threat_type, _ in recent_threats:
                 threat_summary[threat_type] += 1
@@ -212,16 +136,16 @@ class OrbitMonitor:
         # 轨道违规
         recent_violations = [v for v in self.orbit_violations if v["tick"] > self.last_tick - 100]
         if recent_violations:
-            print(f"\n⚠️ 轨道违规（近100 tick）:")
+            print("\n⚠️ 轨道违规（近100 tick）:")
             for v in recent_violations[-5:]:  # 只显示最近5条
                 print(f"  Tick {v['tick']}: {v['type']} - unit={v['unit_id'][:8]} pos={v['position']}")
 
         # 单位位置检查
-        print(f"\n当前单位轨道检查:")
+        print("\n当前单位轨道检查:")
 
         # 检查先锋
         if vanguards and self.core_position:
-            print(f"  先锋（应在近轨道r=5附近）:")
+            print("  先锋（应在近轨道r=5附近）:")
             for vid in vanguards:
                 if vid in self.unit_positions and self.unit_positions[vid]:
                     last_pos = self.unit_positions[vid][-1]
@@ -232,7 +156,7 @@ class OrbitMonitor:
         # 检查游侠
         if rangers:
             sorted_rangers = sorted(rangers)
-            print(f"  开路游侠（前4个，应在r=650-680范围）:")
+            print("  开路游侠（前4个，应在r=650-680范围）:")
             for rid in sorted_rangers[:4]:
                 if rid in self.unit_positions and self.unit_positions[rid]:
                     last_pos = self.unit_positions[rid][-1]
@@ -241,7 +165,7 @@ class OrbitMonitor:
                     print(f"    {status} {rid[:8]}: 距原点={dist} (期望=650-680)")
 
             if len(rangers) > 4 and self.core_position:
-                print(f"  中轨游侠（第5+个，应在r=10-40范围）:")
+                print("  中轨游侠（第5+个，应在r=10-40范围）:")
                 for rid in sorted_rangers[4:]:
                     if rid in self.unit_positions and self.unit_positions[rid]:
                         last_pos = self.unit_positions[rid][-1]

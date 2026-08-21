@@ -130,23 +130,9 @@ if patrol:
         n = len(bucket)
         ideal_gap = (8 * r) / n
         # 实际:把每个 goal 投影到方环周长坐标(0..8r),排序求相邻差
-        def arc(gx, gy):
-            # 以 (cx+r, cy+r) 右下角为 0,逆时针(与代码一致)
-            dx, dy = gx - cx, gy - cy
-            if dx == r and -r <= dy <= r and not (dy < -r):
-                # 右边: x=r, dy 从 +r 到 -r
-                if dy >= 0:
-                    return dy if dy > 0 else 0  # 角点
-                else:
-                    return 2 * r - dy  # 不应到这
-            # 简化:直接按四条边判断
-            if dy == r and -r <= dx <= r:  # 下边? 注意符号
-                pass
-            return 0  # fallback
         # 实际相邻距离用欧氏
         pts = [u["goal"] for u in bucket]
         dists = []
-        import math
         for i in range(n):
             for j in range(i + 1, n):
                 d = max(abs(pts[i][0]-pts[j][0]), abs(pts[i][1]-pts[j][1]))
