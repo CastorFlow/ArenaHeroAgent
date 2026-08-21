@@ -90,7 +90,7 @@ class EndToEndTests(unittest.TestCase):
             stats_path = root / ".arena_hero_stats.json"
             control_path = root / ".arena_hero_control.json"
             control_path.write_text(
-                json.dumps({"mode": "lightning", "recall": False}),
+                json.dumps({}),
                 encoding="utf-8",
             )
 
@@ -145,9 +145,6 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(
                 control_payload,
                 {
-                    "mode": "lightning",
-                    "aggress_vanguards": 0,
-                    "aggress_rangers": 0,
                     "core_orbit_radius": 0,
                     "core_hold": False,
                     "core_target": None,

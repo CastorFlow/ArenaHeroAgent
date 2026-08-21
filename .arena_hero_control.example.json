@@ -1,7 +1,4 @@
 {
-  "mode": "develop",
-  "aggress_vanguards": 0,
-  "aggress_rangers": 0,
   "core_orbit_radius": 0,
   "core_hold": false,
   "core_target": null,

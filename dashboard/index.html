@@ -174,7 +174,7 @@
 <div id="login-screen">
   <div id="login-box">
     <h1>🔐 Arena Hero Agent</h1>
-    <p style="color:var(--muted);line-height:1.65;margin:0 0 14px">输入 Arena Hero API Key。服务端会用官方 SDK 验证；验证成功后才会启动 Agent 并加载默认配置。Key 不会写入磁盘。</p>
+    <p style="color:var(--muted);line-height:1.65;margin:0 0 14px">输入 Arena Hero API Key。服务端会用官方 SDK 验证；验证成功并收到首个 Turn 后才会启动 Agent 并加载闪电模式默认配置。Key 不会写入磁盘，浏览器只保存随机会话 Token。会话在最后一次活动 12 小时后失效，持续使用会滑动续期；网页会话失效不会停止后台 Agent。</p>
     <input id="password-input" type="password" placeholder="输入 Arena Hero API Key" autocomplete="off" spellcheck="false">
     <button id="login-btn">验证并启动</button>
     <div id="login-error"></div>

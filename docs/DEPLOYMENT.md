@@ -1,31 +1,34 @@
-# 部署、默认地址与自定义域名
+# Linux / VPS 部署、默认地址与自定义域名
 
-本项目的推荐入口是 `arena_hero_dashboard_server.py`。服务启动时**不会预先读取或保存 Arena Hero API Key，也不会立即启动 Agent**。用户在登录页输入 API Key 后，服务会启动真实的 `arena_hero_tactic.py` 子进程；只有官方 SDK 完成鉴权并收到首个完整 Turn，网页才会获得控制台会话并加载默认配置。
+本文部署的是 Dashboard 和由其监管的 Lightning Agent。API Key 不写进 systemd unit、仓库或服务器配置文件，而是在网页登录时临时传给 Agent 子进程。
 
-## 1. 默认地址
+## 1. 网络边界与默认地址
 
-Dashboard 默认配置：
+Dashboard 默认监听：
 
 ```text
-listen: 127.0.0.1:8766
-URL:    http://127.0.0.1:8766/
+127.0.0.1:8766
 ```
 
-- **Windows / WSL2 本机**：由于本机 WSL2 已启用 mirrored networking，Windows 浏览器可直接访问 `http://127.0.0.1:8766/`。
-- **VPS 且没有域名**：推荐仍只监听 VPS 回环地址，通过 SSH 隧道访问：
+VPS 本机地址是：
 
-  ```bash
-  ssh -L 8766:127.0.0.1:8766 vps168
-  ```
+```text
+http://127.0.0.1:8766/
+```
 
-  隧道保持运行时，在本机浏览器打开 `http://127.0.0.1:8766/`。
-- `--host 0.0.0.0` 会让服务可通过 `http://VPS_IP:8766/` 访问，但 API Key 会经过该连接传输。**不要在公网直接使用未加密的 HTTP 或裸露 8766 端口。**
+这不是默认公网地址。除非配置 SSH 隧道或 HTTPS 反向代理，否则远程电脑不能直接打开它。
 
-路线叠加层桥接服务仍默认为 `http://127.0.0.1:8765/`，仅供本机 Chrome/Edge 扩展使用，不应暴露到公网。
+可选浏览器扩展桥接服务默认监听：
 
-## 2. Linux / VPS 安装
+```text
+127.0.0.1:8765
+```
 
-以下路径只是示例，可替换为自己的安装目录：
+8765 只适合本机扩展，不要暴露公网。纯 VPS Dashboard 部署不需要启动 8765。
+
+## 2. 安装项目
+
+以下以 `/opt/ArenaHeroAgent` 为例，可替换成自己的安装目录：
 
 ```bash
 git clone git@github.com:CastorFlow/ArenaHeroAgent.git /opt/ArenaHeroAgent
@@ -37,9 +40,7 @@ python -m pip install -r requirements.txt
 ./scripts/start_dashboard.sh
 ```
 
-启动后不要在服务器 shell 中设置 `ARENA_HERO_API_KEY`。在浏览器登录页输入 Key 即可；Key 只进入 Agent 子进程环境，不写入项目文件。
-
-直接运行时可使用这些环境变量：
+直接运行可使用：
 
 ```bash
 export ARENA_HERO_DASHBOARD_HOST=127.0.0.1
@@ -48,14 +49,47 @@ export ARENA_HERO_AGENT_START_TIMEOUT=25
 ./scripts/start_dashboard.sh
 ```
 
-## 3. systemd 常驻
+不要在服务器 shell、service 文件或 `.env` 中预置用于网页初始化的 API Key。浏览器提交 Key 后，它只进入 Agent 子进程环境。
 
-仓库提供 `deploy/arena-hero-dashboard.service.example`。先修改：
+## 3. 无域名访问
 
-- `User` / `Group`：运行项目的低权限用户。
-- `WorkingDirectory`、`ExecStart`、`ReadWritePaths`：项目实际绝对路径。
+在本地电脑建立 SSH 隧道：
 
-然后安装：
+```bash
+ssh -L 8766:127.0.0.1:8766 <user>@<vps>
+```
+
+保持 SSH 连接打开，然后本机浏览器访问：
+
+```text
+http://127.0.0.1:8766/
+```
+
+这时 API Key 通过 SSH 加密隧道传输，不需要把 8766 开到公网。
+
+## 4. systemd 常驻
+
+仓库提供：
+
+```text
+deploy/arena-hero-dashboard.service.example
+```
+
+先按实际环境修改：
+
+- `User`、`Group`；
+- `WorkingDirectory`；
+- `ExecStart`；
+- `ReadWritePaths`。
+
+示例模板保持：
+
+```text
+Environment=ARENA_HERO_DASHBOARD_HOST=127.0.0.1
+Environment=ARENA_HERO_DASHBOARD_PORT=8766
+```
+
+安装并启动：
 
 ```bash
 sudo cp deploy/arena-hero-dashboard.service.example \
@@ -71,70 +105,89 @@ sudo systemctl status arena-hero-dashboard
 journalctl -u arena-hero-dashboard -f
 ```
 
-service 中不配置 API Key。Dashboard 收到有效 Key 后才启动 Agent，服务退出时会停止由它监管的 Agent 子进程。
+Dashboard 收到有效 Key 后才启动 Agent。只要 systemd 中的 Dashboard 服务和它监管的 Agent 子进程仍在运行，关闭网页或网页会话失效都不会让 Agent 停止。Dashboard 服务停止或重启时会停止当前监管的 Agent。
 
-## 4. 绑定自己的域名
+## 5. 绑定自己的域名
 
-假设域名是 `arena.example.com`。
+下面假设域名为 `arena.example.com`。
 
-### 4.1 DNS
+### 5.1 配置 DNS
 
-在域名 DNS 控制台增加：
+在 DNS 服务商处添加：
 
-- `A` 记录：`arena.example.com` 指向 VPS IPv4。
-- 有 IPv6 时可同时增加 `AAAA` 记录。
+```text
+A     arena.example.com    -> VPS IPv4
+AAAA  arena.example.com    -> VPS IPv6（可选）
+```
 
-等待解析生效后确认：
+确认解析：
 
 ```bash
 getent ahosts arena.example.com
 ```
 
-### 4.2 先启用证书申请用的 Nginx 配置
+### 5.2 安装 Nginx 和 Certbot
 
-首次申请证书时，最终配置引用的证书文件还不存在，不能直接启用最终模板。先复制临时 HTTP-only 模板并替换其中的域名：
+Debian/Ubuntu 示例：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y nginx certbot python3-certbot-nginx
+```
+
+确保 VPS 的 80/443 端口可被公网访问。修改防火墙或云平台安全组属于部署环境操作，应按自己的安全策略执行。
+
+### 5.3 启用临时证书申请配置
+
+复制模板：
 
 ```bash
 sudo cp deploy/nginx-arena-hero-bootstrap.conf.example \
   /etc/nginx/sites-available/arena-hero
 sudo editor /etc/nginx/sites-available/arena-hero
-sudo ln -s /etc/nginx/sites-available/arena-hero /etc/nginx/sites-enabled/arena-hero
+```
+
+把：
+
+```nginx
+server_name arena.example.com;
+```
+
+替换成自己的域名。然后启用：
+
+```bash
+sudo ln -s /etc/nginx/sites-available/arena-hero \
+  /etc/nginx/sites-enabled/arena-hero
 sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-临时模板对普通请求只返回 `503 HTTPS setup pending`，不会把登录页暴露在公网 HTTP 上。Certbot 的 Nginx 插件会临时处理 ACME 验证。
+临时模板只返回 `HTTPS setup pending`，不会通过公网 HTTP 展示 API Key 登录页。
 
-如果 `/etc/nginx/sites-enabled/default` 会抢占同一域名或默认站点，可先移除该符号链接，再执行 `nginx -t`。
-
-### 4.3 申请证书
-
-确认 DNS 已指向 VPS、80 端口已由 Nginx 接收后运行：
+### 5.4 申请 HTTPS 证书
 
 ```bash
 sudo certbot certonly --nginx -d arena.example.com
 ```
 
-成功后应存在：
+证书通常生成在：
 
 ```text
 /etc/letsencrypt/live/arena.example.com/fullchain.pem
 /etc/letsencrypt/live/arena.example.com/privkey.pem
 ```
 
-### 4.4 切换到最终 HTTPS 反向代理
+### 5.5 切换最终反向代理配置
 
-复制最终模板，至少替换两处 `server_name` 和两条证书路径中的示例域名：
+复制最终模板：
 
 ```bash
 sudo cp deploy/nginx-arena-hero.conf.example \
   /etc/nginx/sites-available/arena-hero
 sudo editor /etc/nginx/sites-available/arena-hero
-sudo nginx -t
-sudo systemctl reload nginx
 ```
 
-最终配置的关键内容是：
+需要修改的关键位置：
 
 ```nginx
 server_name arena.example.com;
@@ -143,35 +196,69 @@ ssl_certificate_key /etc/letsencrypt/live/arena.example.com/privkey.pem;
 proxy_pass http://127.0.0.1:8766;
 ```
 
-模板会把 80 端口强制跳转到 HTTPS，并传递真实客户端地址。systemd 服务中应保留：
+模板中有两个 `server_name`，证书路径中也各包含一次示例域名，必须全部替换。检查并重载：
 
-```text
-Environment=ARENA_HERO_DASHBOARD_TRUST_PROXY=true
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
 ```
 
-只有当请求必定经过自己控制的回环反向代理时才启用这个变量，否则客户端可以伪造 `X-Forwarded-For` 绕过应用层登录限流。
-
-完成后访问：
+之后访问：
 
 ```text
 https://arena.example.com/
 ```
 
-API Key 会在初始化请求中传输，因此不要在证书尚未生效时通过公网 HTTP 输入 Key。
+应用本身仍监听 `127.0.0.1:8766`，Nginx 负责公网 HTTPS。不要把应用监听地址改成 `0.0.0.0` 来绕过反向代理。
 
-## 5. 登录与默认配置行为
+### 5.6 可信代理设置
 
-1. 浏览器 POST `/api/login`，请求体只包含本次输入的 API Key。
-2. Dashboard 通过环境变量把 Key 交给真实 Agent 子进程。
-3. 官方 SDK 鉴权成功且收到首个 Turn 后，Agent 写入不含凭据的生命周期状态。
-4. Dashboard 首次运行时创建 `.arena_hero_control.json`，写入完整默认配置，默认模式为 `develop`。
-5. Dashboard 返回随机的 12 小时会话 Token，后续控制请求不再携带 API Key。
+Nginx 模板会传递真实客户端地址。systemd 模板中的：
 
-Key 不会写入控制文件、状态文件或日志。父进程只保留不可逆的 HMAC 指纹，用来识别同一个 Key 的重复登录。若要切换到另一个 API Key，请先重启 Dashboard 服务，避免误停正在运行的账号 Agent。
+```text
+Environment=ARENA_HERO_DASHBOARD_TRUST_PROXY=true
+```
 
-## 6. 安全检查
+只应在 Dashboard 只能接收自己控制的回环反代请求时启用。如果直接把 Dashboard 暴露给不可信网络却仍信任转发头，客户端可能伪造 `X-Forwarded-For`，削弱登录限流。
 
-公网发布前至少确认：
+## 6. 登录、默认配置与 12 小时会话
+
+登录流程：
+
+1. 浏览器向 `/api/login` 提交本次输入的 API Key。
+2. Dashboard 仅通过子进程环境把 Key 交给真实 Agent。
+3. 官方 SDK 鉴权成功并收到首个可操作 Turn 后，Agent 发布不含凭据的生命周期状态。
+4. 首次成功登录会创建 `.arena_hero_control.json`，写入 Lightning 默认配置。
+5. Dashboard 返回随机网页会话 Token，后续请求不再携带 API Key。
+
+会话 Token 使用**滑动 12 小时空闲期限**：
+
+- 每次成功认证请求都从当前时间重新延长 12 小时；
+- 页面持续轮询时通常不会自动退出；
+- 最后一次活动后连续 12 小时无请求才失效；
+- 失效后输入同一个 API Key 可取得新 Token；
+- Token 失效不会停止 Agent，也不会让 VPS 服务在 12 小时后自动停止。
+
+父进程只保留进程内随机 HMAC 生成的 Key 指纹，用来判断是否为同一个 Key。不同 Key 尝试登录正在运行的 Dashboard 会得到冲突；切换账号前应先重启 Dashboard 服务。
+
+## 7. 更新部署
+
+建议先停止服务、拉取代码、更新依赖、运行测试，再启动：
+
+```bash
+sudo systemctl stop arena-hero-dashboard
+cd /opt/ArenaHeroAgent
+git pull --ff-only
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m pytest -q
+sudo systemctl start arena-hero-dashboard
+sudo systemctl status arena-hero-dashboard
+```
+
+停止 Dashboard 会停止它监管的 Agent，因此应在可以接受游戏中断时更新。
+
+## 8. 安全检查
 
 ```bash
 ss -ltnp | grep -E ':8765|:8766'
@@ -181,7 +268,10 @@ sudo nginx -t
 
 预期：
 
-- 8766 只监听 `127.0.0.1`。
-- 8765 不对公网开放。
-- 域名强制跳转 HTTPS。
-- `.env`、`.arena_hero_api_key.dpapi`、`.arena_hero_agent_status.json`、日志和运行状态均未进入 Git。
+- 8766 只监听 `127.0.0.1`；
+- 8765 未在 VPS 上启动，或只监听回环；
+- 域名的 HTTP 请求跳转 HTTPS；
+- API Key、会话 Token、运行状态、JSONL 和日志未进入 Git；
+- `.arena_hero_control.json` 不包含凭据。
+
+完整安全边界见仓库根目录的 [SECURITY.md](../SECURITY.md)。

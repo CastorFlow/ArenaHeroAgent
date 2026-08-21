@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Arena Hero Agent Route Overlay",
   "version": "1.6.5",
-  "description": "Agent routes, browser map resource hints, live metrics, visible cell distance and ETA card, statistics, Chinese event log, modes, recall, rally marker, and core controls.",
+  "description": "Arena Hero Lightning Agent route overlay with browser resource hints, live metrics, statistics, Chinese event log, and visualization controls.",
   "minimum_chrome_version": "111",
   "permissions": [
     "storage"

@@ -3,12 +3,6 @@
 
   const CHANNEL = "arena-hero-route-overlay/v1";
   const OVERLAY_ATTRIBUTE = "data-arena-hero-agent-route-overlay";
-  const MODE_LABELS = {
-    develop: "发育",
-    aggress: "侵略",
-    beacon: "抢信标",
-    migrate: "迁移",
-  };
   const core = globalThis.ArenaHeroOverlayCore;
   if (!core) {
     return;
@@ -23,15 +17,7 @@
     browserIntel: { version: 1, source: "browser", captured_at: null, resources: [] },
     stats: null,
     logs: core.normalizeLogs({}),
-    control: {
-      mode: "develop",
-      recall: false,
-      raid_enabled: false,
-      raid_recall: false,
-      raid_vanguards: 1,
-      raid_rangers: 2,
-      beacon_target_distance: 0,
-    },
+    control: {},
     settings: core.normalizeSettings({}),
     serviceOnline: false,
     pointer: null,
@@ -60,10 +46,6 @@
     statusBar: null,
     statusMetrics: null,
     statusActions: null,
-    modeButton: null,
-    recallButton: null,
-    raidButton: null,
-    raidRecallButton: null,
     statsButton: null,
     statsPanel: null,
     statsOpen: false,
@@ -581,7 +563,7 @@
       marginBottom: "4px",
     });
     const shortcut = document.createElement("div");
-    shortcut.textContent = "快捷键：Alt+Shift+R 路线 · Alt+Shift+L 日志 · Alt+Shift+1 发育 · Alt+Shift+2 侵略 · Alt+Shift+C 召回";
+    shortcut.textContent = "快捷键：Alt+Shift+R 路线 · Alt+Shift+L 日志";
     Object.assign(shortcut.style, {
       color: "#8f9cad",
       fontSize: "11px",
@@ -597,27 +579,6 @@
     addColor(panel, "vanguardColor", "先锋路线颜色");
     addColor(panel, "rangerColor", "游侠路线颜色");
     addColor(panel, "resourceColor", "资源高亮颜色");
-    addControlNumber(
-      panel,
-      "beacon_target_distance",
-      "core↔信标目标距离",
-      "core 与信标的目标距离（格）：0=关闭；距离大于设定时 core 向信标推进，小于则远离",
-    );
-    addControlNumber(
-      panel,
-      "raid_vanguards",
-      "偷袭先锋人数",
-      "独立偷袭编组的先锋数量；0 表示不抽调先锋",
-      { maximum: 19, step: 1 },
-    );
-    addControlNumber(
-      panel,
-      "raid_rangers",
-      "偷袭游侠人数",
-      "独立偷袭编组的游侠数量；0 表示不抽调游侠",
-      { maximum: 19, step: 1 },
-    );
-
     const reset = document.createElement("button");
     reset.type = "button";
     reset.textContent = "恢复默认显示";
@@ -690,57 +651,6 @@
       gap: "4px 10px",
     });
 
-    const primaryActions = document.createElement("div");
-    Object.assign(primaryActions.style, {
-      display: "flex",
-      alignItems: "center",
-      flexWrap: "wrap",
-      gap: "4px",
-    });
-
-    const utilityActions = document.createElement("div");
-    Object.assign(utilityActions.style, {
-      display: "flex",
-      alignItems: "center",
-      flexWrap: "wrap",
-      gap: "4px",
-    });
-
-    const modeButton = document.createElement("button");
-    modeButton.type = "button";
-    applyButtonStyle(modeButton);
-    modeButton.title = "切换模式：发育 / 侵略 / 抢信标（Alt+Shift+1/2/3）";
-    modeButton.addEventListener("click", () => {
-      const order = ["develop", "aggress", "beacon"];
-      const next =
-        order[(order.indexOf(state.control.mode) + 1) % order.length];
-      updateControl({ mode: next });
-    });
-
-    const recallButton = document.createElement("button");
-    recallButton.type = "button";
-    applyButtonStyle(recallButton);
-    recallButton.title = "一键召回（Alt+Shift+C）：所有游侠/先锋回核心防守，再点一次解除";
-    recallButton.addEventListener("click", () => {
-      updateControl({ recall: !state.control.recall });
-    });
-
-    const raidButton = document.createElement("button");
-    raidButton.type = "button";
-    applyButtonStyle(raidButton);
-    raidButton.title = "独立偷袭编组：无限扩圈寻找无人值守的敌方 Core";
-    raidButton.addEventListener("click", () => {
-      updateControl({ raid_enabled: !state.control.raid_enabled });
-    });
-
-    const raidRecallButton = document.createElement("button");
-    raidRecallButton.type = "button";
-    applyButtonStyle(raidRecallButton);
-    raidRecallButton.title = "只召回偷袭编组；侵略模式和其他单位不受影响";
-    raidRecallButton.addEventListener("click", () => {
-      updateControl({ raid_recall: !state.control.raid_recall });
-    });
-
     const makeStatus = (key, title) => {
       const span = document.createElement("span");
       span.title = title;
@@ -811,12 +721,11 @@
       syncControls();
     });
 
-    primaryActions.append(modeButton, recallButton, raidButton, raidRecallButton);
     if (state.toolbar) {
       utilityActions.appendChild(state.toolbar);
     }
     utilityActions.append(statsButton, locatorButton, logsButton);
-    actions.append(primaryActions, utilityActions);
+    actions.append(utilityActions);
     bar.append(metrics, actions);
 
     for (const button of bar.querySelectorAll("button")) {
@@ -833,10 +742,6 @@
     state.statusBar = bar;
     state.statusMetrics = metrics;
     state.statusActions = actions;
-    state.modeButton = modeButton;
-    state.recallButton = recallButton;
-    state.raidButton = raidButton;
-    state.raidRecallButton = raidRecallButton;
     state.statsButton = statsButton;
     state.locatorButton = locatorButton;
     state.logsButton = logsButton;
@@ -937,17 +842,6 @@
         heading: "实时快照",
         rows: [
           ["tick", "Tick"],
-          ["mode", "模式"],
-          ["recall", "召回状态"],
-          ["raid_enabled", "偷袭模式"],
-          ["raid_recall", "偷袭召回"],
-          ["raid_selected", "偷袭编组 (先/游)"],
-          ["raid_target", "偷袭目标 Core"],
-          ["raid_sweep_radius", "偷袭扫荡半径"],
-          ["migration_candidate", "迁移候选点"],
-          ["migration_target", "迁移目标"],
-          ["migration_site_checked", "候选点已检查"],
-          ["migration_site_score", "障碍半侧评分"],
           ["resources", "资源 / 容量"],
           ["population", "人口 (工/先/游)"],
           ["core", "核心 HP / 盾"],
@@ -955,7 +849,6 @@
           ["beacon_position", "信标坐标"],
           ["visible_enemies", "可见敌人"],
           ["core_threat_count", "Core 周边敌军"],
-          ["core_reinforcement_active", "主力回援"],
           ["owns_beacon", "持有信标"],
           ["visible_resource_cells", "当前可见矿点"],
           ["known_resource_cells", "记忆矿点"],
@@ -963,8 +856,6 @@
           ["browser_intel_online", "浏览器数据状态"],
           ["browser_intel_age_seconds", "浏览器数据延迟"],
           ["worker_cargo", "工人携带资源"],
-          ["exploring_workers", "向外探索工人"],
-          ["max_worker_search_radius", "最远探索半径"],
           ["active_routes", "规划路线 / 完整路线"],
           ["tick_interval", "回合间隔"],
         ],
@@ -1342,7 +1233,6 @@
       setText("bar:beacon", "信标 -");
       return;
     }
-    const mode = MODE_LABELS[stats.mode] || "发育";
     setText("bar:tick", `Tick ${stats.tick}`);
     setText("bar:resources", `资源 ${stats.resources}/${stats.capacity}`);
     setText(
@@ -1351,24 +1241,14 @@
     );
     setText(
       "bar:enemies",
-      `敌 ${stats.visible_enemies}${stats.core_reinforcement_active ? " · 回援" : ""}`,
+      `敌 ${stats.visible_enemies}`,
     );
     setText("bar:core", `HP ${stats.core_hp}/${stats.core_shield}`);
     setText("bar:beacon", stats.owns_beacon ? "信标✓" : "信标✗");
 
     const pairs = {
       "stats:tick": String(stats.tick),
-      "stats:mode": mode,
-      "stats:recall": state.control.recall ? "已召回" : "正常",
-      "stats:raid_enabled": stats.raid_enabled ? "开启" : "关闭",
-      "stats:raid_recall": stats.raid_recall ? "召回中" : "正常",
-      "stats:raid_selected": `${stats.raid_selected_vanguards ?? 0}/${stats.raid_selected_rangers ?? 0}`,
-      "stats:raid_target": formatPosition(stats.raid_core_position),
-      "stats:raid_sweep_radius": String(stats.raid_sweep_radius ?? 18),
-      "stats:migration_candidate": formatPosition(stats.migration_candidate),
-      "stats:migration_target": formatPosition(stats.migration_target),
-      "stats:migration_site_checked": stats.migration_site_checked ? "是" : "否",
-      "stats:migration_site_score": `${stats.migration_site_score}/9`,
+      "stats:mode": "闪电速攻",
       "stats:resources": `${stats.resources}/${stats.capacity}`,
       "stats:population": `${stats.workers}/${stats.vanguards}/${stats.rangers}`,
       "stats:core": `${stats.core_hp}/${stats.core_shield}`,
@@ -1376,9 +1256,6 @@
       "stats:beacon_position": formatPosition(stats.beacon_position),
       "stats:visible_enemies": String(stats.visible_enemies),
       "stats:core_threat_count": String(stats.core_threat_count),
-      "stats:core_reinforcement_active": stats.core_reinforcement_active
-        ? "进行中"
-        : "未触发",
       "stats:owns_beacon": stats.owns_beacon ? "是" : "否",
       "stats:visible_resource_cells": String(stats.visible_resource_cells),
       "stats:known_resource_cells": String(stats.known_resource_cells),
@@ -1388,8 +1265,6 @@
         ? `${stats.browser_intel_age_seconds} 秒`
         : "-",
       "stats:worker_cargo": String(stats.worker_cargo),
-      "stats:exploring_workers": String(stats.exploring_workers),
-      "stats:max_worker_search_radius": String(stats.max_worker_search_radius),
       "stats:active_routes": `${stats.active_routes}/${stats.complete_routes}`,
       "stats:tick_interval": `${stats.tick_interval} tick`,
       "stats:total_resources_harvested": String(stats.total_resources_harvested),
@@ -1493,42 +1368,6 @@
     }
     if (state.settingsButton) {
       state.settingsButton.style.color = state.settingsOpen ? "#9bcbbd" : "#d9e1eb";
-    }
-    if (state.modeButton) {
-      const mode = state.control.mode;
-      state.modeButton.textContent =
-        mode === "beacon"
-          ? "🚩 抢信标"
-          : mode === "aggress"
-            ? "⚔ 侵略"
-            : "🌱 发育";
-      state.modeButton.style.color =
-        mode === "beacon" ? "#c8a3e8" : mode === "aggress" ? "#d98a7a" : "#9bcbbd";
-    }
-    if (state.recallButton) {
-      const recall = state.control.recall;
-      state.recallButton.textContent = recall ? "解除召回" : "一键召回";
-      state.recallButton.style.color = recall ? "#d98a7a" : "#9bcbbd";
-    }
-    if (state.raidButton) {
-      const enabled = Boolean(state.control.raid_enabled);
-      state.raidButton.textContent = enabled ? "偷袭 开" : "偷袭 关";
-      state.raidButton.style.color = enabled ? "#e0b36b" : "#8f9cad";
-    }
-    if (state.raidRecallButton) {
-      const recall = Boolean(state.control.raid_recall);
-      state.raidRecallButton.textContent = recall ? "偷袭解除召回" : "偷袭召回";
-      state.raidRecallButton.style.color = recall ? "#d98a7a" : "#9bcbbd";
-    }
-    if (state.settingInputs.has("beacon_target_distance")) {
-      const entry = state.settingInputs.get("beacon_target_distance");
-      entry.input.value = String(state.control.beacon_target_distance ?? 0);
-    }
-    for (const key of ["raid_vanguards", "raid_rangers"]) {
-      const entry = state.settingInputs.get(key);
-      if (entry) {
-        entry.input.value = String(state.control[key] ?? (key === "raid_vanguards" ? 1 : 2));
-      }
     }
     if (state.statsPanel) {
       state.statsPanel.style.display = state.statsOpen ? "block" : "none";
@@ -2277,44 +2116,6 @@
     context.restore();
   }
 
-  function drawRally(context, rect) {
-    const rally = state.control.rally_point;
-    if (!Array.isArray(rally) || rally.length !== 2) {
-      return;
-    }
-    const center = screenPoint(rally, rect.width, rect.height);
-    if (!center) {
-      return;
-    }
-    const size = state.camera.cell;
-    context.save();
-    // 标记点
-    context.fillStyle = "rgba(240, 185, 60, 0.85)";
-    context.strokeStyle = "rgba(20, 16, 4, 0.9)";
-    context.lineWidth = 2;
-    context.beginPath();
-    context.arc(center.x, center.y, Math.max(5, size * 0.32), 0, Math.PI * 2);
-    context.fill();
-    context.stroke();
-    // 旗帜杆 + 旗帜
-    const flagX = center.x + Math.max(4, size * 0.28);
-    const flagY = center.y - Math.max(8, size * 0.5);
-    context.strokeStyle = "rgba(240, 185, 60, 0.9)";
-    context.lineWidth = 2;
-    context.beginPath();
-    context.moveTo(center.x, center.y);
-    context.lineTo(center.x, flagY);
-    context.stroke();
-    context.fillStyle = "rgba(240, 185, 60, 0.9)";
-    context.beginPath();
-    context.moveTo(center.x, flagY);
-    context.lineTo(flagX, flagY + Math.max(4, size * 0.22));
-    context.lineTo(center.x, flagY + Math.max(8, size * 0.44));
-    context.closePath();
-    context.fill();
-    context.restore();
-  }
-
   function drawLocator(context, rect) {
     // 追踪目标：正在追踪的单位 或 临时标记
     let position = null;
@@ -2454,7 +2255,6 @@
       drawHover(state.context, rect, hover);
       drawSelection(state.context, rect);
       renderDistanceCard(rect);
-      drawRally(state.context, rect);
     drawLocator(state.context, rect);
     drawHud(state.context, rect, hover);
     renderStatusBar();
@@ -2496,39 +2296,7 @@
       } else if (message.kind === "logs" && message.payload && typeof message.payload === "object") {
         updateLogs(message.payload);
       } else if (message.kind === "control" && message.payload && typeof message.payload === "object") {
-        state.control = {
-          mode: ["develop", "aggress", "beacon", "migrate"].includes(message.payload.mode)
-            ? message.payload.mode
-            : "develop",
-          recall: Boolean(message.payload.recall),
-          raid_enabled: Boolean(message.payload.raid_enabled),
-          raid_recall: Boolean(message.payload.raid_recall),
-          raid_vanguards:
-            typeof message.payload.raid_vanguards === "number"
-              ? message.payload.raid_vanguards
-              : state.control.raid_vanguards ?? 1,
-          raid_rangers:
-            typeof message.payload.raid_rangers === "number"
-              ? message.payload.raid_rangers
-              : state.control.raid_rangers ?? 2,
-          beacon_target_distance:
-            typeof message.payload.beacon_target_distance === "number"
-              ? message.payload.beacon_target_distance
-              : state.control.beacon_target_distance ?? 0,
-          rally_point:
-            Array.isArray(message.payload.rally_point) &&
-            message.payload.rally_point.length === 2
-              ? [Number(message.payload.rally_point[0]), Number(message.payload.rally_point[1])]
-              : null,
-          aggress_vanguards:
-            typeof message.payload.aggress_vanguards === "number"
-              ? message.payload.aggress_vanguards
-              : state.control.aggress_vanguards ?? 0,
-          aggress_rangers:
-            typeof message.payload.aggress_rangers === "number"
-              ? message.payload.aggress_rangers
-              : state.control.aggress_rangers ?? 0,
-        };
+        state.control = message.payload;
         syncControls();
         renderStatusBar();
       } else if (message.kind === "status") {
@@ -2569,48 +2337,6 @@
         renderLogs();
       }
       syncControls();
-    } else if (!editing && event.altKey && event.shiftKey && event.code === "Digit1") {
-      event.preventDefault();
-      updateControl({ mode: "develop" });
-    } else if (!editing && event.altKey && event.shiftKey && event.code === "Digit2") {
-      event.preventDefault();
-      updateControl({ mode: "aggress" });
-    } else if (!editing && event.altKey && event.shiftKey && event.code === "Digit3") {
-      event.preventDefault();
-      updateControl({ mode: "beacon" });
-    } else if (!editing && event.altKey && event.shiftKey && event.code === "KeyC") {
-      event.preventDefault();
-      updateControl({ recall: !state.control.recall });
-    } else if (!editing && event.altKey && event.shiftKey && event.code === "KeyM") {
-      event.preventDefault();
-      // Alt+Shift+M：在鼠标悬停处设置兵力集结标记
-      const mapCanvas = findMapCanvas(performance.now());
-      if (mapCanvas && state.pointer && state.camera) {
-        const rect = mapCanvas.getBoundingClientRect();
-        const localX = state.pointer.x - rect.left;
-        const localY = state.pointer.y - rect.top;
-        if (
-          localX >= 0 &&
-          localY >= 0 &&
-          localX < rect.width &&
-          localY < rect.height
-        ) {
-          const cell = core.screenToGrid(
-            localX,
-            localY,
-            state.camera,
-            rect.width,
-            rect.height,
-          );
-          if (cell) {
-            updateControl({ rally_point: [cell[0], cell[1]] });
-          }
-        }
-      }
-    } else if (!editing && event.altKey && event.shiftKey && event.code === "KeyU") {
-      event.preventDefault();
-      // Alt+Shift+U：清除集结标记
-      updateControl({ rally_point: null });
     }
   });
   window.addEventListener("blur", () => {

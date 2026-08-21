@@ -314,7 +314,6 @@ class ChineseEventLogger:
         self._last_visible_enemies: int | None = None
         self._visible_enemy_ids: set[str] = set()
         self._enemy_core_owners: dict[str, str] = {}
-        self._last_mode: str | None = None
         self._last_owns_beacon: bool | None = None
         self._load_seen_ids()
 
@@ -392,8 +391,6 @@ class ChineseEventLogger:
         self,
         turn: Turn,
         unit_labels: Mapping[str, Any],
-        *,
-        mode: str,
     ) -> None:
         records: list[dict[str, Any]] = []
         for enemy in turn.visible_enemies:
@@ -500,13 +497,12 @@ class ChineseEventLogger:
                 )
         self._last_visible_enemies = visible_enemies
 
-        mode_labels = {"develop": "发育", "aggress": "侵略", "beacon": "抢信标"}
-        if self._last_mode is None:
+        if not self._seen and not self.path.is_file():
             records.append(
                 self._state_record(
                     turn.tick,
                     "日志系统已启动",
-                    f"开始记录 Arena Hero 事件，当前为{mode_labels.get(mode, mode)}模式",
+                    "开始记录 Arena Hero 闪电模式事件",
                     "系统",
                     "info",
                     "logger_started",
@@ -514,19 +510,6 @@ class ChineseEventLogger:
                     position=turn.core.position if turn.core is not None else None,
                 )
             )
-        elif mode != self._last_mode:
-            records.append(
-                self._state_record(
-                    turn.tick,
-                    "策略模式切换",
-                    f"策略已切换为{mode_labels.get(mode, mode)}模式",
-                    "系统",
-                    "info",
-                    f"mode:{mode}",
-                    now,
-                )
-            )
-        self._last_mode = mode
 
         owned_ids = {unit.id for unit in turn.units}
         if turn.core is not None:

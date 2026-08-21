@@ -124,8 +124,8 @@ class ChineseEventLogTests(unittest.TestCase):
             path = Path(directory) / "events.jsonl"
             logger = ChineseEventLogger(path)
 
-            logger.append_turn(turn, {}, mode="aggress")
-            logger.append_turn(turn, {}, mode="aggress")
+            logger.append_turn(turn, {})
+            logger.append_turn(turn, {})
 
             destroyed_event = ResolutionEvent(
                 event_id=UUID("00000000-0000-4000-8000-000000000303"),
@@ -144,7 +144,7 @@ class ChineseEventLogTests(unittest.TestCase):
                 beacon=ChampionBeacon(position=(0, 0)),
             )
             logger = ChineseEventLogger(path)
-            logger.append_turn(resolved_turn, {}, mode="aggress")
+            logger.append_turn(resolved_turn, {})
 
             records = [
                 json.loads(line)

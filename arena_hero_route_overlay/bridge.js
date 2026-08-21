@@ -6,13 +6,6 @@
   const POLL_INTERVAL_MS = 1500;
   const BROWSER_INTEL_MIN_INTERVAL_MS = 1200;
   const SETTINGS_KEY = "arenaHeroRouteOverlaySettingsV1";
-  const CONTROL_SHORTCUTS = new Set([
-    "KeyC",
-    "KeyM",
-    "Digit1",
-    "Digit2",
-    "Digit3",
-  ]);
   let trustedControlUntil = 0;
   let lastBrowserIntelSentAt = 0;
 
@@ -74,72 +67,6 @@
     });
   }
 
-  function handleControlUpdate(message) {
-    if (
-      !message.payload ||
-      typeof message.payload !== "object" ||
-      message.kind !== "control:update"
-    ) {
-      return;
-    }
-    if (performance.now() > trustedControlUntil) {
-      return;
-    }
-    trustedControlUntil = 0;
-    const payload = message.payload;
-    const update = {};
-    if (["develop", "aggress", "beacon", "migrate"].includes(payload.mode)) {
-      update.mode = payload.mode;
-    }
-    if (typeof payload.recall === "boolean") {
-      update.recall = payload.recall;
-    }
-    for (const key of ["raid_enabled", "raid_recall"]) {
-      if (typeof payload[key] === "boolean") {
-        update[key] = payload[key];
-      }
-    }
-    if (
-      typeof payload.beacon_target_distance === "number" &&
-      Number.isFinite(payload.beacon_target_distance)
-    ) {
-      update.beacon_target_distance = payload.beacon_target_distance;
-    }
-    if (payload.rally_point === null) {
-      update.rally_point = null;
-    } else if (
-      Array.isArray(payload.rally_point) &&
-      payload.rally_point.length === 2 &&
-      payload.rally_point.every(Number.isFinite)
-    ) {
-      update.rally_point = payload.rally_point;
-    }
-    for (const key of ["aggress_vanguards", "aggress_rangers"]) {
-      if (typeof payload[key] === "number" && Number.isFinite(payload[key])) {
-        update[key] = payload[key];
-      }
-    }
-    for (const key of ["raid_vanguards", "raid_rangers"]) {
-      if (typeof payload[key] === "number" && Number.isFinite(payload[key])) {
-        update[key] = payload[key];
-      }
-    }
-    if (!Object.keys(update).length) {
-      return;
-    }
-    send(
-      {
-        type: "ARENA_HERO_OVERLAY_SET_CONTROL",
-        update,
-      },
-      (failed, payload) => {
-        if (!failed && payload) {
-          publish("control", payload);
-        }
-      },
-    );
-  }
-
   document.addEventListener(
     "pointerdown",
     (event) => {
@@ -160,9 +87,7 @@
       const overlayInput =
         event.target instanceof Element &&
         Boolean(event.target.closest(`[${OVERLAY_ATTRIBUTE}="control"]`));
-      const shortcut =
-        event.altKey && event.shiftKey && CONTROL_SHORTCUTS.has(event.code);
-      if (event.isTrusted && (overlayInput || shortcut)) {
+      if (event.isTrusted && overlayInput) {
         trustedControlUntil = performance.now() + 5000;
       }
     },
@@ -221,8 +146,6 @@
       }, () => {});
     } else if (message.kind === "settings:update") {
       chrome.storage.local.set({ [SETTINGS_KEY]: message.payload });
-    } else if (message.kind === "control:update") {
-      handleControlUpdate(message);
     }
   });
 

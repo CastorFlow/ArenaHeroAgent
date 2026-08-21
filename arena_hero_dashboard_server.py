@@ -3,7 +3,8 @@
 The server listens on ``127.0.0.1:8766`` by default.  The login form accepts the
 Arena Hero API key, starts the real tactic with that key, waits until the
 official SDK authenticates and publishes the first actionable Turn, then
-returns a 12-hour dashboard session token.  The key is never written to disk.
+returns a random dashboard token with a sliding 12-hour idle timeout.  The key
+is never written to disk, and expiry of the browser token does not stop Agent.
 
 Use Nginx/Caddy and HTTPS when exposing the dashboard through a domain.  All
 data APIs require ``Authorization: Bearer <session token>``.
@@ -374,11 +375,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             if not self.server.control_path.is_file():
                 defaults = load_control(self.server.control_path)
-                save_control(
-                    self.server.control_path,
-                    defaults["mode"],
-                    defaults,
-                )
+                save_control(self.server.control_path, defaults)
             self._clear_login_rate()
             token = secrets.token_urlsafe(32)
             with self.server._tokens_lock:
@@ -399,10 +396,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             data = self._read_json_body()
             if data is None:
                 return
-            current = load_control(self.server.control_path)
-            mode = data.get("mode", current["mode"])
             try:
-                payload = save_control(self.server.control_path, mode, data)
+                payload = save_control(self.server.control_path, data)
             except ValueError as exc:
                 self._send_error(str(exc), HTTPStatus.BAD_REQUEST)
                 return

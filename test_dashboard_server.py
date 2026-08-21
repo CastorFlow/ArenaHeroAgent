@@ -117,7 +117,7 @@ class DashboardServerTests(unittest.TestCase):
             self.assertEqual(status, HTTPStatus.OK)
             self.assertTrue(payload["token"])
             self.assertEqual(payload["agent"]["state"], "running")
-            self.assertEqual(payload["config"]["mode"], "develop")
+            self.assertNotIn("mode", payload["config"])
             self.assertEqual(payload["config"]["spawn_ratio"]["worker"], 3)
             self.assertNotIn(VALID_KEY, json.dumps(payload))
             self.assertTrue((directory_path / ".arena_hero_control.json").is_file())
@@ -128,16 +128,17 @@ class DashboardServerTests(unittest.TestCase):
                 f"{base}/api/config", headers=headers
             )
             self.assertEqual(status, HTTPStatus.OK)
-            self.assertEqual(current["mode"], "develop")
+            self.assertNotIn("mode", current)
 
             status, _, changed = self.request(
                 f"{base}/api/config",
                 method="POST",
-                payload={"mode": "aggress"},
+                payload={"core_hold": True},
                 headers=headers,
             )
             self.assertEqual(status, HTTPStatus.OK)
-            self.assertEqual(changed["mode"], "aggress")
+            self.assertTrue(changed["core_hold"])
+            self.assertNotIn("mode", changed)
         self.assertEqual(supervisor.started, 1)
 
     def test_legacy_password_is_rejected_and_invalid_key_never_echoes(self) -> None:

@@ -39,13 +39,8 @@ DEFAULT_DASHBOARD_CONTROL_FIELDS = {
 
 
 def expected_control(**overrides: object) -> dict:
-    """构造 /control POST 返回的完整期望字典（旧字段 + 网页控制台新增字段默认值）。"""
-    payload: dict = {
-        "mode": "develop",
-        "aggress_vanguards": 0,
-        "aggress_rangers": 0,
-    }
-    payload.update(DEFAULT_DASHBOARD_CONTROL_FIELDS)
+    """构造 Lightning-only /control 返回的完整期望字典。"""
+    payload: dict = dict(DEFAULT_DASHBOARD_CONTROL_FIELDS)
     payload.update(overrides)
     return payload
 
@@ -152,7 +147,7 @@ class RouteOverlayServerTests(unittest.TestCase):
                 with urlopen(f"http://{host}:{port}/stats", timeout=2) as response:
                     payload = json.load(response)
                 self.assertEqual(payload["tick"], 7)
-                self.assertEqual(payload["mode"], "aggress")
+                self.assertEqual(payload["mode"], "lightning")
                 self.assertEqual(payload["workers"], 3)
                 self.assertEqual(payload["total_resources_harvested"], 12)
                 self.assertEqual(payload["event_totals"], {"CORE_SPAWN_SUCCEEDED": 2})
@@ -237,51 +232,59 @@ class RouteOverlayServerTests(unittest.TestCase):
 
                 request = Request(
                     f"{base}/control",
-                    data=json.dumps({"mode": "aggress"}).encode("utf-8"),
+                    data=json.dumps({"core_hold": True}).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                     method="POST",
                 )
                 with urlopen(request, timeout=2) as response:
                     posted = json.load(response)
-                self.assertEqual(posted, expected_control(mode="aggress"))
+                self.assertEqual(posted, expected_control(core_hold=True))
 
                 with urlopen(f"{base}/control", timeout=2) as response:
                     after = json.load(response)
-                self.assertEqual(after, expected_control(mode="aggress"))
+                self.assertEqual(after, expected_control(core_hold=True))
                 self.assertEqual(
                     json.loads(control_path.read_text(encoding="utf-8")),
-                    expected_control(mode="aggress"),
+                    expected_control(core_hold=True),
                 )
             finally:
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=2)
 
-    def test_control_rejects_invalid_mode(self) -> None:
+    def test_legacy_mode_fields_are_ignored(self) -> None:
         with TemporaryDirectory() as directory:
             directory_path = Path(directory)
             routes_path = directory_path / ".arena_hero_routes.json"
             routes_path.write_text("{}", encoding="utf-8")
-            server = create_server(routes_path, port=0)
+            control_path = directory_path / ".arena_hero_control.json"
+            control_path.write_text(
+                json.dumps(
+                    {
+                        "mode": "aggress",
+                        "aggress_vanguards": 9,
+                        "aggress_rangers": 9,
+                        "core_hold": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            server = create_server(routes_path, control_path=control_path, port=0)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             host, port = server.server_address
             try:
-                request = Request(
-                    f"http://{host}:{port}/control",
-                    data=json.dumps({"mode": "bogus"}).encode("utf-8"),
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                try:
-                    urlopen(request, timeout=2)
-                    self.fail("expected HTTP error for invalid mode")
-                except HTTPError as exc:
-                    self.assertEqual(exc.code, 400)
+                with urlopen(f"http://{host}:{port}/control", timeout=2) as response:
+                    payload = json.load(response)
             finally:
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=2)
+
+        self.assertEqual(payload, expected_control(core_hold=True))
+        self.assertNotIn("mode", payload)
+        self.assertNotIn("aggress_vanguards", payload)
+        self.assertNotIn("aggress_rangers", payload)
 
     def test_control_accepts_independent_comet_settings(self) -> None:
         with TemporaryDirectory() as directory:
@@ -415,9 +418,7 @@ class RouteOverlayServerTests(unittest.TestCase):
             control_path.write_text(
                 json.dumps(
                     {
-                        "mode": "aggress",
-                        "aggress_vanguards": 6,
-                        "aggress_rangers": 7,
+                        "core_hold": True,
                         "comet_active": True,
                         "comet_vanguards": 2,
                         "comet_rangers": 5,
@@ -436,7 +437,7 @@ class RouteOverlayServerTests(unittest.TestCase):
             try:
                 request = Request(
                     f"http://{host}:{port}/control",
-                    data=json.dumps({"aggress_rangers": 9}).encode("utf-8"),
+                    data=json.dumps({"comet_rangers": 9}).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                     method="POST",
                 )
@@ -450,12 +451,10 @@ class RouteOverlayServerTests(unittest.TestCase):
         self.assertEqual(
             posted,
             expected_control(
-                mode="aggress",
-                aggress_vanguards=6,
-                aggress_rangers=9,
+                core_hold=True,
                 comet_active=True,
                 comet_vanguards=2,
-                comet_rangers=5,
+                comet_rangers=9,
             ),
         )
 
@@ -557,7 +556,7 @@ class RouteOverlayServerTests(unittest.TestCase):
             try:
                 request = Request(
                     f"http://{host}:{port}/control",
-                    data=json.dumps({"mode": "aggress"}).encode("utf-8"),
+                    data=json.dumps({"core_hold": True}).encode("utf-8"),
                     headers={
                         "Content-Type": "application/json",
                         "Origin": "https://example.com",
@@ -626,30 +625,6 @@ class RouteOverlayServerTests(unittest.TestCase):
         self.assertEqual(stored, expected)
         self.assertNotIn("must-not-leak", json.dumps(posted))
 
-    def test_control_accepts_beacon_mode(self) -> None:
-        with TemporaryDirectory() as directory:
-            directory_path = Path(directory)
-            routes_path = directory_path / ".arena_hero_routes.json"
-            routes_path.write_text("{}", encoding="utf-8")
-            server = create_server(routes_path, port=0)
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            host, port = server.server_address
-            try:
-                request = Request(
-                    f"http://{host}:{port}/control",
-                    data=json.dumps({"mode": "beacon"}).encode("utf-8"),
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urlopen(request, timeout=2) as response:
-                    posted = json.load(response)
-                self.assertEqual(posted, expected_control(mode="beacon"))
-            finally:
-                server.shutdown()
-                server.server_close()
-                thread.join(timeout=2)
-
     def test_manifest_is_read_only_and_scoped(self) -> None:
         extension = Path(__file__).with_name("arena_hero_route_overlay")
         manifest = json.loads((extension / "manifest.json").read_text(encoding="utf-8"))
@@ -666,7 +641,7 @@ class RouteOverlayServerTests(unittest.TestCase):
         self.assertIn("chrome.storage.local", source)
         self.assertIn("alt+shift+r", source)
         self.assertIn("alt+shift+l", source)
-        self.assertIn("alt+shift+1", source)
+        self.assertNotIn("alt+shift+1", source)
         self.assertIn("/logs", source)
         self.assertIn("showresources", source)
         self.assertIn("showunitlabels", source)

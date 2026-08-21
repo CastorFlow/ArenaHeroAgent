@@ -19,7 +19,7 @@ EMPTY_ROUTES = {
 }
 EMPTY_STATS = {
     "tick": 0,
-    "mode": "develop",
+    "mode": "lightning",
     "comet_active": False,
     "comet_mode": "beacon",
     "comet_target": None,
@@ -48,7 +48,6 @@ EMPTY_STATS = {
     "beacon_status": "UNCLAIMED",
     "visible_enemies": 0,
     "core_threat_count": 0,
-    "core_reinforcement_active": False,
     "owns_beacon": False,
     "visible_resource_cells": 0,
     "known_resource_cells": 0,
@@ -61,8 +60,6 @@ EMPTY_STATS = {
     "active_routes": 0,
     "complete_routes": 0,
     "remembered_enemies": 0,
-    "exploring_workers": 0,
-    "max_worker_search_radius": 0,
     "tick_interval": 0,
     "observed_turns": 0,
     "elapsed_ticks": 0,
@@ -93,7 +90,6 @@ EMPTY_BROWSER_INTEL = {
     "captured_at": None,
     "resources": [],
 }
-VALID_MODES = {"develop", "aggress", "beacon", "migrate", "lightning"}
 # 网页控制台新增控制字段（与 arena_hero_strategy.TacticMemory 一致）。
 CONTROL_TRANSFER_MODES = {"star", "march", "fortify"}
 CONTROL_UNIT_TYPES = ("WORKER", "VANGUARD", "RANGER")
@@ -431,8 +427,8 @@ def _normalize_stats(payload: Any) -> dict[str, Any]:
         elif isinstance(value, dict):
             result[key] = _sanitize_dict(value)
         # 其余类型（None 等）直接丢弃。
-    if result["mode"] not in VALID_MODES:
-        result["mode"] = "develop"
+    # 闪电模式是唯一支持的顶层策略；忽略旧统计文件中的历史模式值。
+    result["mode"] = "lightning"
     return result
 
 
@@ -779,21 +775,8 @@ def load_control(path: Path) -> dict[str, Any]:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             return _default_control()
-        mode = data.get("mode", "develop")
-        if mode not in VALID_MODES:
-            mode = "develop"
-        result: dict[str, Any] = {
-            "mode": mode,
-        }
-        for key in ("aggress_vanguards", "aggress_rangers"):
-            raw_value = data.get(key, 0)
-            result[key] = (
-                max(0, int(raw_value))
-                if isinstance(raw_value, (int, float))
-                and not isinstance(raw_value, bool)
-                else 0
-            )
-        # === 网页控制台新增控制字段：回显读取值（save_control 做校验/落盘）===
+        result: dict[str, Any] = {}
+        # 闪电模式的网页控制字段；旧版本的 mode/aggress_* 字段不再回显。
         _read_dashboard_control_fields(data, result)
         return result
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
@@ -801,36 +784,18 @@ def load_control(path: Path) -> dict[str, Any]:
 
 
 def _default_control() -> dict[str, Any]:
-    """控制文件的完整默认值，含网页控制台新增字段。"""
-    payload: dict[str, Any] = {
-        "mode": "develop",
-        "aggress_vanguards": 0,
-        "aggress_rangers": 0,
-    }
+    """闪电模式控制文件的完整默认值。"""
+    payload: dict[str, Any] = {}
     _default_dashboard_control_fields(payload)
     return payload
 
 
 def save_control(
     path: Path,
-    mode: str,
     data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if mode not in VALID_MODES:
-        raise ValueError(f"mode must be one of {sorted(VALID_MODES)}")
     payload = load_control(path)
-    payload.update({"mode": mode})
     if data is not None:
-        for key in ("aggress_vanguards", "aggress_rangers"):
-            if key not in data:
-                continue
-            raw_value = data[key]
-            if not isinstance(raw_value, (int, float)) or isinstance(
-                raw_value,
-                bool,
-            ):
-                raise ValueError(f"{key} must be a number")
-            payload[key] = max(0, int(raw_value))
         # 网页控制台新增控制字段：严格校验后落盘。
         _apply_dashboard_control_fields(data, payload)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -949,10 +914,8 @@ class RouteOverlayHandler(BaseHTTPRequestHandler):
             temporary.replace(path)
             self._send_json(payload, HTTPStatus.OK)
             return
-        current = load_control(self.server.control_path)
-        mode = data.get("mode", current["mode"])
         try:
-            payload = save_control(self.server.control_path, mode, data)
+            payload = save_control(self.server.control_path, data)
         except ValueError as exc:
             self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return

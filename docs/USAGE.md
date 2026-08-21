@@ -1,64 +1,23 @@
-# 使用与配置
+# 使用与控制参数
 
-本文覆盖安装、凭据、运行方式、浏览器叠加层、控制字段、运行文件和常见故障。战术行为本身见 [STRATEGY.md](STRATEGY.md)。
+本项目只有一个顶层策略：**Lightning**。Dashboard 和浏览器叠加层不再提供其他顶层模式切换。
 
-## 1. 前置条件
+## 1. 登录并启动 Agent
 
-- Python 3.11 或更高版本。
-- Arena Hero API Key。
-- 需要叠加层时使用 Chrome 或 Edge 111+。
-- Windows 一键脚本需要 PowerShell 7 或 Windows PowerShell 5.1。
-
-项目只依赖官方 `arena-hero>=0.2.9,<0.3` SDK。SDK 负责 WebSocket、HTTP、模型验证、重连和幂等重试，项目只负责战术决策。
-
-## 2. Windows 安装
+### Windows
 
 ```powershell
 .\setup.ps1
-```
-
-脚本会：
-
-1. 检查 Python 版本是否至少为 3.11。
-2. 在 `.venv` 中创建隔离环境。
-3. 升级 `pip`。
-4. 安装 `requirements.txt`。
-5. 输出已安装的 Arena Hero SDK 版本。
-
-已有虚拟环境时脚本会复用它。跳过 `pip` 自身升级：
-
-```powershell
-.\setup.ps1 -SkipPipUpgrade
-```
-
-指定 Python 可执行文件：
-
-```powershell
-.\setup.ps1 -Python "C:\Python311\python.exe"
-```
-
-## 3. 推荐运行方式：网页输入 API Key
-
-Windows：
-
-```powershell
 .\start_all.ps1
 ```
 
-脚本会启动：
+访问：
 
-- Dashboard：`http://127.0.0.1:8766/`
-- 可选浏览器叠加层桥接：`http://127.0.0.1:8765/`
-
-Dashboard 启动时 Agent 尚未运行。用户在登录页输入 Arena Hero API Key 后，服务会启动真实 `arena_hero_tactic.py` 子进程，并等待官方 SDK 鉴权成功和首个完整 Turn；成功后才创建完整默认控制配置、签发 12 小时会话并显示控制台。API Key 不写入磁盘。
-
-停止本仓库启动的 Dashboard、Agent 和叠加层：
-
-```powershell
-.\stop_all.ps1
+```text
+http://127.0.0.1:8766/
 ```
 
-Linux / WSL2：
+### Linux / WSL2
 
 ```bash
 python3 -m venv .venv
@@ -67,232 +26,184 @@ python -m pip install -r requirements.txt
 ./scripts/start_dashboard.sh
 ```
 
-本机默认访问 `http://127.0.0.1:8766/`。VPS、自定义域名、HTTPS 和无域名 SSH 隧道见 [DEPLOYMENT.md](DEPLOYMENT.md)。
-
-### 首次初始化的默认配置
-
-首次成功登录且 `.arena_hero_control.json` 不存在时，服务会写入完整默认值，其中包括：
-
-- 主模式：`develop`
-- Core：不锁定、不迁移、轨道半径 0、转移模式 `star`
-- 造兵队列：空；默认比例为游侠/先锋/工人 `1:1:3`
-- 单位上限：工人 20，游侠/先锋 0（0 表示不设置额外上限）
-- 战时存底：150
-- 哈雷彗星任务：关闭
-
-所有字段以 `.arena_hero_control.example.json` 和网页控制台当前显示为准。
-
-## 4. 高级用法：DPAPI 或命令行直接运行 Agent
-
-网页初始化不需要 `set_key.ps1`。只有绕过 Dashboard、直接启动 Agent 时才需要下面的凭据方式。
-
-### Windows DPAPI
-
-```powershell
-.\set_key.ps1
-.\start_arena_hero.ps1
-```
-
-Key 会保存到 `.arena_hero_api_key.dpapi`，只能由当前 Windows 用户在当前机器上解密。该文件已被 Git 忽略，但仍应像凭据一样保护。
-
-### 环境变量或 `.env`
-
-`arena_hero_tactic.py` 也支持：
+默认同样访问：
 
 ```text
-ARENA_HERO_API_KEY=your-key
+http://127.0.0.1:8766/
 ```
 
-可以临时设置环境变量，或以 `.env.example` 为模板创建本地 `.env`。`.env` 是明文文件，只适合受控环境，并已被 Git 忽略。不要在共享 shell 历史、CI 日志或截图中暴露真实 Key。
+登录框中输入 Arena Hero API Key。服务端会：
 
-限定 Tick 数：
+1. 将 Key 仅通过子进程环境传给 `arena_hero_tactic.py`；
+2. 等待官方 SDK 鉴权并收到首个可操作 Turn；
+3. 成功后创建 Lightning 默认控制配置；
+4. 返回随机 Dashboard 会话 Token。
+
+无效、停用或无法完成初始化的 Key 不会进入控制台。
+
+## 2. 12 小时滑动会话
+
+12 小时限制针对的是**浏览器 Dashboard 会话 Token**，不是 Arena Hero API Key，也不是 Agent 的运行时长。
+
+- 每次成功的已认证 Dashboard 请求都会把 Token 的失效时间重置为“当前时间 + 12 小时”。
+- 页面保持打开并正常轮询时，会话会持续续期。
+- 最后一次成功请求后连续 12 小时没有活动，Token 才失效。
+- Token 失效后重新输入同一个 API Key，即可获得新会话并复用仍在运行的 Agent。
+- 会话失效、关闭浏览器或关闭电脑上的网页，不会停止 VPS 上的 Agent。
+- 停止 Dashboard 服务会停止它监管的 Agent 子进程；Agent 崩溃或显式停止服务也会结束运行。
+
+浏览器不会保存 API Key，只会在当前标签页的 `sessionStorage` 保存随机 Token。
+
+## 3. Dashboard 与本地叠加层
+
+- Dashboard：`http://127.0.0.1:8766/`
+- 可选扩展桥接：`http://127.0.0.1:8765/`
+
+8765 仅用于本机 Chrome/Edge 扩展读取路线、统计、事件与提交控制，不应暴露到公网。
+
+Dashboard 可查看或修改：
+
+- 当前 Tick、资源、人口、单位和 Agent 运行状态；
+- Lightning 路线、Core 轨迹、战况和事件；
+- Core 轨道、转移与敌情偏置；
+- 生产队列、比例、上限、补兵和战备资源；
+- Comet 小队任务。
+
+控制配置会写入 `.arena_hero_control.json`，不包含 API Key。Agent 每个 Turn 都会检查控制文件变化。
+
+## 4. 控制字段
+
+默认配置见 `.arena_hero_control.example.json`。
+
+### 4.1 Core
+
+| 字段 | 类型 / 范围 | 默认值 | 说明 |
+|---|---|---:|---|
+| `core_orbit_radius` | 非负整数 | `0` | Core 围绕原点的方形轨道半径；`0` 表示不启用自动轨道巡逻 |
+| `core_hold` | boolean | `false` | 强制 Core 驻扎，停止非必要移动 |
+| `core_target` | `[x, y]` 或 `null` | `null` | 用户指定的 Core 转移目标 |
+| `core_transfer_mode` | `star/march/fortify` | `star` | Core 转移期间的工人物流样式 |
+| `core_evade_enemies` | boolean | `false` | 可见敌人出现时优先远离；与追击同时开启时退避优先 |
+| `core_chase_enemies` | boolean | `false` | 可见敌人出现时增加靠近敌人的移动偏置 |
+| `core_pursue_beacon` | boolean | `false` | 让 Core 把当前信标位置作为临时转移目标 |
+
+Core 转移样式：
+
+- `star`：工人继续采集并向移动中的 Core 交付。
+- `march`：空载工人随 Core 急行，减少远距离采集拖延。
+- `fortify`：工人继续采集但在转移完成前暂缓集中交付。
+
+这些值只是 Lightning 内部的 Core 行为样式，不是顶层模式。
+
+### 4.2 生产
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `build_queue` | 单位类型数组 | `[]` | 最多 20 个预定单位；值为 `WORKER`、`VANGUARD`、`RANGER` |
+| `spawn_ratio` | 三个非负整数 | `1:1:3` | 游侠、先锋、工人的长期目标比例；某项为 `0` 表示停止常规生产该兵种，全部为 `0` 表示囤资源 |
+| `unit_caps` | 三个非负整数 | 工人 `20`，其余 `0` | 兵种独立上限；`0` 表示不设置该兵种上限 |
+| `replenish_threshold` | 三个非负整数 | 全部 `0` | 数量低于阈值时触发补兵 |
+| `replenish_priority` | 单位类型顺序 | 游侠、工人、先锋 | 多个兵种同时不足时的补兵优先级 |
+| `wartime_reserve` | 非负整数 | `150` | 经济允许时保留的治疗、修盾和补兵资源 |
+
+生产选择顺序大体为：预定队列、开局工人引导、紧急防线/医疗缺口、补兵阈值、兵种上限、正常比例。实际生产仍受当前资源、人口价格、Core 状态和 Core 所在格容量限制。
+
+### 4.3 Comet 小队
+
+| 字段 | 类型 / 范围 | 默认值 | 说明 |
+|---|---|---:|---|
+| `comet_active` | boolean | `false` | 开启或关闭 Comet 任务 |
+| `comet_mode` | `beacon/coordinate` | `beacon` | 追踪当前信标，或前往自定义坐标 |
+| `comet_target` | `[x, y]` 或 `null` | `null` | `coordinate` 目标；目标无效时任务不会出发 |
+| `comet_vanguards` | 非负整数 | `3` | 期望派出的先锋数 |
+| `comet_rangers` | 非负整数 | `3` | 期望派出的游侠数 |
+| `comet_min_reserve_vanguards` | 非负整数 | `3` | Core 周边最低保留先锋数 |
+| `comet_min_reserve_rangers` | 非负整数 | `3` | Core 周边最低保留游侠数 |
+| `comet_wounded_threshold` | `0.0` 到 `1.0` | `0.5` | 生命比例低于阈值时进入撤退/替补流程 |
+| `comet_rally_enabled` | boolean | `false` | 首批成员是否先集合再推进 |
+| `comet_rally_distance` | 非负整数 | `0` | 集合点相对目标的回退距离 |
+
+`beacon` 在这里表示 Comet 的目标来源，不是顶层策略模式。
+
+## 5. 配置文件示例
+
+```json
+{
+  "core_orbit_radius": 0,
+  "core_hold": false,
+  "core_target": null,
+  "core_transfer_mode": "star",
+  "core_evade_enemies": false,
+  "core_chase_enemies": false,
+  "core_pursue_beacon": false,
+  "build_queue": [],
+  "spawn_ratio": {"ranger": 1, "vanguard": 1, "worker": 3},
+  "unit_caps": {"worker": 20, "vanguard": 0, "ranger": 0},
+  "replenish_threshold": {"ranger": 0, "vanguard": 0, "worker": 0},
+  "replenish_priority": ["ranger", "worker", "vanguard"],
+  "wartime_reserve": 150,
+  "comet_active": false,
+  "comet_mode": "beacon",
+  "comet_target": null,
+  "comet_vanguards": 3,
+  "comet_rangers": 3,
+  "comet_min_reserve_vanguards": 3,
+  "comet_min_reserve_rangers": 3,
+  "comet_wounded_threshold": 0.5,
+  "comet_rally_enabled": false,
+  "comet_rally_distance": 0
+}
+```
+
+建议优先通过 Dashboard 修改，避免手写 JSON 时产生类型或拼写错误。
+
+## 6. 运行文件
+
+常见运行文件：
+
+| 文件 | 内容 |
+|---|---|
+| `.arena_hero_control.json` | 当前 Lightning 控制参数 |
+| `.arena_hero_agent_status.json` | Agent 初始化与生命周期状态，不含 Key |
+| `.arena_hero_memory.json` | 持久化战术记忆 |
+| `.arena_hero_routes.json` | 单位路线与目标 |
+| `.arena_hero_stats.json` | 脱敏统计 |
+| `.arena_hero_browser_intel.json` | 本地扩展提供的低可信资源提示 |
+| `arena_hero_telemetry.jsonl` | Tick 遥测 |
+| `arena_hero_events_zh.jsonl` | 中文事件 |
+| `arena_hero_battle_history.jsonl` | 战况历史 |
+| `arena_hero_core_trail.jsonl` | Core 轨迹 |
+
+这些文件和日志默认被 Git 忽略。不要把它们当作公开示例提交，因为其中可能包含账号运行状态或地图信息。
+
+## 7. 停止与重新登录
+
+Windows：
 
 ```powershell
-.\.venv\Scripts\python.exe .\arena_hero_tactic.py --max-turns 10
+.\stop_all.ps1
 ```
 
-## 5. Dashboard 参数和健康检查
+systemd：
 
 ```bash
-python arena_hero_dashboard_server.py --host 127.0.0.1 --port 8766
+sudo systemctl stop arena-hero-dashboard
 ```
 
-| 参数/环境变量 | 默认值 | 作用 |
-|---|---|---|
-| `--host` / `ARENA_HERO_DASHBOARD_HOST` | `127.0.0.1` | Dashboard 监听地址 |
-| `--port` / `ARENA_HERO_DASHBOARD_PORT` | `8766` | Dashboard 端口 |
-| `--agent-status-file` / `ARENA_HERO_AGENT_STATUS_FILE` | `.arena_hero_agent_status.json` | 无凭据 Agent 生命周期状态 |
-| `--agent-start-timeout` / `ARENA_HERO_AGENT_START_TIMEOUT` | `25` 秒 | 等待鉴权和首个 Turn 的上限 |
-| `ARENA_HERO_DASHBOARD_TRUST_PROXY` | false | 信任反代传来的客户端 IP，仅限回环反代部署 |
+同一个 API Key 重复登录会复用仍在运行的 Agent并签发新的网页会话。已有 Agent 正在运行时，使用不同 API Key 登录会返回冲突；如确实要切换账号，应先停止或重启 Dashboard 服务。
 
-公开健康检查：
+## 8. 无域名远程访问
+
+VPS 上不要直接公开 8766。使用 SSH 隧道：
 
 ```bash
-curl http://127.0.0.1:8766/api/health
+ssh -L 8766:127.0.0.1:8766 <user>@<vps>
 ```
 
-除 `/`、静态资源、`/api/login` 和 `/api/health` 外，其余 Dashboard API 都需要登录成功后签发的 Bearer 会话 Token。
+本机浏览器打开：
 
-## 6. 命令行参数
-
-`arena_hero_tactic.py` 支持：
-
-| 参数 | 默认值 | 作用 |
-|---|---|---|
-| `--max-turns N` | 不限制 | 成功提交 N 个 Turn 后退出 |
-| `--base-url URL` | `https://api.arenahero.io` | HTTP API 根地址 |
-| `--websocket-url URL` | SDK 从 HTTP 地址推导 | WebSocket 地址 |
-| `--memory-file PATH` | `.arena_hero_memory.json` | 持久战术记忆 |
-| `--telemetry-file PATH` | `arena_hero_telemetry.jsonl` | 每 Tick 决策遥测 |
-| `--stats-file PATH` | `.arena_hero_stats.json` | 叠加层统计快照 |
-| `--event-log-file PATH` | `arena_hero_events_zh.jsonl` | 中文事件日志 |
-
-对应环境变量：
-
-| 环境变量 | 作用 |
-|---|---|
-| `ARENA_HERO_API_KEY` | API Key |
-| `ARENA_HERO_BASE_URL` | HTTP API 根地址 |
-| `ARENA_HERO_WEBSOCKET_URL` | WebSocket 地址 |
-| `ARENA_HERO_MEMORY_FILE` | 战术记忆路径 |
-| `ARENA_HERO_TELEMETRY_FILE` | 遥测路径 |
-| `ARENA_HERO_STATS_FILE` | 统计路径 |
-| `ARENA_HERO_EVENT_LOG_FILE` | 中文日志路径 |
-| `ARENA_HERO_CONTROL_FILE` | 控制 JSON 路径 |
-| `ARENA_HERO_BROWSER_INTEL_FILE` | 浏览器资源提示路径 |
-| `ARENA_HERO_RECOVERY_TARGETS_FILE` | 人工恢复目标列表路径 |
-
-## 7. 浏览器叠加层
-
-### 安装
-
-1. 打开 `chrome://extensions` 或 `edge://extensions`。
-2. 启用开发者模式。
-3. 选择“加载已解压的扩展程序”。
-4. 选择 `arena_hero_route_overlay` 目录。
-5. 保持本地叠加层服务运行，并打开 `https://app.arenahero.io/arena`。
-
-叠加层会读取本地路线、统计和中文事件；它也会把浏览器当前地图中的资源格作为短期、低置信提示发送给 Agent。Agent 会验证时效、距离、当前视野和资源配额合理性，不会把浏览器提示当作服务器真相。
-
-### 控件
-
-| 控件 | 作用 |
-|---|---|
-| 模式 | 在发育、侵略、抢信标之间循环 |
-| 一键召回 | 所有战斗单位回 Core 防守；再次点击解除 |
-| 偷袭 | 启用独立 Core 搜索/斩首编组 |
-| 偷袭召回 | 只召回独立偷袭编组 |
-| 统计 | 显示资源、人口、成功/失败事件和长期计数 |
-| 定位 | 按单位或事件坐标聚焦地图 |
-| 日志 | 显示脱敏中文事件流 |
-| 设置 | 调整目标距离、偷袭编组数量和侵略编组数量 |
-
-快捷键：
-
-| 快捷键 | 作用 |
-|---|---|
-| `Alt+Shift+1` | 发育模式 |
-| `Alt+Shift+2` | 侵略模式 |
-| `Alt+Shift+3` | 抢信标模式 |
-| `Alt+Shift+C` | 切换全军召回 |
-| `Alt+Shift+R` | 切换路线显示 |
-| `Alt+Shift+L` | 切换中文日志 |
-| `Alt+Shift+M` | 在鼠标悬停格设置集结点 |
-| `Alt+Shift+U` | 清除集结点 |
-
-### 控制 JSON
-
-叠加层把控制写到 `.arena_hero_control.json`。没有叠加层时也可使用 `.arena_hero_control.example.json` 作为结构参考。
-
-| 字段 | 类型 | 含义 |
-|---|---|---|
-| `mode` | `develop/aggress/beacon/migrate/lightning` | 主模式 |
-| `recall` | boolean | 全军召回 |
-| `comet_active` | boolean | 哈雷彗星任务总开关 |
-| `comet_mode` | `beacon`/`coordinate` | 追踪信标（动态坐标）/ 打击自定义坐标 |
-| `comet_target` | `[x,y]` or null | coordinate 模式打击坐标（beacon 模式每 tick 从信标刷新） |
-| `comet_vanguards` | non-negative integer | 小队先锋数量 |
-| `comet_rangers` | non-negative integer | 小队游侠数量 |
-| `comet_min_reserve_vanguards` | non-negative integer | 轨道最低满血先锋保留（保卫 Core） |
-| `comet_min_reserve_rangers` | non-negative integer | 轨道最低满血游侠保留（保卫 Core） |
-| `comet_wounded_threshold` | 0.0–1.0 | 半血触发替补阈值（hp/max_hp ≤ 此值即换下） |
-| `beacon_target_distance` | non-negative integer | Core 希望与信标保持的曼哈顿距离；0 关闭 |
-| `rally_point` | `[x,y]` or null | 战斗单位人工集结点 |
-| `migration_candidate` | `[x,y]` or null | 工人验证的迁移候选格 |
-| `auto_migrate` | boolean | 候选格通过防守面检查后自动进入迁移模式 |
-| `aggress_vanguards` | non-negative integer | 指定侵略先锋数量；0 使用自动分配 |
-| `aggress_rangers` | non-negative integer | 指定侵略游侠数量；0 使用自动分配 |
-| `lightning_ring` | `[inner_r, outer_r]` | 闪电模式方环（挖空甜甜圈）`inner_r ≤ max(\|x\|,\|y\|) ≤ outer_r`；默认 `[500, 700]`，仅 `mode=lightning` 生效 |
-
-控制文件在每个 Turn 开始时按修改时间热读取。浏览器 Manual 动作仍然按服务器规则优先于 Agent 对同一对象的动作。
-
-## 8. 运行文件
-
-| 文件 | 内容 | 是否应提交 |
-|---|---|---|
-| `.arena_hero_api_key.dpapi` | Windows 加密 Key | 否 |
-| `.arena_hero_agent_status.json` | Dashboard 与 Agent 间的无凭据生命周期状态 | 否 |
-| `.arena_hero_memory.json` | 地图、敌人、编队、编号和累计战术状态 | 否 |
-| `.arena_hero_routes.json` | 当前 Tick 路线和单位快照 | 否 |
-| `.arena_hero_stats.json` | 叠加层统计快照 | 否 |
-| `.arena_hero_control.json` | 当前人工控制 | 否 |
-| `.arena_hero_browser_intel.json` | 短期浏览器地图提示 | 否 |
-| `.arena_hero_recovery_targets.json` | 人工资源恢复/迁移侦察点 | 否 |
-| `arena_hero_telemetry.jsonl` | 每 Tick 决策和事件摘要 | 否 |
-| `arena_hero_events_zh.jsonl` | 脱敏中文事件日志 | 否 |
-| `agent.log`, `agent_err.log` | Agent 后台输出 | 否 |
-| `arena_hero_dashboard*.log`, `arena_hero_overlay*.log` | Dashboard/叠加层输出 | 否 |
-
-记忆、遥测和中文日志会限制文件规模；无需手工轮转即可长期运行。
-
-## 9. 策略热加载
-
-运行中修改 `arena_hero_strategy.py` 后：
-
-1. 第一个观察到修改的 Tick 标记 `strategy_reload_pending=True`。
-2. 下一个 Tick 保存记忆并加载候选模块。
-3. 候选模块加载和状态恢复成功后才替换旧策略。
-4. 新策略运行异常时跳过该 Tick，并在可能时回滚旧策略。
-
-这避免了半写入文件或语法错误直接终止长期进程。修改连接入口 `arena_hero_tactic.py` 时仍需重启。
-
-## 10. 故障排查
-
-### `ProtocolError` 或状态模型字段不匹配
-
-确认虚拟环境中的 SDK 版本：
-
-```powershell
-.\.venv\Scripts\python.exe -c "import arena_hero; print(arena_hero.__version__)"
+```text
+http://127.0.0.1:8766/
 ```
 
-本仓库要求 `>=0.2.9,<0.3`。重新运行 `setup.ps1` 或 `pip install -r requirements.txt`，然后重启 Agent。
-
-### 叠加层无数据
-
-依次检查：
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8765/health
-Invoke-RestMethod http://127.0.0.1:8765/stats
-```
-
-确认扩展已启用、页面域名为 `app.arenahero.io`，并在扩展更新后点击“重新加载”。
-
-### 资源增长慢
-
-先看统计中的 `worker_cargo`、`visible_resource_cells`、`known_resource_cells`、`exploring_workers`、`move_failures` 和 `worker:cargo_stuck`。资源为 0 可能只是刚产兵；载货正在回仓也不等于卡住。不要只根据 Core 当前库存增加工人，必须同时考虑动态人口价格和回本周期。
-
-### Core 门口拥堵
-
-短暂 `cargo_queue_hold` 是主动排队。真正异常通常伴随连续 `UNIT_MOVE_FAILED`、`worker:cargo_stuck` 或载货距离长期不下降。策略会让占据 Core 的单位腾位，并在近端载货进入服务半径时暂停 Core 迁移。
-
-### API Key 无法解密
-
-DPAPI 文件与 Windows 用户绑定。切换账号或机器后运行：
-
-```powershell
-.\set_key.ps1
-```
-
-不要尝试把旧 DPAPI 文件复制到新机器。
+域名和 HTTPS 部署见 [DEPLOYMENT.md](DEPLOYMENT.md)。
