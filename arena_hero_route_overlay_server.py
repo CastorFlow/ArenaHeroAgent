@@ -44,7 +44,7 @@ EMPTY_STATS = {
     "core_shield": 0,
     "core_state": "RESPAWNING",
     "core_position": None,
-    "beacon_position": [0, 0],
+    "beacon_position": None,
     "beacon_status": "UNCLAIMED",
     "visible_enemies": 0,
     "core_threat_count": 0,

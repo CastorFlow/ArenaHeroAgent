@@ -25,6 +25,8 @@ class FakeAgentSupervisor:
         self.key: str | None = None
         self.started = 0
         self.stopped = 0
+        # 真实 AgentSupervisor 有 extra_env，create_server 会往里写数据文件路径。
+        self.extra_env: dict[str, str] = {}
 
     def start(self, api_key: str) -> dict[str, object]:
         self.started += 1

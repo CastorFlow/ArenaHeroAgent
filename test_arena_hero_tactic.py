@@ -2415,5 +2415,132 @@ class AgentLifecycleStatusTests(unittest.TestCase):
             self.assertFalse(path.with_suffix(".json.tmp").exists())
 
 
+class CoreMoveStartFailedTests(unittest.TestCase):
+    """回归：CORE_MOVE_START_FAILED 连续失败时不得死循环重选同一方向。
+
+    历史 bug：_choose_core_migration 调 core.start_move() 后不读回执，
+    服务端拒掉 → 下 tick 重新打分又选同一方向 → 705 tick 死循环，Core 冻在
+    原地被拆。observe() 现在记录失败方向/计数，选向时跳过失败方向，连续
+    失败 ≥3 次放弃 core_target 回落巡逻。
+    """
+
+    def _make_fail_event(self, tick: int) -> ResolutionEvent:
+        return ResolutionEvent(
+            event_id=UUID(int=0xCAF + tick),
+            tick=tick,
+            event_type="CORE_MOVE_START_FAILED",
+            reason_code="MOVE_BLOCKED_TERRAIN",
+            actor_id=None,
+            target_id=None,
+            position=None,
+            values=None,
+        )
+
+    @staticmethod
+    def _migration_ready_memory() -> TacticMemory:
+        """让 choose_actions 穿过造兵/修盾分支、真正进入 core 迁移评分。
+
+        choose_actions 优先造兵：只要 bootstrap 未满 3、比例允许、cap 允许、
+        资源够，就会 spawn 并 return，不进入迁移。测试要让 Core 迁移逻辑跑
+        到，需把这三道门都关上：bootstrap 已满、比例全 0、cap 全 0。
+        """
+        memory = TacticMemory()
+        memory.core_orbit_radius = 550
+        memory.bootstrap_workers_built = 3
+        memory.spawn_ratio = {"ranger": 0, "vanguard": 0, "worker": 0}
+        memory.unit_caps = {"worker": 0, "vanguard": 0, "ranger": 0}
+        return memory
+
+    def test_observe_tracks_core_move_start_failed(self) -> None:
+        # observe() 收到 CORE_MOVE_START_FAILED 时递增计数、记下失败方向。
+        memory = TacticMemory()
+        memory.core_heading = Direction.DOWN  # 上一 tick 选的方向
+        tactic = SmartTactic(memory)
+        turn, _ = make_turn(
+            tick=100,
+            own_core=core((600, 600)),
+            events=(self._make_fail_event(100),),
+        )
+        tactic.memory.observe(turn)
+        self.assertEqual(memory.core_move_fail_count, 1)
+        self.assertEqual(memory.core_last_failed_direction, Direction.DOWN)
+
+    def test_observe_resets_fail_count_on_success(self) -> None:
+        # 任意 CORE_MOVE_* 成功推进事件清零失败计数。
+        memory = TacticMemory()
+        memory.core_move_fail_count = 2
+        memory.core_last_failed_direction = Direction.DOWN
+        tactic = SmartTactic(memory)
+        progress = ResolutionEvent(
+            event_id=UUID(int=0xCAFE),
+            tick=100,
+            event_type="CORE_MOVE_PROGRESS",
+            reason_code=None,
+            actor_id=None,
+            target_id=None,
+            position=None,
+            values=None,
+        )
+        turn, _ = make_turn(
+            tick=100, own_core=core((600, 600)), events=(progress,)
+        )
+        tactic.memory.observe(turn)
+        self.assertEqual(memory.core_move_fail_count, 0)
+        self.assertIsNone(memory.core_last_failed_direction)
+
+    def test_failed_direction_excluded_from_candidates(self) -> None:
+        # 连续失败后，失败方向不得再被选为迁移方向。构造 Core 在远离目标处、
+        # 失败方向恰是朝目标的唯一最优方向 → 该方向被跳过，Core 改选其他方向
+        # 或放弃。关键是：不再无限重选 DOWN。
+        from arena_hero import StartMoveAction
+        memory = self._migration_ready_memory()
+        memory.core_target = (600, 1000)  # 正下方，DOWN 是最优方向
+        memory.core_target_kind = "user"
+        memory.core_heading = Direction.DOWN
+        memory.core_move_fail_count = 1
+        memory.core_last_failed_direction = Direction.DOWN
+        tactic = SmartTactic(memory)
+        turn, _ = make_turn(
+            tick=100,
+            own_core=core((600, 600)),
+            resources=10,
+        )
+        tactic.choose_actions(turn)
+        action = turn.plan.core_action
+        # 若仍是 StartMove，方向不得是刚失败的 DOWN。
+        if isinstance(action, StartMoveAction):
+            self.assertNotEqual(
+                action.direction,
+                Direction.DOWN,
+                "连续失败方向不应被重新选中",
+            )
+
+    def test_fail_streak_abandons_target(self) -> None:
+        # 累计失败 ≥3 次且仍有 target → 放弃 target、清计数，不再 start_move。
+        from arena_hero import StartMoveAction
+        memory = self._migration_ready_memory()
+        memory.core_target = (600, 1000)
+        memory.core_target_kind = "user"
+        memory.core_heading = Direction.DOWN
+        memory.core_move_fail_count = 3
+        memory.core_last_failed_direction = Direction.DOWN
+        tactic = SmartTactic(memory)
+        turn, _ = make_turn(
+            tick=100,
+            own_core=core((600, 600)),
+            resources=10,
+        )
+        tactic.choose_actions(turn)
+        self.assertIsNone(
+            memory.core_target, "连续失败 ≥3 次应放弃 core_target"
+        )
+        self.assertEqual(memory.core_move_fail_count, 0)
+        # Core 不应在本 tick 再次 start_move（放弃后回落巡逻/修盾由上层决定，
+        # 这里至少确认没有朝失败方向死循环）。
+        action = turn.plan.core_action
+        if isinstance(action, StartMoveAction):
+            self.assertNotEqual(action.direction, Direction.DOWN)
+
+
 if __name__ == "__main__":
     unittest.main()

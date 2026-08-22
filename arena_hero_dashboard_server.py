@@ -423,17 +423,37 @@ def create_server(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> DashboardServer:
+    # 解析最终路径（缺省用默认），既给 dashboard 读，也透传给 agent 子进程
+    # 让 strategy 的 _append_battle_history / _append_core_trail 落盘到同一文件。
+    control_path = control_path or Path(".arena_hero_control.json")
+    stats_path = stats_path or Path(".arena_hero_stats.json")
+    telemetry_path = telemetry_path or Path("arena_hero_telemetry.jsonl")
+    battle_path = battle_path or Path("arena_hero_battle_history.jsonl")
+    trail_path = trail_path or Path("arena_hero_core_trail.jsonl")
+    routes_path = routes_path or Path(".arena_hero_routes.json")
+    events_path = events_path or Path("arena_hero_events_zh.jsonl")
+    if agent_supervisor is None:
+        agent_supervisor = AgentSupervisor()
+    # 把 agent 子进程需要写的数据文件路径通过环境变量注入：strategy.py 的
+    # battle_history_path / core_trail_path / control_path 都从 env 读，
+    # 这样 dashboard 读的文件和 tactic 写的文件是同一份。
+    # 无论 supervisor 是这里创建的还是 main() 传入的，都补齐这三项。
+    agent_supervisor.extra_env.update({
+        "ARENA_HERO_CONTROL_FILE": str(control_path.resolve()),
+        "ARENA_HERO_BATTLE_HISTORY_FILE": str(battle_path.resolve()),
+        "ARENA_HERO_CORE_TRAIL_FILE": str(trail_path.resolve()),
+    })
     return DashboardServer(
         (host, port),
         dashboard_dir=dashboard_dir,
-        control_path=control_path or Path(".arena_hero_control.json"),
-        stats_path=stats_path or Path(".arena_hero_stats.json"),
-        telemetry_path=telemetry_path or Path("arena_hero_telemetry.jsonl"),
-        battle_path=battle_path or Path("arena_hero_battle_history.jsonl"),
-        trail_path=trail_path or Path("arena_hero_core_trail.jsonl"),
-        routes_path=routes_path or Path(".arena_hero_routes.json"),
-        events_path=events_path or Path("arena_hero_events_zh.jsonl"),
-        agent_supervisor=agent_supervisor or AgentSupervisor(),
+        control_path=control_path,
+        stats_path=stats_path,
+        telemetry_path=telemetry_path,
+        battle_path=battle_path,
+        trail_path=trail_path,
+        routes_path=routes_path,
+        events_path=events_path,
+        agent_supervisor=agent_supervisor,
     )
 
 
@@ -487,6 +507,9 @@ def main() -> int:
         agent_supervisor=AgentSupervisor(
             status_path=args.agent_status_file,
             startup_timeout=args.agent_start_timeout,
+            # 战况历史 / Core 轨迹路径在 create_server 解析后注入；
+            # 这里先创建 supervisor 占位，路径补丁由 create_server 在
+            # extra_env 中补齐（见 create_server 的 agent_supervisor 分支）。
         ),
         host=args.host,
         port=args.port,

@@ -436,6 +436,10 @@ class TacticMemory:
     last_core_damaged_tick: int = 0
     last_core_destroyed_tick: int = 0
     last_core_respawn_tick: int = 0
+    # Core 单步迁移失败追踪：连续被服务端拒 start_move 的方向 + 计数。
+    # 不持久化——重启后从 0 起，避免旧值干扰；observe() 实时维护。
+    core_move_fail_count: int = 0
+    core_last_failed_direction: Direction | None = None
     last_events: list[dict] = field(default_factory=list)
     last_tick: int = 0
     # 哈雷彗星：派出小队追踪信标或打击自定义坐标的持续任务。
@@ -815,12 +819,16 @@ class TacticMemory:
             memory.core_hold = bool(data.get("core_hold", False))
             raw_core_target = data.get("core_target")
             if isinstance(raw_core_target, list) and len(raw_core_target) == 2:
-                memory.core_target = (
+                target_tuple = (
                     int(raw_core_target[0]),
                     int(raw_core_target[1]),
                 )
-                # 用户从控制文件设的目标 → 到达后应 auto 驻扎。
-                memory.core_target_kind = "user"
+                # (0,0) 是 beacon 未占领时的历史脏默认值，非合法用户目标，清掉
+                # 避免重启后 load 恢复出朝原点跨图死迁移的 target。
+                if target_tuple != (0, 0):
+                    memory.core_target = target_tuple
+                    # 用户从控制文件设的目标 → 到达后应 auto 驻扎。
+                    memory.core_target_kind = "user"
             raw_transfer_mode = data.get("core_transfer_mode", "star")
             if raw_transfer_mode in TRANSFER_MODES:
                 memory.core_transfer_mode = raw_transfer_mode
@@ -1259,12 +1267,30 @@ class TacticMemory:
                 self.last_core_destroyed_tick = turn.tick
                 self.core_heading = None
                 self.last_core_move_tick = 0
+                self.core_move_fail_count = 0
+                self.core_last_failed_direction = None
                 self.clear_comet_state()
             elif event.event_type == "CORE_RESPAWNED":
                 self.last_core_respawn_tick = turn.tick
                 self.core_heading = None
                 self.last_core_move_tick = 0
+                self.core_move_fail_count = 0
+                self.core_last_failed_direction = None
                 self.clear_comet_state()
+            elif event.event_type == "CORE_MOVE_START_FAILED":
+                # Core 单步迁移被服务端拒绝。记录失败方向 + 累计计数，供
+                # _choose_core_migration 对失败方向加罚分、连续失败时剔除，
+                # 避免重复选同一方向形成数百 tick 死循环（Core 冻在原地被拆）。
+                self.core_move_fail_count += 1
+                self.core_last_failed_direction = self.core_heading
+            elif event.event_type in (
+                "CORE_MOVE_STARTED",
+                "CORE_MOVE_SUCCEEDED",
+                "CORE_MOVE_PROGRESS",
+            ):
+                # 任意成功推进即重置失败计数——上一次失败已翻篇。
+                self.core_move_fail_count = 0
+                self.core_last_failed_direction = None
             # 记录战斗事件（供 overlay 快速定位）
             if event.event_type in {
                 "SHOT_HIT",
@@ -1703,9 +1729,15 @@ class TacticMemory:
                     for v in raw_target
                 )
             ):
-                self.core_target = (int(raw_target[0]), int(raw_target[1]))
-                # 用户从控制文件设的目标 → 到达后应 auto 驻扎。
-                self.core_target_kind = "user"
+                target_tuple = (int(raw_target[0]), int(raw_target[1]))
+                # (0,0) 是 beacon 未占领时的历史脏默认值，非合法用户目标，清掉
+                # 避免跨图朝原点死迁移。用户仍可显式设其他任意坐标（含接近原点的点）。
+                if target_tuple == (0, 0):
+                    self.core_target = None
+                else:
+                    self.core_target = target_tuple
+                    # 用户从控制文件设的目标 → 到达后应 auto 驻扎。
+                    self.core_target_kind = "user"
             raw_mode = data.get("core_transfer_mode", "star")
             if raw_mode in TRANSFER_MODES:
                 self.core_transfer_mode = raw_mode
@@ -7490,9 +7522,17 @@ class SmartTactic:
         # 与用户手设 core_target 互斥：御驾亲征开启时无视持久化的 core_target。
         if self.memory.core_pursue_beacon:
             beacon_pos = turn.beacon.position
-            self.memory.core_target = beacon_pos
-            self.memory.core_target_kind = "beacon"
-            core_target = beacon_pos
+            # beacon 位置无效时（未占领/SDK 返回 None）不写 core_target，回落恒星
+            # 巡逻。原点 (0,0) 不应作为迁移目标——历史上 beacon 默认值误传 (0,0)
+            # 致 Core 跨整个地图朝原点死迁移、途中卡死。此处显式排除。
+            if beacon_pos is None or beacon_pos == (0, 0):
+                self.memory.core_target = None
+                self.memory.core_target_kind = "user"
+                core_target = None
+            else:
+                self.memory.core_target = beacon_pos
+                self.memory.core_target_kind = "beacon"
+                core_target = beacon_pos
         else:
             core_target = self.memory.core_target
         if core_target is not None:
@@ -7707,6 +7747,14 @@ class SmartTactic:
                 or planner.final_occupancy(destination) >= 2
             ):
                 continue
+            # 连续迁移失败兜底：刚被服务端拒掉的方向直接跳过，避免每 tick
+            # 重新打分又选回同一方向形成死循环。累计失败 >=3 次视为"当前目标
+            # 走不通"，外层会据此放弃 core_target 回落巡逻/修盾。
+            if (
+                direction == self.memory.core_last_failed_direction
+                and self.memory.core_move_fail_count >= 1
+            ):
+                continue
             # One Core step costs four Ticks. Normalize for fleet size and resist
             # undoing the last step while faster Workers are still catching up.
             if self.memory.core_heading is None:
@@ -7797,6 +7845,27 @@ class SmartTactic:
                 (score, DIRECTION_RANK[direction], direction, destination)
             )
         if not candidates:
+            return
+        # 连续迁移失败兜底：所有方向都被失败方向过滤后 candidates 为空，或
+        # 累计失败 >=3 次（四向都试过仍走不动），放弃当前 core_target，回落
+        # 巡逻/修盾，避免冻在原地几百 tick 被拆。清掉失败计数与 heading
+        # 让下一 tick 重新评估；用户目标若确实不可达，记一条观测供诊断。
+        if self.memory.core_move_fail_count >= 3:
+            self.memory.core_move_fail_count = 0
+            self.memory.core_last_failed_direction = None
+            if self.memory.core_target is not None:
+                self.memory.observations.append(
+                    f"core_target_unreachable target={self.memory.core_target} "
+                    f"abandoning migration"
+                )
+                self.memory.decision_totals[
+                    "core:target_unreachable"
+                ] += 1
+                self.memory.core_target = None
+                self.memory.core_target_kind = "user"
+                decisions.append(
+                    "core abandon_target reason=move_failed_streak"
+                )
             return
         # 闪电模式被战斗单位包围兜底：≥2 个战斗单位从不同方向夹击，且不存在
         # 任何"逃离方向"（比所有战斗单位都远）时，才停下修盾。单个战斗单位
