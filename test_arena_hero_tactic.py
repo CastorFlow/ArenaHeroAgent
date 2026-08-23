@@ -2541,6 +2541,46 @@ class CoreMoveStartFailedTests(unittest.TestCase):
         if isinstance(action, StartMoveAction):
             self.assertNotEqual(action.direction, Direction.DOWN)
 
+    def test_respawn_resets_bootstrap_and_patrol_waypoint(self) -> None:
+        # CORE_RESPAWNED 必须重置引导工人计数 + 清拆前巡逻点：
+        #   - bootstrap_workers_built 持久化在 memory，拆前已 =3；不重置则
+        #     跳过工人引导 → 比例选兵选 RANGER → capacity=10 造不起(12) →
+        #     Core 每 tick 移动不造兵、资源攒着不动(用户观察到的 bug)。
+        #   - lightning_patrol_waypoint 沿用拆前的旧角，重生 Core 位置已变，
+        #     会朝半个地图外的旧角死走。
+        memory = TacticMemory()
+        memory.bootstrap_workers_built = 3
+        memory.lightning_patrol_waypoint = (450, 450)
+        memory.lightning_patrol_phase = 2
+        tactic = SmartTactic(memory)
+        respawn_event = ResolutionEvent(
+            event_id=UUID(int=0xBEEF),
+            tick=100,
+            event_type="CORE_RESPAWNED",
+            reason_code=None,
+            actor_id=None,
+            target_id=None,
+            position=None,
+            values=None,
+        )
+        turn, _ = make_turn(
+            tick=100,
+            own_core=core((600, 600)),
+            events=(respawn_event,),
+        )
+        tactic.memory.observe(turn)
+        self.assertEqual(
+            memory.bootstrap_workers_built,
+            0,
+            "重生后引导工人计数必须清零，前 3 个单位重新固定造工人",
+        )
+        self.assertIsNone(
+            memory.lightning_patrol_waypoint,
+            "重生后清旧巡逻点，让 _lightning_patrol_waypoint 按当前 Core 位置重选最近角",
+        )
+        self.assertEqual(memory.core_heading, None)
+        self.assertEqual(memory.core_move_fail_count, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

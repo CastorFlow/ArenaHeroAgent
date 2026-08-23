@@ -1277,6 +1277,17 @@ class TacticMemory:
                 self.core_move_fail_count = 0
                 self.core_last_failed_direction = None
                 self.clear_comet_state()
+                # 重生 = 新一局开局:重置引导工人计数,让前 3 个单位重新固定
+                # 造工人恢复起手经济。bootstrap_workers_built 持久化在 memory,
+                # 不重置则沿用拆前的 3 → 跳过工人引导 → 落到比例选兵选 RANGER,
+                # 而 resource_capacity=10 时 ranger_cost=12 造不起 → budget 空转,
+                # Core 每 tick 移动不造兵、资源攒着不动(用户观察到的 bug)。
+                self.bootstrap_workers_built = 0
+                # 清拆前的巡逻点:重生 Core 位置已变(SDK 重定位),沿用旧
+                # waypoint 会让它朝半个地图外的旧角死走。waypoint 仍在 corners
+                # 列表里时不触发重选投影,必须显式清 None 让
+                # _lightning_patrol_waypoint 按当前 Core 位置重选最近角。
+                self.lightning_patrol_waypoint = None
             elif event.event_type == "CORE_MOVE_START_FAILED":
                 # Core 单步迁移被服务端拒绝。记录失败方向 + 累计计数，供
                 # _choose_core_migration 对失败方向加罚分、连续失败时剔除，

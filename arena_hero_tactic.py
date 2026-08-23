@@ -348,7 +348,7 @@ def main() -> int:
         print("Stopped by user.", flush=True)
         return 0
     except (AuthenticationError, PolicyViolationError) as exc:
-        _write_agent_status("auth_failed", type(exc).__name__)
+        _write_agent_status("auth_failed", detail=type(exc).__name__)
         print(f"Arena Hero authentication stopped: {type(exc).__name__}", file=sys.stderr)
         return 2
     except ProtocolError:
@@ -359,11 +359,11 @@ def main() -> int:
         )
         return 3
     except TransportError as exc:
-        _write_agent_status("transport_error", type(exc).__name__)
+        _write_agent_status("transport_error", detail=type(exc).__name__)
         print(f"Arena Hero transport failure: {type(exc).__name__}", file=sys.stderr)
         return 4
     except RuntimeError as exc:
-        _write_agent_status("failed", type(exc).__name__)
+        _write_agent_status("failed", detail=type(exc).__name__)
         print(str(exc), file=sys.stderr)
         return 5
     return 0
