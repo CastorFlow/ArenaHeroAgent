@@ -1641,6 +1641,10 @@ class StandoffRelayAndBlindSpotTests(unittest.TestCase):
 
     def test_choose_actions_assigns_relay_ranger_to_standoff(self) -> None:
         # 端到端：对峙僵局 + 未参战游侠 → 它被指派走向盲区换血位，而不是巡逻。
+        # 注：≤4 个游侠时 _ranger_assault_plan 优先把满血游侠编为 2 预瞄(用户要求"2
+        # 预瞄优先 + 剩余突击")，会吃掉 relay 候选。这里用 5 个游侠：2 入编组预瞄 +
+        # 第 3 个突击后，仍剩未参战的满血游侠可被指派为 relay。standoff 与 relay_cell
+        # 不变（静止敌游侠 → 45°盲区对角）。
         memory = TacticMemory()
         tactic = SmartTactic(memory)
         # 先用 4 帧建立敌游侠"原地僵持"的轨迹。
@@ -1654,10 +1658,19 @@ class StandoffRelayAndBlindSpotTests(unittest.TestCase):
             )
             tactic.memory.observe(warm)
         relay_view = ranger((570, 590), UUID(int=0xB030))
+        extra1 = ranger((572, 592), UUID(int=0xB031))
+        extra2 = ranger((574, 594), UUID(int=0xB032))
+        extra3 = ranger((576, 596), UUID(int=0xB033))
         turn, _ = make_turn(
             tick=5,
             own_core=core((560, 600)),
-            units=(ranger((600, 600)), relay_view),
+            units=(
+                ranger((600, 600)),
+                relay_view,
+                extra1,
+                extra2,
+                extra3,
+            ),
             enemies=(enemy_ranger((603, 600)),),
             obstacle_cells=((602, 598),),
         )
@@ -2195,14 +2208,24 @@ class ScoringPreaimAndSoloKillTests(unittest.TestCase):
 
     def test_diagonal_support_ranger_fires_at_original_cell(self) -> None:
         # 建 4 帧相持 + 第三满血游侠站盲区对角格 → 射敌原位 + 计数。
+        # 注：≤4 游侠时 _ranger_assault_plan 优先编满血游侠为 2 预瞄+突击(用户"2 预瞄
+        # 优先 + 剩余突击")，relay 支援游侠须是编组之外的第三方。这里补 3 个 filler
+        # 站在 standoff 近旁(距敌 5 格，>4 不入互瞄环 exclude_ids、但被 assault 编为
+        # 最近 4 人)，使 relay_view 成为编组之外唯一的支援候选 → 被指派、站盲区对角格
+        # 射敌原位。
         memory = TacticMemory()
         tactic = SmartTactic(memory)
         self._observe_standoff_warmup(tactic)
         # 第三游侠站在盲区对角格(600,597):warmup 用 obstacle (602,598) 造盲区。
         relay_view = ranger((600, 597), UUID(int=0xB040))
+        fillers = [
+            ranger((598, 600), UUID(int=0xB050)),
+            ranger((608, 600), UUID(int=0xB051)),
+            ranger((603, 595), UUID(int=0xB052)),
+        ]
         turn, _ = make_turn(
             tick=5, own_core=core((560, 600)),
-            units=(ranger((600, 600)), relay_view),
+            units=(ranger((600, 600)), relay_view, *fillers),
             enemies=(enemy_ranger((603, 600)),),
             obstacle_cells=((602, 598),),
         )
@@ -2219,16 +2242,24 @@ class ScoringPreaimAndSoloKillTests(unittest.TestCase):
 
     def test_diagonal_support_does_not_fire_out_of_range(self) -> None:
         # 回归:支援游侠被指派但站位超射程(距敌原位 6 格,远超游侠射程 3)时,
-        # 不得提交超距 SHOOT(否则服务器判 SHOT_MISSED——看得见命中、实际无效)。
+        # 不得提交超距 SHOT(否则服务器判 SHOT_MISSED——看得见命中、实际无效)。
         # 必须回落到 standoff_relay_advance 推进分支继续走近,而非原地开空枪。
+        # 注：≤4 游侠时 relay 候选被 assault_plan 编组吃掉。补 3 个 filler 站在
+        # standoff 近旁(距敌 5 格)被 assault 编为最近 4 人，使 far_ranger 成为
+        # 编组之外的 relay 支援候选被指派。
         memory = TacticMemory()
         tactic = SmartTactic(memory)
         self._observe_standoff_warmup(tactic)
         # 第三游侠站在 (597,597),距敌原位 (603,600) = max(6,3)=6,既超射程又非 45°对齐。
         far_ranger = ranger((597, 597), UUID(int=0xB041))
+        fillers = [
+            ranger((598, 600), UUID(int=0xB060)),
+            ranger((608, 600), UUID(int=0xB061)),
+            ranger((603, 595), UUID(int=0xB062)),
+        ]
         turn, _ = make_turn(
             tick=5, own_core=core((560, 600)),
-            units=(ranger((600, 600)), far_ranger),
+            units=(ranger((600, 600)), far_ranger, *fillers),
             enemies=(enemy_ranger((603, 600)),),
             obstacle_cells=((602, 598),),
         )
@@ -2252,6 +2283,9 @@ class ScoringPreaimAndSoloKillTests(unittest.TestCase):
     def test_diagonal_support_abandons_dead_chase_and_releases_ranger(self) -> None:
         # 死追保护:支援游侠连续多 tick 被指派却到不了合法射击线(敌每 tick 移动→
         # relay_cell 跟着移)→ 达阈值后冷却该游侠、回落常规分支(动起来),不再死追。
+        # 注：补 3 个 filler 站在 standoff 近旁(距敌 5 格)被 assault 编为最近 4 人，
+        # 使 far_ranger 成为编组之外的 relay 支援游侠被指派
+        # (≤4 游侠时 relay 候选被 assault_plan 编组吃掉)。
         memory = TacticMemory()
         tactic = SmartTactic(memory)
         self._observe_standoff_warmup(tactic)
@@ -2259,10 +2293,15 @@ class ScoringPreaimAndSoloKillTests(unittest.TestCase):
         # 预置:该游侠已连续未开火到阈值-1,再走一帧即触发放弃。
         from arena_hero_strategy import STANDOFF_SUPPORT_MAX_STALL_TICKS
         memory.standoff_support_stall[str(far_ranger.id)] = STANDOFF_SUPPORT_MAX_STALL_TICKS - 1
+        fillers = [
+            ranger((598, 600), UUID(int=0xB070)),
+            ranger((608, 600), UUID(int=0xB071)),
+            ranger((603, 595), UUID(int=0xB072)),
+        ]
         # 敌游侠仍在(603,600)原地相持(relay_cell=(600,597),游侠(570,590)远在外)。
         turn, _ = make_turn(
             tick=5, own_core=core((560, 600)),
-            units=(ranger((600, 600)), far_ranger),
+            units=(ranger((600, 600)), far_ranger, *fillers),
             enemies=(enemy_ranger((603, 600)),),
             obstacle_cells=((602, 598),),
         )

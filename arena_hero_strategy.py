@@ -134,6 +134,25 @@ LIGHTNING_ESCAPE_VISITED_WEIGHT = 3.0  # 逃生期单格 visited 直接惩罚，
 # 的巡逻点位，"朝 goal"="朝自己轨道"，不破坏逃生的"完全忽略目标"语义(目标方向从未
 # 进入触发/结束判定，只在评分并列时作决胜)。
 LIGHTNING_ESCAPE_GOAL_BIAS_WEIGHT = 1.0
+# 卡住/逃生检测的距离下限：单位距 goal 超过此值才算"尚在路上但走不动"，触发生卡住
+# 检测。原值 CORE_BEACON_HYSTERESIS(8) 漏掉"目标格近在 1-7 格内却被障碍挡死"的卡死——
+# 单位四邻全堵、距 goal=3 时 _lightning_step_toward 直接返回 False 走 wait，从不进卡住
+# 分支。降到 2：仅排除"已贴到目标死区内正常待命"，其余被堵/横跳一律进检测。
+LIGHTNING_ESCAPE_NEAR_GOAL = 2
+# 游侠巡逻静止超时：连续此值个 tick 位置不变即强制进一次逃生。兜住四邻全堵、
+# _lightning_step_toward 直接返回 False 不经过卡住检测的极端静默卡死（参照 worker
+# 的 last_position_tick 静止检测）。与 STUCK_TICKS 同值(16)。
+RANGER_STATIONARY_LIMIT = 16
+# 巡逻/逃生评分里"威胁记忆格"的惩罚：逃出敌方视野后短期(THREAT_MEMORY_TICKS)内仍把
+# 敌方战斗单位当时所在格当软障碍，避免工人/Core 逃出视野又沿巡逻一头扎回去再撞见敌人
+# 形成"逃-回-逃"循环。与 visited 项同量级，能压过单格距离差但不会盖过开阔度(5/出口)。
+THREAT_CELL_PATROL_PENALTY = 8.0
+# 威胁记忆持续 tick：逃出视野后该格继续被当软障碍 30 tick；绕过去 + 老化后自然恢复。
+THREAT_MEMORY_TICKS = 30
+# 45°偷袭移动判定：取敌方近 N 帧轨迹，max-norm 跨度 ≥ 此阈值即"持续移动"，放弃 45°
+# 斜角偷袭、改正向/横向最远射程直攻（邻格连续、移动靶难逃出射程或被预瞄罩住）。
+ENEMY_MOBILE_SPAN_TICKS = 2
+ENEMY_MOBILE_SPAN_CELLS = 2
 # 巡逻角障碍密度跳角：目标角周围 5x5（25 格）内已知障碍 > 此值（40%）时，
 # 且单位距角尚远（> 死区*2），视为"角在乱石堆里"，提前推进下一角绕行。
 LIGHTNING_CORNER_OBSTACLE_LIMIT = 10
@@ -573,6 +592,11 @@ class TacticMemory:
     recent_positions: dict[str, list[Position]] = field(default_factory=dict, repr=False)
     enemy_positions: dict[str, Position] = field(default_factory=dict, repr=False)
     enemy_prev: dict[str, Position] = field(default_factory=dict, repr=False)
+    # 威胁记忆：敌方战斗单位(先锋/游侠)当时所在格 → 到期 tick。逃出敌方视野后短期
+    # (THREAT_MEMORY_TICKS)内仍把这些格当软障碍，让工人/Core 巡逻/逃生评分绕开，
+    # 避免逃出视野又沿巡逻一头扎回威胁格再撞见敌人形成"逃-回-逃"循环。瞬态、不持久化
+    # (session 内,同 enemy_trails 先例,repr=False,load/save 不处理)。
+    recent_threat_cells: dict[Position, int] = field(default_factory=dict, repr=False)
     # 敌方轨迹库：每个敌方单位最近 7 帧的位置序列（用于识别 ZIGZAG/LINEAR/CIRCLE
     # 运动规律，替代单帧速度外推）。不持久化——session 内瞬态。
     enemy_trails: dict[str, list[Position]] = field(default_factory=dict, repr=False)
@@ -1587,6 +1611,14 @@ class TacticMemory:
                     trail.append(enemy.position)
                 if len(trail) > self.ENEMY_TRAIL_WINDOW:
                     del trail[: len(trail) - self.ENEMY_TRAIL_WINDOW]
+                # 威胁记忆：敌方战斗单位(先锋/游侠)当前格记入软障碍，到期 tick =
+                # 当前 + THREAT_MEMORY_TICKS。逃出视野后短期内仍被巡逻/逃生评分绕开，
+                # 避免逃出视野又沿巡逻一头扎回威胁格再撞见敌人形成"逃-回-逃"循环。
+                # 工人/Core 无攻击力不计入（只有真能伤我方单位的先锋/游侠算威胁）。
+                if enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}:
+                    self.recent_threat_cells[enemy.position] = (
+                        turn.tick + THREAT_MEMORY_TICKS
+                    )
             if isinstance(enemy, CoreView):
                 self.enemy_prev.pop(eid, None)
         for eid in list(self.enemy_positions):
@@ -1610,6 +1642,15 @@ class TacticMemory:
                 self.recent_positions.pop(uid, None)
                 self.lightning_unit_stuck_counters.pop(uid, None)
                 self.lightning_unit_escape_until.pop(uid, None)
+        # 威胁记忆老化与解除：删过期项(value<=tick)；删已被我方实占的格——
+        # 我方单位已站上该格说明威胁已离开/被清除，继续把自家脚下当软障碍会误伤
+        # 巡逻评分(单位已在威胁原位却仍被惩罚原地不动)。我方 Core 位置也算实占。
+        own_positions = {u.position for u in turn.units}
+        if turn.core is not None:
+            own_positions.add(turn.core.position)
+        for pos in list(self.recent_threat_cells):
+            if self.recent_threat_cells[pos] <= turn.tick or pos in own_positions:
+                self.recent_threat_cells.pop(pos, None)
         # visited 时间衰减：每 100 tick 对所有 visited 乘以 0.95（指数衰减）
         # 老路径 visited 会缓慢衰减（50 → 1000 tick 后 → 25），相对区分度恢复
         if turn.tick % 100 == 0:
@@ -2715,8 +2756,12 @@ class MovementPlanner:
                 if core_position is not None
                 else 0
             )
+            # 威胁记忆硬惩罚：逃出敌方视野后短期(THREAT_MEMORY_TICKS)内，敌方战斗单位
+            # 当时的格仍被记为软障碍。逃向经过该格的方向重罚（+50，同致命靠近量级），
+            # 使逃跑优先选"不经过威胁格"的方向，避免逃出视野又逃回威胁格附近。
+            threat_memory_penalty = 50 if destination in self.memory.recent_threat_cells else 0
             return (
-                self.threat.get(destination, 0),
+                self.threat.get(destination, 0) + threat_memory_penalty,
                 -enemy_distance,
                 -exits,
                 core_distance,
@@ -4119,12 +4164,21 @@ class SmartTactic:
         退避与追击同时开时退避优先（保命优先于抢攻）。优先级低于驻扎（驻扎时本方法
         不被调用——choose_actions 已在 core_hold 处 return）。仅作用于 Core 运动状态
         （恒星巡逻 + star/march/fortify 三种转移模式），驻扎时停驻不进迁移。
+
+        威胁记忆持续化：敌方离视野后，只要 recent_threat_cells 还有未过期威胁格，
+        退避仍返回 "evade"——否则 Core 一旦看不见敌人就立即恢复巡逻、沿轨道一头扎回
+        威胁方向再撞见，形成"退-回-退"循环（与工人逃-回-逃同根因）。趁胜追击风险高、
+        用户没强调，追击保持只看可见敌人（记忆仅用于退避）。
         """
-        if not turn.visible_enemies:
+        has_visible_enemy = bool(turn.visible_enemies)
+        has_threat_memory = any(
+            until > turn.tick for until in self.memory.recent_threat_cells.values()
+        )
+        if not has_visible_enemy and not has_threat_memory:
             return "none"
         if self.memory.core_evade_enemies:
             return "evade"
-        if self.memory.core_chase_enemies:
+        if self.memory.core_chase_enemies and has_visible_enemy:
             return "chase"
         return "none"
 
@@ -5277,13 +5331,17 @@ class SmartTactic:
         if turn.tick >= escape_until:
             if escape_until:
                 self.memory.lightning_unit_escape_until.pop(uid, None)
-            # 卡住检测：距目标尚远（>死区,排除在角附近正常待命）却小范围震荡。
+            # 卡住检测：距目标尚远却小范围震荡。
             # 主判据：窗口内任意格重访次数 ≥ 3（覆盖大环震荡，不只是 2 格 ping-pong）。
-            # 停驻(采集/召回)后刚恢复移动的单位每步都在新格(count=1),不误伤。
+            # 距离阈值用 LIGHTNING_ESCAPE_NEAR_GOAL(=2)：原值 CORE_BEACON_HYSTERESIS(8)
+            # 漏掉"目标格近在 1-7 格内却被障碍挡死"的卡死——四邻全堵、距 goal=3 时
+            # _lightning_step_toward 直接返回 False 走 wait，从不进此分支。降到 2 仅
+            # 排除"已贴目标死区正常待命"。停驻(采集/召回)后刚恢复移动的单位每步在新格
+            # (count=1),不误伤。
             window = recent[-LIGHTNING_ESCAPE_DETECT_WINDOW:]
             if (
                 len(window) >= LIGHTNING_ESCAPE_DETECT_WINDOW
-                and _distance(unit.position, goal) > CORE_BEACON_HYSTERESIS
+                and _distance(unit.position, goal) > LIGHTNING_ESCAPE_NEAR_GOAL
             ):
                 revisit_counts = Counter(window)
                 max_revisits = revisit_counts.most_common(1)[0][1] if revisit_counts else 0
@@ -5343,12 +5401,21 @@ class SmartTactic:
                 # 防止逃生一路往内圈钻。goal 是巡逻点位(在轨道方环上)，故"朝 goal"
                 # 即"朝轨道"，不改变"逃生以开阔度/visited 为主导"的语义。
                 goal_delta = _distance(destination, goal) - _distance(unit.position, goal)
+                # 威胁记忆软惩罚：逃出敌方视野后短期内的威胁格(敌方战斗单位当时所在
+                # 格)在评分里加 THREAT_CELL_PATROL_PENALTY，让逃生方向也绕开它，
+                # 不至于逃生刚结束又一头扎回威胁格附近。与 visited 项同量级。
+                threat_cell_penalty = (
+                    THREAT_CELL_PATROL_PENALTY
+                    if destination in self.memory.recent_threat_cells
+                    else 0.0
+                )
                 score = (
                     -exits * LIGHTNING_ESCAPE_EXIT_WEIGHT
                     + visited_penalty
                     + planner.threat.get(destination, 0) * 4.0
                     + heading_penalty
                     + goal_delta * LIGHTNING_ESCAPE_GOAL_BIAS_WEIGHT
+                    + threat_cell_penalty
                 )
             else:
                 # 方向惯性:掉头反向重罚,保持当前方向无罚,转弯轻罚。单位 1格/tick
@@ -5361,6 +5428,23 @@ class SmartTactic:
                     heading_penalty = 12.0
                 else:
                     heading_penalty = 2.0
+                # 威胁记忆绕行：威胁记忆格挡住朝 goal 直连路径时，单位被迫绕 1 格侧向，
+                # 随后 heading 惯性(掉头12) 锁死绕行方向——一旦朝东绕过，朝南(掉头回 goal)
+                # 永远输给朝东，单位一路远去几十格、距 goal 越来越远(绕行失效)。
+                # 威胁记忆窗口内(unit 周围 6 格内仍有威胁格)整体降低 heading 罚(反向1.0/
+                # 转弯0.3)，让 target_distance 主导：绕过威胁后单位能折返朝 goal 最近格。
+                # 保留小罚防绕行-折返反复横跳(visited 项累积惩罚反复格)。
+                nearby_threat = any(
+                    _distance(unit.position, pos) <= 6 and until > turn.tick
+                    for pos, until in self.memory.recent_threat_cells.items()
+                )
+                if nearby_threat and heading is not None:
+                    if direction == heading:
+                        heading_penalty = 0.0
+                    elif direction == OPPOSITE_DIRECTION[heading]:
+                        heading_penalty = 1.0
+                    else:
+                        heading_penalty = 0.3
                 target_distance = _distance(destination, goal)
                 # visited 惩罚：相对密度(当前格 vs 四邻平均)，防止整条轨道饱和后失去区分度。
                 # 整条巡逻轨道 visited 都是 50 时，局部死角被反复蹭到 55，相对密度 +5 仍会被惩罚。
@@ -5374,11 +5458,35 @@ class SmartTactic:
                 avg_visited = sum(neighbors_visited) / len(neighbors_visited) if neighbors_visited else 0
                 relative_density = visited_count - avg_visited
                 visited_penalty = max(-4.0, min(10.0, relative_density * 0.8))
+                # 威胁记忆软惩罚：逃出敌方视野后短期内的威胁格在巡逻评分里加罚，
+                # 让单位绕开它而非沿巡逻一头扎回再撞见敌人（工人逃-回-逃循环根因）。
+                # 与 visited 项同量级，能压过单格距离差但不会盖过障碍/威胁硬阻断。
+                threat_cell_penalty = (
+                    THREAT_CELL_PATROL_PENALTY
+                    if destination in self.memory.recent_threat_cells
+                    else 0.0
+                )
+                # 绕行时防"背向 goal 一路远去"：当直连邻格被威胁记忆挡住，切向(东/西)
+                # 与背向(北)的 target_distance 常相等(都=当前+1)，heading 惯性 + DIRECTION_RANK
+                # 会让单位一路背向走几十格、失去绕行意义。加一项"走此格是否离 goal 更远"
+                # 的增量(走此格距 goal - 当前距 goal)：切向=0、背向=+1、朝向=-1。权重 1.5
+                # 让它能压过 heading 转弯罚(2.0)的一半但弱于掉头罚(12)，使绕行倾向切向
+                # 而非背向；仅在威胁格挡路时起作用(无威胁时 target_distance 项已主导)。
+                threat_active = any(
+                    _destination(unit.position, d) in self.memory.recent_threat_cells
+                    for d in DIRECTION_ORDER
+                )
+                bypass_backward_penalty = 0.0
+                if threat_active:
+                    goal_delta = _distance(destination, goal) - _distance(unit.position, goal)
+                    bypass_backward_penalty = max(0.0, goal_delta) * 1.5
                 score = (
                     target_distance
                     + planner.threat.get(destination, 0) * 4.0
                     + heading_penalty
                     + visited_penalty
+                    + threat_cell_penalty
+                    + bypass_backward_penalty
                 )
             candidates.append((score, DIRECTION_RANK[direction], direction))
         if not candidates:
@@ -5437,8 +5545,33 @@ class SmartTactic:
         )[2]
 
 
+    def _enemy_is_mobile(
+        self,
+        enemy: UnitView | CoreView,
+        *,
+        span_ticks: int = ENEMY_MOBILE_SPAN_TICKS,
+        threshold: int = ENEMY_MOBILE_SPAN_CELLS,
+    ) -> bool:
+        """敌方是否"持续移动"——近 span_ticks+1 帧轨迹的 max-norm 跨度 ≥ threshold。
 
-
+        45°偷袭遇到移动靶时，支援游侠每 tick 按"目标当前位置"重算最优斜角格会
+        被带跑（目标一动就换方向追、永远不生效）。本方法判定移动后调用方放弃 45°
+        斜角、改正向/横向最远射程直攻（邻格连续、难逃出射程或被预瞄罩住）。
+        Core 无轨迹库，视为静止。轨迹不足返回 False（保守：不动则继续 45°）。
+        """
+        if isinstance(enemy, CoreView):
+            return False
+        trail = self.memory.enemy_trails.get(str(enemy.id), [])
+        if len(trail) < 2:
+            return False
+        recent = trail[-(span_ticks + 1):] if len(trail) >= span_ticks + 1 else trail
+        xs = [p[0] for p in recent]
+        ys = [p[1] for p in recent]
+        span = max(
+            (max(xs) - min(xs)) if xs else 0,
+            (max(ys) - min(ys)) if ys else 0,
+        )
+        return span >= threshold
 
     def _enemy_motion_pattern(self, enemy: UnitView | CoreView) -> str:
         """从敌方 7 帧轨迹库识别运动规律：ZIGZAG / LINEAR / CIRCLE / UNKNOWN。
@@ -6245,31 +6378,54 @@ class SmartTactic:
         turn: Turn,
         standoff: UnitView,
         planner: MovementPlanner,
+        *,
+        mobile: bool = False,
     ) -> Position | None:
         """换血位：敌游侠盲区中距离 3 对角格优先；无盲区回退距离 3 直线格。
 
         无盲区时换血依然成立（用户原则）：站在对方弹道上，对方也不能动
         ——其他位置已被我方瞄准，它动一下就会被射。
+
+        mobile=True（目标持续移动）时反向最远射程(正向/横向)优先于 45°斜角：
+        正向格邻格连续，移动靶难逃出射程或被预瞄游侠罩住；45°斜角每 tick 随目标
+        移动漂移，支援游侠永远追不上、支援失效（用户根因）。
         """
         target = standoff.position
         obstacles = planner.obstacles
         blind = self._enemy_blind_firing_cells(turn, target, obstacles)
-        pool = blind or self._firing_cells(target, obstacles)
+        # 候选池用全部合法射击格(非仅盲区)：移动靶优先正向格时不应被盲区池限制到
+        # "只有对角盲格"→无正向可选→回退对角(失效)。盲区作 blind 优先标签用在排序里。
+        all_firing = self._firing_cells(target, obstacles)
+        pool = all_firing
         diagonal_far = [
             cell
             for cell in pool
             if abs(cell[0] - target[0]) == 3 and abs(cell[1] - target[1]) == 3
         ]
-        if diagonal_far:
-            return min(diagonal_far, key=lambda cell: cell)
+        # 正向/横向最远：必须严格轴向(dx=3,dy=0 或 dx=0,dy=3)，不含 (3,3) 对角格。
+        # 旧 `max(|dx|,|dy|)==3` 会把 (3,3) 对角格也计入 straight_far，mobile=True 时
+        # min(straight_far) 落到字典序最小的对角格 → mobile 标志对 relay 路径完全失效
+        # (仍返回 45°对角格，与 mobile 语义相反)。
         straight_far = [
             cell
             for cell in pool
-            if max(abs(cell[0] - target[0]), abs(cell[1] - target[1])) == 3
+            if (abs(cell[0] - target[0]) == 3 and abs(cell[1] - target[1]) == 0)
+            or (abs(cell[0] - target[0]) == 0 and abs(cell[1] - target[1]) == 3)
         ]
-        if straight_far:
-            return min(straight_far, key=lambda cell: cell)
-        return None
+
+        def _best(cells: list[Position]) -> Position | None:
+            """盲区格优先(stealth)，再按字典序(确定性)。"""
+            if not cells:
+                return None
+            blind_cells = [c for c in cells if c in blind]
+            pool_pref = blind_cells or cells
+            return min(pool_pref, key=lambda c: c)
+
+        # 移动靶：正向最远优先(连续邻格、难逃出)；静止靶：45°斜角优先(盲区偷袭)。
+        primary_far, secondary_far = (
+            (straight_far, diagonal_far) if mobile else (diagonal_far, straight_far)
+        )
+        return _best(primary_far) or _best(secondary_far)
 
     def _find_vanguard_dance_target(
         self, turn: Turn, ranger: Ranger
@@ -6528,6 +6684,8 @@ class SmartTactic:
         target: UnitView,
         planner: MovementPlanner,
         rangers: Iterable[Ranger],
+        *,
+        mobile: bool = False,
     ) -> Position | None:
         """为主动突击选公共射击格：三格 45°优先，其次三格直线。
 
@@ -6536,6 +6694,10 @@ class SmartTactic:
         ""总是不生效""。这里把射击格计算从僵局检测中解耦：只要敌情在
         游侠视野内，就先找可达的三格斜线格；没有再退到三格横/竖线，
         最后才使用任意合法射击格。
+
+        mobile=True（目标持续移动）时正向最远射程优先于 45°斜角：正向格邻格连续，
+        移动靶难逃出射程或被预瞄游侠罩住；45°斜角每 tick 随目标移动漂移，突击游侠
+        永远追不上、突击失效（用户根因）。category 0..5 顺序随 mobile 翻转。
         """
         target_cell = target.position
         all_cells = self._firing_cells(target_cell, planner.obstacles)
@@ -6551,18 +6713,34 @@ class SmartTactic:
             dy = abs(cell[1] - target_cell[1])
             diagonal_far = dx == 3 and dy == 3
             straight_far = (dx == 3 and dy == 0) or (dx == 0 and dy == 3)
-            if diagonal_far and cell in blind_cells:
-                category = 0
-            elif diagonal_far:
-                category = 1
-            elif straight_far and cell in blind_cells:
-                category = 2
-            elif straight_far:
-                category = 3
-            elif cell in blind_cells:
-                category = 4
+            if mobile:
+                # 移动靶：正向最远(blind 优先) → 正向最远 → 45°斜角(blind) → 45°斜角 → 其余。
+                if straight_far and cell in blind_cells:
+                    category = 0
+                elif straight_far:
+                    category = 1
+                elif diagonal_far and cell in blind_cells:
+                    category = 2
+                elif diagonal_far:
+                    category = 3
+                elif cell in blind_cells:
+                    category = 4
+                else:
+                    category = 5
             else:
-                category = 5
+                # 静止靶：45°斜角(盲区偷袭)优先 → 正向最远 → 其余（原行为）。
+                if diagonal_far and cell in blind_cells:
+                    category = 0
+                elif diagonal_far:
+                    category = 1
+                elif straight_far and cell in blind_cells:
+                    category = 2
+                elif straight_far:
+                    category = 3
+                elif cell in blind_cells:
+                    category = 4
+                else:
+                    category = 5
             # 选择离小队整体最近的公共点，避免四人从两侧拉成长蛇。
             nearest = min(
                 (_distance(position, cell) for position in ranger_positions),
@@ -6586,7 +6764,13 @@ class SmartTactic:
         acted_units: set[UUID],
         vacancy_by_id: dict[UUID, Vacancy],
     ) -> RangerAssaultPlan | None:
-        """发现敌情后固定抽取四名游侠，2 预瞄 + 2 主动突击。"""
+        """发现敌情后抽取编组游侠：2 预瞄 + 剩余突击（≤4 人）。
+
+        2 人 → 2 预瞄、0 突击（全员卡撤退路径）；3 人 → 2 预瞄 + 1 突击；
+        4 人 → 2 预瞄 + 2 突击（原行为）。原要求 ≥4 致 2-3 个游侠时编组不成立、
+        其余游侠直接无视敌方单位（如工人）——用户要求按"2 预瞄优先、剩余突击"。
+        fire_cell 按目标是否持续移动(mobile)选正向最远(移动靶)或 45°斜角(静止靶)。
+        """
         eligible = [
             ranger
             for ranger in turn.rangers
@@ -6594,7 +6778,7 @@ class SmartTactic:
             and ranger.id not in acted_units
             and ranger.id not in vacancy_by_id
         ]
-        if len(eligible) < 4:
+        if len(eligible) < 2:
             return None
         targets = [
             enemy
@@ -6624,7 +6808,8 @@ class SmartTactic:
                 ranger.id.bytes,
             ),
         )[:4]
-        fire_cell = self._ranger_assault_fire_cell(turn, target, planner, ordered)
+        mobile = self._enemy_is_mobile(target)
+        fire_cell = self._ranger_assault_fire_cell(turn, target, planner, ordered, mobile=mobile)
         if fire_cell is None:
             return None
         return RangerAssaultPlan(
@@ -6761,12 +6946,16 @@ class SmartTactic:
         ranger: Ranger,
         planner: MovementPlanner,
     ) -> UnitView | None:
-        """少于四名游侠时，也不能对先锋/工人永远原地预瞄。"""
+        """未编入突击编组(2 预瞄 + 剩余突击)的游侠主动进攻目标。
+
+        含 RANGER：原仅先锋/工人致未编组游侠遇敌方游侠无视——与 _ranger_assault_plan
+        的目标集对齐，使游离游侠遇到任何可见敌方战斗/经济单位都主动进攻而非巡逻无视。
+        """
         targets = [
             enemy
             for enemy in turn.visible_enemies
             if isinstance(enemy, UnitView)
-            and enemy.unit_type in {UnitType.VANGUARD, UnitType.WORKER}
+            and enemy.unit_type in {UnitType.RANGER, UnitType.VANGUARD, UnitType.WORKER}
             and _unit_can_see_position(ranger, enemy.position, planner.obstacles)
         ]
         if not targets:
@@ -6788,8 +6977,11 @@ class SmartTactic:
         target: UnitView,
         decisions: list[str],
     ) -> bool:
+        # mobile 须与 _ranger_assault_plan 一致：移动靶选正向最远射程(邻格连续、难逃出)，
+        # 静止靶 45°斜角(盲区偷袭)。漏传 mobile= 默认 False → 游离游侠遇移动敌游侠仍走
+        # 45°漂移格、追不上(同 _ranger_assault_plan 修复的根因)。
         fire_cell = self._ranger_assault_fire_cell(
-            turn, target, planner, (ranger,)
+            turn, target, planner, (ranger,), mobile=self._enemy_is_mobile(target)
         )
         if fire_cell is None:
             return False
@@ -6820,7 +7012,8 @@ class SmartTactic:
         strategic_standoff = self._detect_strategic_standoff(turn)
         standoff = strategic_standoff.enemy if strategic_standoff is not None else None
         standoff_relay_cell = (
-            self._standoff_relay_cell(turn, standoff, planner) if standoff is not None else None
+            self._standoff_relay_cell(turn, standoff, planner, mobile=self._enemy_is_mobile(standoff))
+            if standoff is not None else None
         )
         # 相持触发计数:检出战略相持且能算出换血位即计一次。
         if strategic_standoff is not None and standoff_relay_cell is not None:
@@ -6849,10 +7042,17 @@ class SmartTactic:
         standoff_support_ranger_id: UUID | None = None
         if strategic_standoff is not None and standoff_relay_cell is not None and not t4_imminent:
             # 互瞄环 exclude_ids = 距敌 ≤4 的游侠(已在相持里的)。
+            # 加上已编入 assault_plan 的游侠(2 预瞄 + 突击)，否则 ≤4-5 个游侠时
+            # support_ranger 会选到编组成员、relay 指派与 assault 指派冲突（用户原
+            # "固定四人分工"语义：relay 是编组之外的第三方破局游侠）。
+            assault_assigned: set[UUID] = (
+                set(assault_plan.preaim_ids) | set(assault_plan.assault_ids)
+                if assault_plan is not None else set()
+            )
             exclude_ids = {
                 r.id for r in turn.rangers
                 if _distance(r.position, standoff.position) <= 4
-            }
+            } | assault_assigned
             support_ranger = self._pick_diagonal_support_ranger(
                 turn, strategic_standoff, planner,
                 acted_units=acted_units, vacancy_by_id=vacancy_by_id,
@@ -7078,10 +7278,34 @@ class SmartTactic:
                 eta_claimed_cells.add(goal)
             # goal 为 None(已到轨道点)或等于本格(已在射击位)→ 显式 wait 占位,
             # 防被同环友军抢格;与先锋/工人的 `orbit is not None and not step: wait` 一致。
+            step_attempted = False
             if goal is None or ranger.position == goal:
                 ranger.wait()
-            elif not self._lightning_step_toward(turn, planner, ranger, goal, reason):
-                ranger.wait()
+            else:
+                step_attempted = True
+                if not self._lightning_step_toward(turn, planner, ranger, goal, reason):
+                    ranger.wait()
+            # 游侠巡逻静止超时兜底：**只在确实试图移动却走不动**时触发(goal 非 None/非本位、
+            # _lightning_step_toward 调过)。合法占位(到轨道点 goal=None / 到射击位 goal==position
+            # / 已在合法射击线)不触发——否则会在敌人/轨道稳定期悄悄写 escape_until,等后续
+            # 出现新非 None goal 时 _lightning_step_toward 进逃生分支(忽略 goal 朝开阔走),
+            # 游侠该重新就位却乱跑,破坏战斗/轨道响应。本 tick _lightning_step_toward 因四邻
+            # 全堵直接返回 False 不经过其内部卡住检测 → 这里兜底强制进逃生,脱出障碍口袋。
+            if step_attempted:
+                r_uid = str(ranger.id)
+                last_moved_tick = self.memory.last_position_tick.get(r_uid, turn.tick)
+                if (
+                    turn.tick - last_moved_tick >= RANGER_STATIONARY_LIMIT
+                    and turn.tick >= self.memory.lightning_unit_escape_until.get(r_uid, 0)
+                ):
+                    self.memory.lightning_unit_escape_until[r_uid] = (
+                        turn.tick + LIGHTNING_ESCAPE_DURATION_TICKS
+                    )
+                    self.memory.decision_totals["ranger:patrol_escape_forced"] += 1
+                    decisions.append(
+                        f"ranger:{_short_id(ranger.id)} patrol_escape_forced "
+                        f"stationary={turn.tick - last_moved_tick}"
+                    )
             decisions.append(f"ranger:{_short_id(ranger.id)} {reason} goal={goal}")
             self.memory.decision_totals[f"{reason}"] += 1
             acted_units.add(ranger.id)
@@ -7824,7 +8048,26 @@ class SmartTactic:
             # 权重 3.0：一格距离变化 ±3 分，与 heading_penalty(1~8)、visited(≤8) 同量级，
             # 足以改变方向选择但不会压过障碍/威胁(×20)与致命靠近(50)。
             enemy_bias_score = 0.0
-            if enemy_bias in ("evade", "chase") and turn.visible_enemies:
+            if enemy_bias == "evade":
+                # 退避：可见敌人优先；敌人离视野后用 recent_threat_cells 的威胁记忆格作
+                # 威胁点算最近距离，让 evade 偏置在记忆期内仍生效，Core 继续绕开威胁格
+                # 而不是立即恢复巡逻一头扎回去（_core_enemy_bias 在记忆期维持 evade）。
+                threat_points = (
+                    [enemy.position for enemy in turn.visible_enemies]
+                    or [pos for pos, until in self.memory.recent_threat_cells.items() if until > turn.tick]
+                )
+                if threat_points:
+                    nearest_after = min(
+                        _distance(destination, p) for p in threat_points
+                    )
+                    nearest_before = min(
+                        _distance(core.position, p) for p in threat_points
+                    )
+                    delta = nearest_after - nearest_before
+                    # 远离加分（delta>0 时减分，使该方向更优）。
+                    enemy_bias_score = -max(0.0, delta) * 3.0
+            elif enemy_bias == "chase" and turn.visible_enemies:
+                # 追击只看可见敌人（记忆用于退避，追击风险高不沿用）。
                 nearest_enemy_after = min(
                     _distance(destination, enemy.position)
                     for enemy in turn.visible_enemies
@@ -7834,12 +8077,8 @@ class SmartTactic:
                     for enemy in turn.visible_enemies
                 )
                 delta = nearest_enemy_after - nearest_enemy_before
-                if enemy_bias == "evade":
-                    # 远离加分（delta>0 时减分，使该方向更优）。
-                    enemy_bias_score = -max(0.0, delta) * 3.0
-                else:  # chase
-                    # 靠近加分（delta<0 时减分）。
-                    enemy_bias_score = min(0.0, delta) * 3.0
+                # 靠近加分（delta<0 时减分）。
+                enemy_bias_score = min(0.0, delta) * 3.0
             score = (
                 target_distance
                 + planner.threat.get(destination, 0) * 20
