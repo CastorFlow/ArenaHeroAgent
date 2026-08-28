@@ -262,8 +262,11 @@ def play(
                     accepted=False,
                     error=exc.error,
                 )
+                current = exc.details.get("current_tick")
+                current_str = f" current_tick={current}" if current is not None else ""
                 print(
-                    f"tick={turn.tick} rejected={exc.error} status={exc.status_code}",
+                    f"tick={turn.tick} rejected={exc.error} status={exc.status_code}"
+                    f"{current_str}",
                     flush=True,
                 )
                 continue
