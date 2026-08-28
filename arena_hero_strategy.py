@@ -232,6 +232,17 @@ VANGUARD_DANCE_ENGAGE_RADIUS = 3
 CORE_DIRECTION_COMMIT_TICKS = 8
 # 射失后的短期记忆：避免对同一敌人和同一格连续浪费行动。
 RANGER_SHOT_MISS_MEMORY_TICKS = 8
+# —— eta() 寻路预算与兜底（防单 turn 决策超出服务器 15s 命令窗口）——
+# 服务器每 tick 固定 15s 窗口(references/reference-numbers.md)。choose_actions 里
+# _lightning_plan_triage/_funnel 对 vacancy×ranger、block×worker 各调一次 planner.eta(),
+# 每次跑一趟完整 A*;敌方拉开战线后单次寻路随距离平方级变贵,历史上曾把单 turn
+# 从 15s 顶到 33s → 全 409 TICK_MISMATCH。三道防线:
+#   ① turn 级 eta 缓存去重(planner 每 turn 新建,天然隔离);
+#   ② 估算专用较小 max_expansions(eta 只用于排序/比较,不需要精确路径);
+#   ③ 墙钟软预算:超过后 eta 直接退化为曼哈顿距离,结构上保证决策不超窗。
+# 兜底触发时行为退化(估算变粗)但绝不超时——严格优于"静默 33s 后全 409"。
+ETA_ESTIMATE_MAX_EXPANSIONS = 4000
+ETA_DEADLINE_BUDGET_S = 10.0
 REFILL_PROBE_MAX_DISTANCE = 40
 REFILL_PROBE_BACKTRACK_DISTANCE = 12
 REFILL_PROBE_CORE_LEASH_DISTANCE = 24
@@ -2593,6 +2604,15 @@ class MovementPlanner:
             self.occupancy[turn.core.position] += 1
         self.departures: Counter[Position] = Counter()
         self.arrivals: Counter[Position] = Counter()
+        # turn 级 eta 缓存(key=(unit.position, goal))。planner 每 turn 新建 → 天然
+        # turn 隔离。所有 eta 调用都发生在 _lightning_prepare_plan(选动作之前),此时
+        # departures/arrivals 仍为空、_blocked 稳定,故缓存值在整个规划阶段一致。
+        # key 用 unit.position:_blocked 的唯一每单位差异是"不挡自己所在格",而同 key
+        # 的 position 相同 → blocked 集相同 → 结果相同。仅 avoid 为空时缓存。
+        self._eta_cache: dict[tuple[Position, Position], int] = {}
+        # 墙钟软预算起点:超过 ETA_DEADLINE_BUDGET_S 后 eta 退化为曼哈顿距离,
+        # 结构上保证单 turn 决策不撞服务器 15s 命令窗口。
+        self._turn_start = time.perf_counter()
 
     def final_occupancy(self, position: Position) -> int:
         return self.occupancy[position] - self.departures[position] + self.arrivals[position]
@@ -2723,17 +2743,37 @@ class MovementPlanner:
 
         Dynamic orbital boundaries tell us *which* ring matters; this estimate
         tells relief and funnel planners whether a unit can physically reach it.
+
+        三道防线防单 turn 决策撞服务器 15s 窗口(见 ETA_DEADLINE_BUDGET_S 附近注释):
+        墙钟软预算兜底 → turn 级缓存去重 → 估算专用较小 max_expansions。
         """
         if unit.position == goal:
             return 0
+        manhattan = _distance(unit.position, goal)
+        # ① 墙钟兜底:本 turn 寻路已耗时超预算 → 退化为曼哈顿估算,不再跑 A*。
+        # 估算变粗,但结构上保证决策及时提交(严格优于静默超时 → 全 409)。
+        if time.perf_counter() - self._turn_start > ETA_DEADLINE_BUDGET_S:
+            return manhattan
+        avoid_cells = frozenset(avoid)
+        # ② turn 级缓存去重:同 (unit.position, goal) 只算一次(仅 avoid 为空时,
+        # 覆盖 triage/funnel 全部调用点——它们都不传 avoid)。
+        cache_key = (unit.position, goal)
+        if not avoid_cells and cache_key in self._eta_cache:
+            return self._eta_cache[cache_key]
+        # ③ 估算专用较小 max_expansions:eta 仅用于排序/比较,不需精确路径,
+        # 单次 A* 成本随距离平方级增长时给出硬上限。
         path = _find_path(
             unit.position,
             goal,
-            blocked=self._blocked(unit, goal, frozenset(avoid)),
+            blocked=self._blocked(unit, goal, avoid_cells),
             threat=self.threat,
             visited=self.memory.visited,
+            max_expansions=ETA_ESTIMATE_MAX_EXPANSIONS,
         )
-        return len(path) if path else _distance(unit.position, goal)
+        result = len(path) if path else manhattan
+        if not avoid_cells:
+            self._eta_cache[cache_key] = result
+        return result
 
     def flee_from_combat(
         self,
