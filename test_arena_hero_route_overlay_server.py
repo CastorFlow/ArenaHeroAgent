@@ -157,6 +157,53 @@ class RouteOverlayServerTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=2)
 
+    def test_stats_effective_control_preserves_negative_target(self) -> None:
+        # effective_control 是 strategy 每 tick 写入 stats 的配置回显，其 core_target
+        # 是坐标（允许负数，如用户设 (-100, 99)）。_normalize_stats 透传该 dict 时不能
+        # 用通用非负钳制把负 x 分量钳成 0——否则前端"设负坐标目标 x 显示成 0"。
+        with TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            routes_path = directory_path / ".arena_hero_routes.json"
+            routes_path.write_text("{}", encoding="utf-8")
+            stats_path = directory_path / ".arena_hero_stats.json"
+            stats_path.write_text(
+                json.dumps(
+                    {
+                        "tick": 9,
+                        "effective_control": {
+                            "core_target": [-100, 99],
+                            "core_target_kind": "user",
+                            "core_hold": False,
+                            "core_orbit_radius": 450,
+                            "spawn_ratio": {"ranger": 1, "vanguard": 1, "worker": 3},
+                            "wartime_reserve": 150,
+                            "bootstrap_workers_built": 3,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            server = create_server(routes_path, port=0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            host, port = server.server_address
+            try:
+                with urlopen(f"http://{host}:{port}/stats", timeout=2) as response:
+                    payload = json.load(response)
+                eff = payload["effective_control"]
+                # 负坐标必须原样保留（这是本次修复的核心断言）。
+                self.assertEqual(eff["core_target"], [-100, 99])
+                # 其余配置字段照常透传，不被丢弃。
+                self.assertEqual(eff["core_target_kind"], "user")
+                self.assertEqual(eff["bootstrap_workers_built"], 3)
+                self.assertEqual(eff["core_orbit_radius"], 450)
+                # 比例等本应非负的字段仍归一化保留。
+                self.assertEqual(eff["spawn_ratio"], {"ranger": 1, "vanguard": 1, "worker": 3})
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
     def test_logs_endpoint_returns_sanitized_chinese_entries(self) -> None:
         with TemporaryDirectory() as directory:
             directory_path = Path(directory)

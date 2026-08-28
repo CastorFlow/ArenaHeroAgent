@@ -468,7 +468,7 @@
             <label class="clr-row"><input type="color" data-clr="ranger"><span>游侠</span></label>
             <label class="clr-row"><input type="color" data-clr="vanguard"><span>先锋</span></label>
             <label class="clr-row"><input type="color" data-clr="worker"><span>工人</span></label>
-            <label class="clr-row"><input type="color" data-clr="enemy"><span>敌方（红环）</span></label>
+            <label class="clr-row"><input type="color" data-clr="enemy"><span>敌方单位（统一红）</span></label>
             <label class="clr-row"><input type="color" data-clr="beacon"><span>信标</span></label>
             <label class="clr-row"><input type="color" data-clr="orbit"><span>恒星轨道/轨迹</span></label>
             <label class="clr-row"><input type="color" data-clr="target"><span>目标 X</span></label>
@@ -486,7 +486,7 @@
           <span><span class="dot" data-clr-dot="ranger"></span>游侠</span>
           <span><span class="dot" data-clr-dot="vanguard"></span>先锋</span>
           <span><span class="dot" data-clr-dot="worker"></span>工人</span>
-          <span><span class="dot" data-clr-dot="enemy"></span>敌方(内点=角色色+红环)</span>
+          <span><span class="dot" data-clr-dot="enemy"></span>敌方单位（统一红）</span>
           <span><span class="dot" data-clr-dot="beacon"></span>信标</span>
           <span><span class="dot" data-clr-dot="orbit"></span>━━实走轨迹 ┄┄预设轨道</span>
           <span><span class="dot" data-clr-dot="target"></span>目标/彗星 X</span>
@@ -544,7 +544,7 @@ const MAP_COLOR_DEFAULTS = {
   ranger: "#3987e5",    // 游侠（蓝）
   vanguard: "#e88a26",  // 先锋（橙）
   worker: "#e6c200",    // 工人（黄）
-  enemy: "#e6453f",     // 敌方红环
+  enemy: "#e6453f",     // 敌方单位（统一红）
   beacon: "#ffd700",    // 信标（金）
   orbit: "#fab219",     // 恒星轨道虚线 + 实走轨迹（黄）
   target: "#ff5bc8",    // 目标/彗星 X
@@ -1447,8 +1447,8 @@ function drawMap() {
     });
   }
 
-  // ---- 敌方单位：custom series，内点=对应角色色，外环=红色 ----
-  // type 映射到角色色；CORE 敌核用 enemy 红做内点。
+  // ---- 敌方单位：custom series，统一红色实心点（不再按角色区分内点色） ----
+  // 敌核(Core)稍大以标识战略目标，颜色仍统一红。
   const enemies = (s && s.enemy_units) || [];
   if (enemies.length) {
     const enemyData = enemies.map((e) => ({
@@ -1461,7 +1461,6 @@ function drawMap() {
         const pt = api.coord(api.value(0), api.value(1));
         const e = enemies[params.dataIndex] || {};
         const isCore = e.type === "CORE";
-        const innerColor = isCore ? C.enemy : (C[ROLE_OF[e.type]] || C.enemy);
         const r = isCore ? 7 : 5;
         return {
           type: "group",
@@ -1469,9 +1468,9 @@ function drawMap() {
             // 外环红
             { type: "circle", shape: { cx: pt[0], cy: pt[1], r: r + 3 },
               style: { fill: "transparent", stroke: C.enemy, lineWidth: 2 } },
-            // 内点角色色
+            // 内点统一红（不再按角色取色）
             { type: "circle", shape: { cx: pt[0], cy: pt[1], r },
-              style: { fill: innerColor } },
+              style: { fill: C.enemy } },
           ],
         };
       },

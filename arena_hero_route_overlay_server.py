@@ -425,7 +425,16 @@ def _normalize_stats(payload: Any) -> dict[str, Any]:
                 for item in value[:512]
             ]
         elif isinstance(value, dict):
-            result[key] = _sanitize_dict(value)
+            cleaned = _sanitize_dict(value)
+            # effective_control 是网页控制台配置的运行时回显，其 core_target 是
+            # 坐标（允许负数，如 (-100, 99)）。_sanitize_dict 的通用非负钳制会把
+            # 负 x 分量钳成 0，导致前端"设负坐标目标 x 显示成 0"。这里对
+            # effective_control 的 core_target 用允许负数的 _position_or_none 覆盖。
+            if key == "effective_control" and isinstance(cleaned, dict):
+                target = _position_or_none(value.get("core_target"))
+                if target is not None or value.get("core_target") is None:
+                    cleaned["core_target"] = target
+            result[key] = cleaned
         # 其余类型（None 等）直接丢弃。
     # 闪电模式是唯一支持的顶层策略；忽略旧统计文件中的历史模式值。
     result["mode"] = "lightning"
