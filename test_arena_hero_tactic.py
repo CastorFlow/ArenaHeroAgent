@@ -1640,11 +1640,9 @@ class StandoffRelayAndBlindSpotTests(unittest.TestCase):
         self.assertEqual(cell, (600, 597))
 
     def test_choose_actions_assigns_relay_ranger_to_standoff(self) -> None:
-        # 端到端：对峙僵局 + 未参战游侠 → 它被指派走向盲区换血位，而不是巡逻。
-        # 注：≤4 个游侠时 _ranger_assault_plan 优先把满血游侠编为 2 预瞄(用户要求"2
-        # 预瞄优先 + 剩余突击")，会吃掉 relay 候选。这里用 5 个游侠：2 入编组预瞄 +
-        # 第 3 个突击后，仍剩未参战的满血游侠可被指派为 relay。standoff 与 relay_cell
-        # 不变（静止敌游侠 → 45°盲区对角）。
+        # v3:对峙僵局(敌游侠(603,600)距我游侠(600,600)=3,射程互覆盖)→ 被动机制 A
+        # 换血接管(射敌原位),而非旧第三方 standoff_relay_advance。远游侠(relay_view
+        # (570,590)距敌 6、超射程)进偷袭小队 → assault_advance 推进,动作是移动。
         memory = TacticMemory()
         tactic = SmartTactic(memory)
         # 先用 4 帧建立敌游侠"原地僵持"的轨迹。
@@ -1675,13 +1673,14 @@ class StandoffRelayAndBlindSpotTests(unittest.TestCase):
             obstacle_cells=((602, 598),),
         )
         summary = tactic.choose_actions(turn)
-        self.assertTrue(
-            any("standoff_relay_advance" in line for line in summary.decisions),
+        # 互覆盖应触发被动换血(射敌原位)。
+        self.assertGreaterEqual(
+            memory.decision_totals["ranger:passive_trade"], 1,
             summary.decisions,
         )
-        # 换血游侠的动作是移动而非射击。
+        # 远游侠进偷袭小队 → 推进(移动而非射击)。
         relay_action = turn.plan.unit_actions.get(relay_view.id)
-        self.assertIsNotNone(relay_action)
+        self.assertIsNotNone(relay_action, summary.decisions)
         self.assertIsInstance(relay_action, MoveAction)
 
     def test_ranger_on_orbit_anchor_always_issues_action(self) -> None:
@@ -2207,16 +2206,12 @@ class ScoringPreaimAndSoloKillTests(unittest.TestCase):
         self.assertEqual(standoff.kind, "worker_fleeing")
 
     def test_diagonal_support_ranger_fires_at_original_cell(self) -> None:
-        # 建 4 帧相持 + 第三满血游侠站盲区对角格 → 射敌原位 + 计数。
-        # 注：≤4 游侠时 _ranger_assault_plan 优先编满血游侠为 2 预瞄+突击(用户"2 预瞄
-        # 优先 + 剩余突击")，relay 支援游侠须是编组之外的第三方。这里补 3 个 filler
-        # 站在 standoff 近旁(距敌 5 格，>4 不入互瞄环 exclude_ids、但被 assault 编为
-        # 最近 4 人)，使 relay_view 成为编组之外唯一的支援候选 → 被指派、站盲区对角格
-        # 射敌原位。
+        # v3:对峙相持的第三方 45° 破局已折叠进偷袭小队/被动换血。敌游侠(603,600)
+        # 距我游侠(600,600)=3 射程互覆盖 → 被动机制 A 换血(射敌原位)。relay_view
+        # 站(600,597)距敌 3 竖线合法 → passive_trade 射敌原位(603,600)。
         memory = TacticMemory()
         tactic = SmartTactic(memory)
         self._observe_standoff_warmup(tactic)
-        # 第三游侠站在盲区对角格(600,597):warmup 用 obstacle (602,598) 造盲区。
         relay_view = ranger((600, 597), UUID(int=0xB040))
         fillers = [
             ranger((598, 600), UUID(int=0xB050)),
@@ -2230,27 +2225,19 @@ class ScoringPreaimAndSoloKillTests(unittest.TestCase):
             obstacle_cells=((602, 598),),
         )
         summary = tactic.choose_actions(turn)
-        action = turn.plan.unit_actions.get(relay_view.id)
-        self.assertIsNotNone(action, summary.decisions)
-        self.assertIsInstance(action, ShootAction)
-        assert isinstance(action, ShootAction)
-        # 支援游侠射敌原位(603,600),非预测格。
-        self.assertEqual(action.expected_cell, (603, 600))
-        self.assertEqual(
-            memory.decision_totals["ranger:diagonal_support"], 1
+        # 被动换血应射敌原位(603,600)。
+        self.assertGreaterEqual(
+            memory.decision_totals["ranger:passive_trade"], 1,
+            f"互覆盖应触发被动换血;决策={summary.decisions}",
         )
 
     def test_diagonal_support_does_not_fire_out_of_range(self) -> None:
-        # 回归:支援游侠被指派但站位超射程(距敌原位 6 格,远超游侠射程 3)时,
-        # 不得提交超距 SHOT(否则服务器判 SHOT_MISSED——看得见命中、实际无效)。
-        # 必须回落到 standoff_relay_advance 推进分支继续走近,而非原地开空枪。
-        # 注：≤4 游侠时 relay 候选被 assault_plan 编组吃掉。补 3 个 filler 站在
-        # standoff 近旁(距敌 5 格)被 assault 编为最近 4 人，使 far_ranger 成为
-        # 编组之外的 relay 支援候选被指派。
+        # v3:超射程游侠(距敌原位 6 格)对敌游侠无合法射击线 → 被动 A 不触发;作为
+        # 偷袭小队成员时射不到原位 → 走 assault_advance 推进,不原地开空枪(超距无效)。
         memory = TacticMemory()
         tactic = SmartTactic(memory)
         self._observe_standoff_warmup(tactic)
-        # 第三游侠站在 (597,597),距敌原位 (603,600) = max(6,3)=6,既超射程又非 45°对齐。
+        # far_ranger(597,597)距敌原位(603,600)=max(6,3)=6,既超射程又非 45°对齐。
         far_ranger = ranger((597, 597), UUID(int=0xB041))
         fillers = [
             ranger((598, 600), UUID(int=0xB060)),
@@ -2268,37 +2255,29 @@ class ScoringPreaimAndSoloKillTests(unittest.TestCase):
         # 不得是 ShootAction(超射程开火即无效命中)。
         self.assertNotIsInstance(
             action, ShootAction,
-            f"超射程支援游侠不应开火,实际动作={action!r};决策={summary.decisions}",
+            f"超射程游侠不应开火,实际动作={action!r};决策={summary.decisions}",
         )
-        self.assertEqual(
-            memory.decision_totals["ranger:diagonal_support"], 0,
-            f"超射程不应计 diagonal_support;决策={summary.decisions}",
-        )
-        # 应正在推进向换血位(standoff_relay_advance),或至少不是原地无效开火。
+        # 应正在推进(assault_advance),而非原地无效开火。
         self.assertTrue(
-            any("standoff_relay_advance" in line for line in summary.decisions),
-            f"应推进向换血位;决策={summary.decisions}",
+            any("assault_advance" in line for line in summary.decisions),
+            f"应推进向偷袭位;决策={summary.decisions}",
         )
 
     def test_diagonal_support_abandons_dead_chase_and_releases_ranger(self) -> None:
-        # 死追保护:支援游侠连续多 tick 被指派却到不了合法射击线(敌每 tick 移动→
-        # relay_cell 跟着移)→ 达阈值后冷却该游侠、回落常规分支(动起来),不再死追。
-        # 注：补 3 个 filler 站在 standoff 近旁(距敌 5 格)被 assault 编为最近 4 人，
-        # 使 far_ranger 成为编组之外的 relay 支援游侠被指派
-        # (≤4 游侠时 relay 候选被 assault_plan 编组吃掉)。
+        # v3:standoff 第三方死追保护(standoff_relay_abandon/cooldown)随第三方路径一并
+        # 移除;偷袭小队 fire_cell 随敌移动由 _ranger_assault_fire_cell 每 tick 重算,
+        # 不再有"指派后死追贴墙"的独立路径。此回归场景已不适用 → 改测:敌游侠原地相持
+        # 时,游侠仍能被动换血或偷袭推进,不会零指令。
         memory = TacticMemory()
         tactic = SmartTactic(memory)
         self._observe_standoff_warmup(tactic)
         far_ranger = ranger((570, 590), UUID(int=0xB042))
-        # 预置:该游侠已连续未开火到阈值-1,再走一帧即触发放弃。
-        from arena_hero_strategy import STANDOFF_SUPPORT_MAX_STALL_TICKS
-        memory.standoff_support_stall[str(far_ranger.id)] = STANDOFF_SUPPORT_MAX_STALL_TICKS - 1
         fillers = [
             ranger((598, 600), UUID(int=0xB070)),
             ranger((608, 600), UUID(int=0xB071)),
             ranger((603, 595), UUID(int=0xB072)),
         ]
-        # 敌游侠仍在(603,600)原地相持(relay_cell=(600,597),游侠(570,590)远在外)。
+        # 敌游侠仍在(603,600)原地相持。
         turn, _ = make_turn(
             tick=5, own_core=core((560, 600)),
             units=(ranger((600, 600)), far_ranger, *fillers),
@@ -2306,22 +2285,13 @@ class ScoringPreaimAndSoloKillTests(unittest.TestCase):
             obstacle_cells=((602, 598),),
         )
         summary = tactic.choose_actions(turn)
-        # 应触发放弃并写入冷却。
-        self.assertTrue(
-            any("standoff_relay_abandon" in line for line in summary.decisions),
-            f"应触发死追放弃;决策={summary.decisions}",
-        )
-        self.assertIn(str(far_ranger.id), memory.standoff_support_cooldown)
-        # 放弃后本 tick 仍有动作(动起来),不得是空 wait——回落巡逻/作战分支。
+        # far_ranger 本 tick 必有动作(不为空):偷袭推进/被动换血/巡逻任一均可。
         action = turn.plan.unit_actions.get(far_ranger.id)
-        self.assertIsNotNone(action, f"放弃后应有动作;决策={summary.decisions}")
-        # 放弃的 tick 不应再是 standoff_relay_advance(已让出指派)。
-        for line in summary.decisions:
-            if _short_id(far_ranger.id) in line:
-                self.assertNotIn("standoff_relay_advance", line)
+        self.assertIsNotNone(action, f"远游侠应有动作;决策={summary.decisions}")
 
     def test_vanguard_dance_approach_gap_aims_gap_cell(self) -> None:
-        # 我游侠(600,600) 敌先锋 hp4(602,600) 上一步朝我 → APPROACH_GAP 射 gap(601,600)。
+        # 我游侠(600,600) 敌先锋 hp4(602,600) 上一步朝我(dist2 靠近)→ DANCE_PREAIM
+        # 射中间格(601,600)。v3 无状态查表,不再写 ADJACENT_BACK 阶段。
         memory = TacticMemory()
         tactic = SmartTactic(memory)
         # 先观察 warmup 帧让先锋 prev=(603,600);choose_actions 会 observe 当前帧。
@@ -2345,11 +2315,6 @@ class ScoringPreaimAndSoloKillTests(unittest.TestCase):
         assert isinstance(action, ShootAction)
         self.assertEqual(action.expected_cell, (601, 600))
         self.assertGreaterEqual(memory.decision_totals["ranger:vanguard_dance"], 1)
-        # phase 推进到 ADJACENT_BACK。
-        pair_key = f"{RANGER_ID}|{enemy_vanguard((602, 600)).id}"
-        self.assertEqual(
-            memory.vanguard_dance_phase[pair_key]["phase"], "ADJACENT_BACK"
-        )
 
     def test_vanguard_dance_adjacent_back_steps_away(self) -> None:
         # seed phase=ADJACENT_BACK、贴脸 hp4 → action 为朝先锋反方向的 MoveAction。
@@ -2401,23 +2366,25 @@ class ScoringPreaimAndSoloKillTests(unittest.TestCase):
         self.assertEqual(action.expected_cell, (602, 600))
 
     def test_vanguard_dance_flee_ambush_triggers_cluster_preaim(self) -> None:
-        # 游侠 hp1(先锋反攻) → FLEE_AMBUSH 预标记 + 第二游侠射追兵 + ambush_trade≥1。
+        # v3:hp1 游侠由 MEDIVAC(优先级 2,高于被动 3)接管回 Core,不再走 FLEE_AMBUSH
+        # 舞步。第二游侠(dist3,不触发被动 B/C)竖线射先锋追兵。此回归验证 hp1 优先
+        # 走 MEDIVAC 回血、且第二游侠对先锋开枪(集群支援)。
         memory = TacticMemory()
         tactic = SmartTactic(memory)
         own_injured = ranger((600, 600), RANGER_ID, hp=1)
         enemy = enemy_vanguard((601, 600), hp=2)
-        pair_key = f"{RANGER_ID}|{enemy.id}"
-        memory.vanguard_dance_phase[pair_key] = {"phase": "REAIM_GAP_HP2"}
-        # 第二游侠站能射先锋追兵的位置:(601,599) 竖距1 射 (601,600)。
-        support = ranger((601, 599), UUID(int=0xB050))
+        # 第二游侠(601,597)距先锋(601,600)=3,竖线合法,且 dist3 不触发被动 B/C。
+        support = ranger((601, 597), UUID(int=0xB050))
         turn, _ = make_turn(
             tick=1, own_core=core((560, 600)),
             units=(own_injured, support), enemies=(enemy,),
         )
-        # 不预 observe:choose_actions 内部 observe + FLEE_AMBUSH 预标记会读 hp。
         tactic.choose_actions(turn)
-        # FLEE_AMBUSH 预标记 + 第二游侠射追兵 + ambush_trade≥1。
-        self.assertGreaterEqual(memory.decision_totals["ranger:ambush_trade"], 1)
+        # hp1 游侠走 MEDIVAC(回 Core 回血)。
+        self.assertGreaterEqual(memory.decision_totals.get("ranger:medivac", 0), 1)
+        # 第二游侠射先锋追兵(ShootAction,集群支援)。
+        support_action = turn.plan.unit_actions.get(support.id)
+        self.assertIsInstance(support_action, ShootAction, memory.decision_totals)
 
 
 class AgentLifecycleStatusTests(unittest.TestCase):

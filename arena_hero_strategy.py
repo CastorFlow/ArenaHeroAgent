@@ -232,11 +232,6 @@ VANGUARD_DANCE_ENGAGE_RADIUS = 3
 CORE_DIRECTION_COMMIT_TICKS = 8
 # 射失后的短期记忆：避免对同一敌人和同一格连续浪费行动。
 RANGER_SHOT_MISS_MEMORY_TICKS = 8
-# 45°支援游侠追逐移动中的 relay_cell(敌每 tick 移动→relay_cell 跟着移)可能永远到不了
-# 合法射击线,陷入"standoff_relay_advance 反复推进却开不了火"的死追(被从巡逻/作战中剥离,
-# 表现为贴墙不动不攻击)。连续未开火达到此阈值即冷却该游侠若干 tick,回落常规分支。
-STANDOFF_SUPPORT_MAX_STALL_TICKS = 4
-STANDOFF_SUPPORT_COOLDOWN_TICKS = 12
 REFILL_PROBE_MAX_DISTANCE = 40
 REFILL_PROBE_BACKTRACK_DISTANCE = 12
 REFILL_PROBE_CORE_LEASH_DISTANCE = 24
@@ -349,7 +344,11 @@ class StrategicStandoff:
 
 @dataclass(frozen=True)
 class RangerAssaultPlan:
-    """四游侠接触编组：两人预瞄、两人共用主动突击位。"""
+    """四游侠接触编组：两人预瞄、两人共用主动突击位。
+
+    preaim_ids 预瞄目标下一格(仅敌未进射程时有效,敌进射程由被动机制 A 接管)。
+    assault_ids 45° 主动换血(满员时机门控见 _execute_ranger_assault)。
+    """
 
     target: UnitView
     fire_cell: Position
@@ -612,9 +611,10 @@ class TacticMemory:
         default_factory=set,
         repr=False,
     )
-    # 游侠单杀先锋舞步状态机: key=f"{ranger_id}|{enemy_vanguard_id}" → phase dict。
-    # 瞬态、不持久化(session 内),repr=False。load/save 不处理(同 enemy_trails 先例)。
-    # phase: "APPROACH_GAP"|"ADJACENT_BACK"|"REAIM_GAP_HP2"|"FLEE_AMBUSH"。
+    # 游侠单杀先锋舞步标记: key=f"{ranger_id}|{enemy_vanguard_id}" → phase dict。
+    # v3 仅写 FLEE_AMBUSH(hp1 逃向集群标记,供其他游侠设伏);其余舞步动作无状态查表
+    # 不写 phase。瞬态、不持久化(session 内),repr=False。load/save 不处理(同 enemy_trails 先例)。
+    # phase: "FLEE_AMBUSH"(仅此一种)。
     vanguard_dance_phase: dict[str, dict] = field(default_factory=dict, repr=False)
     # 本 tick 45°支援指派的游侠 id(瞬态,每 tick choose_actions 开头清空)。
     # 防同一相持一 tick 挑两名支援游侠。
@@ -2492,6 +2492,21 @@ def _enemy_role_priority(enemy: UnitView | CoreView) -> int:
     if isinstance(enemy, CoreView):
         return 2
     return 3
+
+
+def _enemy_rangers_at_cell(turn: Turn, cell: Position) -> int:
+    """同格里敌方游侠数量(仅同格,不扩展相邻)。
+
+    用于判断"敌方游侠主动进射程换血"的火力对比:同格≥2 游侠 = 4血2攻,
+    我方若凑不出对等火力(2*stacked 个满血游侠)就撤退而非换血。
+    """
+    return sum(
+        1
+        for enemy in turn.visible_enemies
+        if isinstance(enemy, UnitView)
+        and enemy.unit_type is UnitType.RANGER
+        and enemy.position == cell
+    )
 
 
 def _build_threat_map(turn: Turn, obstacles: set[Position]) -> Counter[Position]:
@@ -5193,8 +5208,8 @@ class SmartTactic:
 
         严格按 lightning 游侠的多级优先级开火，不另写简陋射原位逻辑：
           1) 游侠单杀先锋舞步(_find_vanguard_dance_target / _resolve_vanguard_dance
-             状态机)：kiting 接战范围内有敌先锋时，先走 APPROACH_GAP→ADJACENT_BACK
-             →REAIM_GAP_HP2→FLEE_AMBUSH 舞步，含后退诱空、预瞄撤退格、集群设伏。
+             无状态查表):kiting 接战范围内有敌先锋时,按 (dist,hp,motion) 出动作
+             (DANCE_BACK 后退 / DANCE_PREAIM 预瞄中间格/撤退格 / FLEE_AMBUSH 逃向集群)。
           2) 打分制预瞄(_ranger_shot_candidates → _score_aim_cells →
              _predicted_enemy_cell → 7帧轨迹库 _enemy_motion_pattern)：对射程内
              敌方单位预测其下一格并瞄那格，按脱靶反馈降分。
@@ -6328,51 +6343,6 @@ class SmartTactic:
             return True
         return cell in friendly_positions
 
-    def _pick_diagonal_support_ranger(
-        self,
-        turn: Turn,
-        standoff: StrategicStandoff,
-        planner: MovementPlanner,
-        *,
-        acted_units: set[UUID],
-        vacancy_by_id: dict,
-        relay_cell: Position | None,
-        exclude_ids: set[UUID],
-    ) -> Ranger | None:
-        """挑满血、未参战、离对峙点最近且未被指派的游侠做 45°支援。
-
-        放宽既有 _distance>3 限制(用户:低限制)——只要不在对峙点本身、未被 ShotLedger
-        占用即可。优先调第三方游侠(不已在互瞄环 exclude_ids 内的),环外无可用则允许
-        任意满血游侠。盲区位优先、无盲区直接取最远对角(_standoff_relay_cell 已落地)。
-        """
-        if relay_cell is None:
-            return None
-        target = standoff.original_cell
-
-        def eligible(ranger: Ranger) -> bool:
-            return (
-                ranger.hp == 2
-                and ranger.id not in acted_units
-                and ranger.id not in vacancy_by_id
-                and ranger.id not in exclude_ids
-                and ranger.id not in self.memory.standoff_support_assigned
-                and str(ranger.id) not in self.memory.standoff_support_cooldown
-                and ranger.position != target
-            )
-
-        all_rangers = [r for r in turn.rangers if eligible(r)]
-        if not all_rangers:
-            return None
-        # 优先选不在互瞄环内的第三方(打破僵局);无则任意满血(低限制)。
-        third_party = [r for r in all_rangers if r.id not in exclude_ids]
-        pool = third_party or all_rangers
-        chosen = min(
-            pool,
-            key=lambda r: (_distance(r.position, relay_cell), r.id.bytes),
-        )
-        self.memory.standoff_support_assigned.add(str(chosen.id))
-        return chosen
-
     def _standoff_relay_cell(
         self,
         turn: Turn,
@@ -6451,6 +6421,174 @@ class SmartTactic:
         pool = tracked or in_range
         return min(pool, key=lambda e: (_distance(ranger.position, e.position), e.id.bytes))
 
+    def _resolve_ranger_passive(
+        self,
+        turn: Turn,
+        planner: MovementPlanner,
+        ranger: Ranger,
+        ledger: ShotLedger,
+        decisions: list[str],
+    ) -> bool:
+        """v3 被动机制(第二节,最高优先级)。返回 True=本游侠已处理(中断主动任务)。
+
+        优先级:逃跑 > 换血 > 单杀舞步动作 > 预瞄。
+          A:敌满血游侠进我方该游侠射程(射程互覆盖)→ 按血量+攻击力判换血/逃。
+          B/C:敌先锋贴脸(dist1)/dist2 趋近 → 单杀舞步表(第五节)。
+        仲裁(规格第二节):
+          A 判逃 → 逃(最高);
+          先锋贴脸(dist1)hp>=3 → DANCE_BACK 后退(撤退类,视同逃,优先于换血);
+          A 判换 → 换血(互覆盖致 B/C 预瞄作废);
+          先锋 dist1-2 其余情形 → DANCE_PREAIM(预瞄中间/撤退格,优先级最低)。
+        hp1 → FLEE_AMBUSH(逃向集群,设伏)。
+        """
+        # FLEE_AMBUSH:本游侠 hp1 → 逃向集群(最高优先级逃跑)。复用 _resolve_vanguard_dance_flee
+        # 保留跨 tick 标记供其他游侠设伏。
+        if ranger.hp <= 1:
+            return self._resolve_vanguard_dance_flee(turn, planner, ranger, decisions)
+
+        obstacles = planner.obstacles
+        # 触发 A:敌满血游侠进射程(射程互覆盖)。
+        enemy_rangers_in_range = [
+            enemy
+            for enemy in turn.visible_enemies
+            if isinstance(enemy, UnitView)
+            and enemy.unit_type is UnitType.RANGER
+            and enemy.hp == 2
+            and _is_legal_ranger_shot(ranger.position, enemy.position, obstacles)
+        ]
+        # A 判定:flee / trade / none(不执行,只算标签供仲裁)。
+        a_target = None
+        a_decision = "none"
+        if enemy_rangers_in_range:
+            a_target = max(
+                enemy_rangers_in_range,
+                key=lambda e: _enemy_rangers_at_cell(turn, e.position),
+            )
+            stacked = _enemy_rangers_at_cell(turn, a_target.position)
+            enemy_effective_hp = stacked * 2
+            our_firepower = sum(
+                r.hp + 1
+                for r in turn.rangers
+                if _is_legal_ranger_shot(r.position, a_target.position, obstacles)
+            )
+            if our_firepower < enemy_effective_hp:
+                a_decision = "flee"
+            elif ledger.can_assign(a_target, predicted=False):
+                a_decision = "trade"
+
+        # 先锋舞步 B/C 判定(只算是否有 dist1+hp>=3 的 DANCE_BACK,优先级高于 trade)。
+        dance_enemy = self._find_vanguard_dance_target(turn, ranger)
+        dance_back_first = (
+            dance_enemy is not None
+            and _distance(ranger.position, dance_enemy.position) == 1
+            and dance_enemy.hp >= 3
+        )
+
+        # 仲裁执行(按优先级):A 逃 > 先锋贴脸 DANCE_BACK > A 换 > 其余舞步 DANCE_PREAIM。
+        if a_decision == "flee":
+            return self._execute_passive_flee(turn, planner, ranger, a_target, decisions)
+        if dance_back_first:
+            # 先锋贴脸 hp>=3 → DANCE_BACK 后退(撤退类优先于换血)。
+            return self._resolve_vanguard_dance(
+                turn, planner, ranger, dance_enemy, ledger, decisions
+            )
+        if a_decision == "trade":
+            cell = a_target.position
+            ranger.shoot(a_target, expected_cell=cell)
+            ledger.assign(ranger, a_target, cell)
+            self._mark_ranger_shot(
+                a_target, cell,
+                blind=ranger.position
+                in self._enemy_blind_firing_cells(turn, cell, obstacles),
+            )
+            decisions.append(
+                f"ranger:{_short_id(ranger.id)} passive_trade "
+                f"target={_short_id(a_target.id)} cell={cell}"
+            )
+            self.memory.decision_totals["ranger:passive_trade"] += 1
+            self.memory.decision_totals["ranger:shot"] += 1
+            return True
+        # A 不触发或火力不足但无 flee_goal → 跑 B/C 单杀舞步(敌先锋 dist1-2)。
+        if dance_enemy is not None:
+            return self._resolve_vanguard_dance(
+                turn, planner, ranger, dance_enemy, ledger, decisions
+            )
+        return False
+
+    def _execute_passive_flee(
+        self, turn, planner, ranger, target, decisions
+    ) -> bool:
+        """被动 A 逃跑:朝远离该敌的安全格移动;退不掉则 wait(不互覆盖换血自杀)。"""
+        flee_goal = self._passive_flee_goal(turn, planner, ranger, target.position)
+        if flee_goal is not None and self._lightning_step_toward(
+            turn, planner, ranger, flee_goal, "ranger_passive_flee"
+        ):
+            decisions.append(
+                f"ranger:{_short_id(ranger.id)} passive_flee "
+                f"target={_short_id(target.id)} goal={flee_goal}"
+            )
+            self.memory.decision_totals["ranger:passive_flee"] += 1
+            return True
+        ranger.wait()
+        decisions.append(
+            f"ranger:{_short_id(ranger.id)} passive_flee_wait "
+            f"target={_short_id(target.id)}"
+        )
+        self.memory.decision_totals["ranger:passive_flee"] += 1
+        return True
+
+    def _passive_flee_goal(
+        self, turn: Turn, planner: MovementPlanner, ranger: Ranger, threat_cell: Position
+    ) -> Position | None:
+        """逃跑目标:优先 Core(安全、可回血),Core 缺失或更靠近威胁时取四邻里
+        离威胁格最远的安全格。"""
+        if turn.core is not None and _distance(
+            turn.core.position, threat_cell
+        ) >= _distance(ranger.position, threat_cell):
+            return turn.core.position
+        safe = [
+            _destination(ranger.position, d)
+            for d in DIRECTION_ORDER
+            if _destination(ranger.position, d) not in planner.obstacles
+            and _destination(ranger.position, d) not in planner.enemy_cells
+        ]
+        if not safe:
+            return None
+        return max(safe, key=lambda c: _distance(c, threat_cell))
+
+    def _resolve_vanguard_dance_flee(
+        self, turn: Turn, planner: MovementPlanner, ranger: Ranger, decisions: list[str]
+    ) -> bool:
+        """FLEE_AMBUSH:hp1 游侠逃向集群(最近友游侠/Core),写跨 tick 标记供其他游侠设伏。
+
+        从 _resolve_ranger_passive 与 _resolve_vanguard_dance 共用,确保 hp1 路径单一。
+        """
+        # 找该游侠正面对的敌先锋(若可见)做配对标记;不可见则仅按 hp1 逃向集群。
+        dance_enemy = self._find_vanguard_dance_target(turn, ranger)
+        pair_key = (
+            f"{ranger.id}|{dance_enemy.id}" if dance_enemy is not None else None
+        )
+        cluster_anchor = self._cluster_anchor(turn, ranger)
+        if cluster_anchor is not None and planner.toward(
+            ranger, cluster_anchor, "vanguard_dance_flee"
+        ):
+            decisions.append(
+                f"ranger:{_short_id(ranger.id)} vanguard_dance FLEE_AMBUSH "
+                f"flee_to={cluster_anchor}"
+            )
+            self.memory.decision_totals["ranger:vanguard_dance"] += 1
+        else:
+            ranger.wait()
+            decisions.append(
+                f"ranger:{_short_id(ranger.id)} vanguard_dance FLEE_AMBUSH wait"
+            )
+        if pair_key is not None:
+            self.memory.vanguard_dance_phase[pair_key] = {
+                "phase": "FLEE_AMBUSH",
+                "flee_tick": turn.tick,
+            }
+        return True
+
     def _resolve_vanguard_dance(
         self,
         turn: Turn,
@@ -6460,151 +6598,126 @@ class SmartTactic:
         ledger: ShotLedger,
         decisions: list[str],
     ) -> bool:
-        """游侠 vs 敌先锋单杀舞步(4 阶段状态机)。返回 True=本游侠已处理。
+        """游侠 vs 敌先锋单杀舞步(第五节表,无状态查表)。返回 True=本游侠已处理。
 
-        APPROACH_GAP(距2预瞄中间格) → ADJACENT_BACK(贴脸hp≥3后退诱空) →
-        REAIM_GAP_HP2(hp2预瞄撤退格) → FLEE_AMBUSH(敌反攻我掉hp1逃向集群+集群设伏)。
-        在 _choose_rangers_lightning 的 legal 射击分支之前介入。
+        纯 (dist, 先锋 hp, 运动 trend) 查表,无跨 tick 阶段:
+          dist1 + hp>=3 -> 后退一格(全堵才还击)
+          dist1 + hp<=2 -> 预瞄撤退格(障碍 -> 其他撤退方向)
+          dist2 + 靠近 -> 预瞄中间格
+          dist2 + hp<=2 + 远离 -> 预瞄撤退格(预测逃到 dist3)
+        dist3 不触发(走编组/预瞄小队)。FLEE_AMBUSH 是唯一跨 tick 标记:
+        本游侠 hp1 -> 逃向集群,供其他游侠设伏(_enemy_is_flee_ambush_pursuer)。
         """
         pair_key = f"{ranger.id}|{enemy_vanguard.id}"
-        phase_state = self.memory.vanguard_dance_phase.get(pair_key)
-        # 无跟踪态时按距离决定是否启动舞步。
-        phase = phase_state["phase"] if phase_state else None
         dist = _distance(ranger.position, enemy_vanguard.position)
 
-        # FLEE_AMBUSH:上一 tick 处于 REAIM_GAP_HP2,本 tick 我游侠掉到 hp1 且先锋仍贴脸可见。
-        if phase == "REAIM_GAP_HP2" and ranger.hp <= 1:
-            phase = "FLEE_AMBUSH"
+        # FLEE_AMBUSH:本游侠 hp1 -> 逃向集群(委托 _resolve_vanguard_dance_flee,
+        # 保留跨 tick 标记供其他游侠设伏;与 _resolve_ranger_passive 共用同一 hp1 路径)。
+        if ranger.hp <= 1:
+            return self._resolve_vanguard_dance_flee(turn, planner, ranger, decisions)
+        # 逃跑游侠已回满血 -> 清配对。
+        phase_state = self.memory.vanguard_dance_phase.get(pair_key)
+        if phase_state and phase_state.get("phase") == "FLEE_AMBUSH" and ranger.hp >= 2:
+            self.memory.vanguard_dance_phase.pop(pair_key, None)
 
-        # 启动判定:无 phase 且距离=2 且先锋上一步朝我 → APPROACH_GAP。
-        if phase is None and dist == 2:
-            prev = self.memory.enemy_prev.get(str(enemy_vanguard.id))
-            if prev is not None and _distance(prev, ranger.position) > dist:
-                phase = "APPROACH_GAP"
-
-        if phase is None:
+        # dist3 不触发单杀舞步(走编组/预瞄小队)。
+        if dist not in (1, 2):
             return False
 
-        # 写回 phase_state(更新 hp/prev 记录)。
-        self.memory.vanguard_dance_phase[pair_key] = {
-            "phase": phase,
-            "enemy_hp_last": enemy_vanguard.hp,
-            "enemy_prev_cell": self.memory.enemy_prev.get(str(enemy_vanguard.id)),
-            "tick": turn.tick,
-        }
+        prev = self.memory.enemy_prev.get(str(enemy_vanguard.id))
+        approaching = prev is None or _distance(prev, ranger.position) > dist
+        retreating = prev is not None and _distance(prev, ranger.position) < dist
 
-        if phase == "APPROACH_GAP":
-            # 预瞄中间格(先锋贴脸必经格)。
+        # dist1 + hp>=3 -> 后退一格(全堵才还击)。
+        if dist == 1 and enemy_vanguard.hp >= 3:
+            back_dir = self._vanguard_dance_back_direction(ranger, enemy_vanguard)
+            if back_dir is not None and self._can_ranger_move_to(
+                turn, planner, ranger, back_dir
+            ):
+                ranger.move(back_dir)
+                decisions.append(
+                    f"ranger:{_short_id(ranger.id)} vanguard_dance DANCE_BACK "
+                    f"retreat={back_dir} target={_short_id(enemy_vanguard.id)}"
+                )
+                self.memory.decision_totals["ranger:vanguard_dance"] += 1
+                return True
+            # 全堵 -> 还击(射先锋原位)。
+            if _is_legal_ranger_shot(
+                ranger.position, enemy_vanguard.position, planner.obstacles
+            ) and ledger.can_assign(enemy_vanguard, predicted=False):
+                cell = enemy_vanguard.position
+                ranger.shoot(enemy_vanguard, expected_cell=cell)
+                ledger.assign(ranger, enemy_vanguard, cell)
+                self._mark_ranger_shot(enemy_vanguard, cell, blind=False)
+                decisions.append(
+                    f"ranger:{_short_id(ranger.id)} vanguard_dance DANCE_BACK "
+                    f"counter target={_short_id(enemy_vanguard.id)} cell={cell}"
+                )
+                self.memory.decision_totals["ranger:vanguard_dance"] += 1
+                self.memory.decision_totals["ranger:shot"] += 1
+                return True
+            # 退不掉也还不了 -> 回退向 Core。
+            if turn.core is not None and planner.toward(
+                ranger, turn.core.position, "vanguard_dance_retreat"
+            ):
+                decisions.append(
+                    f"ranger:{_short_id(ranger.id)} vanguard_dance DANCE_BACK retreat_core"
+                )
+                self.memory.decision_totals["ranger:vanguard_dance"] += 1
+                return True
+            ranger.wait()
+            decisions.append(
+                f"ranger:{_short_id(ranger.id)} vanguard_dance DANCE_BACK wait"
+            )
+            self.memory.decision_totals["ranger:vanguard_dance"] += 1
+            return True
+
+        # 其余舞步动作都是 DANCE_PREAIM(预瞄中间格或撤退格)。
+        # dist2 靠近 / dist2+hp<=2+靠近 -> 预瞄中间格;
+        # dist1+hp<=2 / dist2+hp<=2+远离 -> 预瞄撤退格。
+        preaim_middle = dist == 2 and not retreating
+        if preaim_middle:
             gap = self._vanguard_dance_gap_cell(ranger, enemy_vanguard)
             if gap is not None and _is_legal_ranger_shot(
                 ranger.position, gap, planner.obstacles
-            ):
-                if ledger.can_assign(enemy_vanguard, predicted=True):
-                    ranger.shoot(enemy_vanguard, expected_cell=gap)
-                    ledger.assign(ranger, enemy_vanguard, gap)
-                    self._mark_ranger_shot(enemy_vanguard, gap, blind=False)
-                    decisions.append(
-                        f"ranger:{_short_id(ranger.id)} vanguard_dance APPROACH_GAP "
-                        f"target={_short_id(enemy_vanguard.id)} gap={gap}"
-                    )
-                    self.memory.decision_totals["ranger:vanguard_dance"] += 1
-                    self.memory.decision_totals["ranger:shot"] += 1
-                    self.memory.vanguard_dance_phase[pair_key]["phase"] = "ADJACENT_BACK"
-                    return True
-            return False
-
-        if phase == "ADJACENT_BACK":
-            # 贴脸且先锋 hp≥3 → 其下一动作必进攻,我后退一格让其扑空。
-            if dist <= 1 and enemy_vanguard.hp >= 3:
-                back_dir = self._vanguard_dance_back_direction(ranger, enemy_vanguard)
-                if back_dir is not None and self._can_ranger_move_to(
-                    turn, planner, ranger, back_dir
-                ):
-                    ranger.move(back_dir)
-                    decisions.append(
-                        f"ranger:{_short_id(ranger.id)} vanguard_dance ADJACENT_BACK "
-                        f"retreat={back_dir}"
-                    )
-                    self.memory.decision_totals["ranger:vanguard_dance"] += 1
-                    self.memory.vanguard_dance_phase[pair_key]["phase"] = "REAIM_GAP_HP2"
-                    return True
-                # 被卡 → 回退向 Core。
-                if turn.core is not None and planner.toward(
-                    ranger, turn.core.position, "vanguard_dance_retreat"
-                ):
-                    decisions.append(
-                        f"ranger:{_short_id(ranger.id)} vanguard_dance ADJACENT_BACK retreat_core"
-                    )
-                    self.memory.decision_totals["ranger:vanguard_dance"] += 1
-                    self.memory.vanguard_dance_phase[pair_key]["phase"] = "REAIM_GAP_HP2"
-                    return True
-            # 先锋已掉到 hp2 或离开贴脸 → 跳到 REAIM_GAP_HP2。
-            self.memory.vanguard_dance_phase[pair_key]["phase"] = "REAIM_GAP_HP2"
-            return False
-
-        if phase == "REAIM_GAP_HP2":
-            # 先锋 hp2 → 预判逃跑,预瞄其撤退格(低血 flee 权重已优先 BACKWARD)。
-            if enemy_vanguard.hp <= 2:
-                scored = self._score_aim_cells(
-                    turn, enemy_vanguard, planner, context="default"
-                )
-                legal_scored = [
-                    (cell, score)
-                    for cell, score in scored
-                    if _is_legal_ranger_shot(
-                        ranger.position, cell, planner.obstacles
-                    )
-                ]
-                if legal_scored and ledger.can_assign(enemy_vanguard, predicted=True):
-                    cell = max(
-                        legal_scored,
-                        key=lambda cs: (cs[1], _cell_sort_key(cs[0])),
-                    )[0]
-                    ranger.shoot(enemy_vanguard, expected_cell=cell)
-                    ledger.assign(ranger, enemy_vanguard, cell)
-                    self._mark_ranger_shot(enemy_vanguard, cell, blind=False)
-                    decisions.append(
-                        f"ranger:{_short_id(ranger.id)} vanguard_dance REAIM_GAP_HP2 "
-                        f"target={_short_id(enemy_vanguard.id)} cell={cell}"
-                    )
-                    self.memory.decision_totals["ranger:vanguard_dance"] += 1
-                    self.memory.decision_totals["ranger:shot"] += 1
-                    return True
-            # 先锋没掉到 hp2(仍 hp3+)或无合法撤退格 → 留在 ADJACENT_BACK 继续。
-            self.memory.vanguard_dance_phase[pair_key]["phase"] = "ADJACENT_BACK"
-            return False
-
-        if phase == "FLEE_AMBUSH":
-            # 我游侠掉到 hp1:逃向集群(最近友游侠/Core)。
-            cluster_anchor = self._cluster_anchor(turn, ranger)
-            if cluster_anchor is not None and planner.toward(
-                ranger, cluster_anchor, "vanguard_dance_flee"
-            ):
+            ) and ledger.can_assign(enemy_vanguard, predicted=True):
+                ranger.shoot(enemy_vanguard, expected_cell=gap)
+                ledger.assign(ranger, enemy_vanguard, gap)
+                self._mark_ranger_shot(enemy_vanguard, gap, blind=False)
                 decisions.append(
-                    f"ranger:{_short_id(ranger.id)} vanguard_dance FLEE_AMBUSH "
-                    f"flee_to={cluster_anchor}"
+                    f"ranger:{_short_id(ranger.id)} vanguard_dance DANCE_PREAIM "
+                    f"middle target={_short_id(enemy_vanguard.id)} cell={gap}"
                 )
                 self.memory.decision_totals["ranger:vanguard_dance"] += 1
-            else:
-                ranger.wait()
-                decisions.append(
-                    f"ranger:{_short_id(ranger.id)} vanguard_dance FLEE_AMBUSH wait"
-                )
-            # 其他游侠预瞄追兵必经路 → 由常规打分制 legal 分支处理(先锋追击时上一步
-            # 朝我方友军→approach_forward=True→FORWARD 高分选追兵推进格)。本 tick 其他
-            # 游侠对该先锋开枪由 legal 分支 _enemy_is_flee_ambush_pursuer 计 ambush_trade。
-            # 保留 FLEE_AMBUSH 配对到下一 tick(供其他游侠本 tick 检测);逃跑游侠回 hp2
-            # 或先锋离视野时清掉(见 _find_vanguard_dance_target 启动前的清理 + observe 清理)。
-            self.memory.vanguard_dance_phase[pair_key]["phase"] = "FLEE_AMBUSH"
-            self.memory.vanguard_dance_phase[pair_key]["flee_tick"] = turn.tick
+                self.memory.decision_totals["ranger:shot"] += 1
+                return True
+            # 中间格无合法线 -> 落到通用预瞄(可能选撤退格)。
+        # 预瞄撤退格:dist1+hp<=2 或 dist2+hp<=2+远离,或中间格无合法线时。
+        scored = self._score_aim_cells(
+            turn, enemy_vanguard, planner, context="vanguard_dance"
+        )
+        legal_scored = [
+            (cell, score)
+            for cell, score in scored
+            if _is_legal_ranger_shot(ranger.position, cell, planner.obstacles)
+        ]
+        if legal_scored and ledger.can_assign(enemy_vanguard, predicted=True):
+            cell = max(legal_scored, key=lambda cs: (cs[1], _cell_sort_key(cs[0])))[0]
+            # 撤退格被障碍占 -> _score_aim_cells 已排除障碍候选(走可通行格),
+            # 取最高分即"其他撤退方向"。
+            ranger.shoot(enemy_vanguard, expected_cell=cell)
+            ledger.assign(ranger, enemy_vanguard, cell)
+            self._mark_ranger_shot(enemy_vanguard, cell, blind=False)
+            decisions.append(
+                f"ranger:{_short_id(ranger.id)} vanguard_dance DANCE_PREAIM "
+                f"retreat target={_short_id(enemy_vanguard.id)} cell={cell}"
+            )
+            self.memory.decision_totals["ranger:vanguard_dance"] += 1
+            self.memory.decision_totals["ranger:shot"] += 1
             return True
-
-        # 舞步配对过期清理:逃跑游侠已回满血(hp2)或先锋已不在 kiting 范围 → 清配对。
-        if phase == "FLEE_AMBUSH" and ranger.hp >= 2:
-            self.memory.vanguard_dance_phase.pop(pair_key, None)
-            return False
-
+        # 无合法预瞄格 -> 不接管,落主循环常规分支。
         return False
+
 
     def _vanguard_dance_gap_cell(
         self, ranger: Ranger, enemy: UnitView
@@ -6780,6 +6893,8 @@ class SmartTactic:
         ]
         if len(eligible) < 2:
             return None
+        # 目标集含 VANGUARD:先锋 dist=3 走编组(dist 1-2 由被动机制 B/C 单杀舞步接管,
+        # 见 _resolve_ranger_passive),不排除先锋以免 dist3 先锋无人管。
         targets = [
             enemy
             for enemy in turn.visible_enemies
@@ -6904,10 +7019,17 @@ class SmartTactic:
         ledger: ShotLedger,
         decisions: list[str],
     ) -> bool:
-        """执行突击位：当前能打就打，否则两名游侠向同一格叠加推进。"""
+        """执行偷袭小队位:当前能打就打,否则向 45°/正向 fire_cell 推进叠加。
+
+        满员时机门控(第四节):目标同格 2 叠加游侠 = 4血2攻,1 人换不过 → 偷袭小队
+        需满 2 人才能主动换血;未满员时成员只推进到位不开火(等满员),被动机制仍可
+        在更早分支接管。单游侠/工人/先锋目标(N<=1)1 人即偷袭,不门控。
+        """
         target = assault.target
+        stacked = _enemy_rangers_at_cell(turn, target.position) if target.unit_type is UnitType.RANGER else 1
+        assault_understrength = stacked >= 2 and len(assault.assault_ids) < 2
         if _is_legal_ranger_shot(ranger.position, target.position, planner.obstacles):
-            if ledger.can_assign(target, predicted=False):
+            if not assault_understrength and ledger.can_assign(target, predicted=False):
                 ranger.shoot(target, expected_cell=target.position)
                 ledger.assign(ranger, target, target.position)
                 self._mark_ranger_shot(target, target.position, blind=(
@@ -6929,6 +7051,7 @@ class SmartTactic:
             decisions.append(
                 f"ranger:{_short_id(ranger.id)} assault_advance "
                 f"target={_short_id(target.id)} fire_cell={assault.fire_cell}"
+                f"{' [wait_fill]' if assault_understrength else ''}"
             )
             self.memory.decision_totals["ranger:assault_advance"] += 1
             return True
@@ -6936,6 +7059,7 @@ class SmartTactic:
         decisions.append(
             f"ranger:{_short_id(ranger.id)} assault_wait "
             f"target={_short_id(target.id)} fire_cell={assault.fire_cell}"
+            f"{' [wait_fill]' if assault_understrength else ''}"
         )
         self.memory.decision_totals["ranger:assault_wait"] += 1
         return True
@@ -7038,43 +7162,11 @@ class SmartTactic:
                 f"fire_cell={assault_plan.fire_cell}"
             )
             self.memory.decision_totals["ranger:assault_squad"] += 1
-        standoff_relay_ranger_id: UUID | None = None
-        standoff_support_ranger_id: UUID | None = None
-        if strategic_standoff is not None and standoff_relay_cell is not None and not t4_imminent:
-            # 互瞄环 exclude_ids = 距敌 ≤4 的游侠(已在相持里的)。
-            # 加上已编入 assault_plan 的游侠(2 预瞄 + 突击)，否则 ≤4-5 个游侠时
-            # support_ranger 会选到编组成员、relay 指派与 assault 指派冲突（用户原
-            # "固定四人分工"语义：relay 是编组之外的第三方破局游侠）。
-            assault_assigned: set[UUID] = (
-                set(assault_plan.preaim_ids) | set(assault_plan.assault_ids)
-                if assault_plan is not None else set()
-            )
-            exclude_ids = {
-                r.id for r in turn.rangers
-                if _distance(r.position, standoff.position) <= 4
-            } | assault_assigned
-            support_ranger = self._pick_diagonal_support_ranger(
-                turn, strategic_standoff, planner,
-                acted_units=acted_units, vacancy_by_id=vacancy_by_id,
-                relay_cell=standoff_relay_cell, exclude_ids=exclude_ids,
-            )
-            if support_ranger is not None:
-                standoff_support_ranger_id = support_ranger.id
-                # 推进指派沿用旧字段名(复用既有 standoff_relay_advance 移动分支)。
-                standoff_relay_ranger_id = support_ranger.id
-        # FLEE_AMBUSH 预标记:遍历 REAIM_GAP_HP2 配对,若该游侠本 tick 掉到 hp1
-        # (先锋 hp2 时没逃反攻了我),把配对标 FLEE_AMBUSH,供其他游侠 legal 分支计数
-        # ambush_trade。MEDIVAC 分支会接管该 hp1 游侠回 Core(即"逃向集群"的撤退部分)。
-        for pair_key, state in list(self.memory.vanguard_dance_phase.items()):
-            if state.get("phase") != "REAIM_GAP_HP2":
-                continue
-            pair_ranger_str = pair_key.split("|", 1)[0]
-            pair_ranger = next(
-                (r for r in turn.rangers if str(r.id) == pair_ranger_str), None
-            )
-            if pair_ranger is not None and pair_ranger.hp <= 1:
-                state["phase"] = "FLEE_AMBUSH"
-                state["flee_tick"] = turn.tick
+        # 对峙相持信号保留(_detect_strategic_standoff 命中即"偷袭小队该主动换血"),
+        # 但 v3 把第三方 relay 破局折叠进偷袭小队(_execute_ranger_assault 的 fire_cell),
+        # 不再单独指派编组外第三方游侠。standoff_relay_cell 仅用于 LAST_STAND 盲区位判定。
+        # FLEE_AMBUSH 由 _resolve_ranger_passive/_resolve_vanguard_dance 在游侠 hp1 时直接写
+        # 入 vanguard_dance_phase,供其他游侠 legal 分支 _enemy_is_flee_ambush_pursuer 设伏。
         # 本 tick 同 sector eta_support/funnel_cover 已认领的射击格(防扎堆贴墙)。
         eta_claimed_cells: set[Position] = set()
         for ranger in sorted(turn.rangers, key=_uuid_key):
@@ -7111,7 +7203,13 @@ class SmartTactic:
                     self.memory.decision_totals["ranger:shot"] += 1
                 else:
                     at_home = ranger.position == turn.core.position
-                    if not at_home and not planner.toward(ranger, turn.core.position, "ranger_medivac"):
+                    # 残血撤退复用 _lightning_step_toward(含威胁记忆三件套:
+                    # recent_threat_cells 软障碍 + 绕行降 heading 罚 + 防背向),
+                    # 不走 planner.toward/_find_path(后者不引用威胁记忆,敌人离视野
+                    # 即 threat 归零、A* 直插敌方原火力格 → 逃-回-逃同构循环)。
+                    if not at_home and not self._lightning_step_toward(
+                        turn, planner, ranger, turn.core.position, "ranger_medivac"
+                    ):
                         ranger.wait()
                     decisions.append(f"ranger:{_short_id(ranger.id)} MEDIVAC home={medivac.t_home} gap={medivac.t_medical_gap}")
                     self.memory.decision_totals["ranger:medivac"] += 1
@@ -7119,6 +7217,14 @@ class SmartTactic:
                     # healing phase can spend a resource on it this Tick.
                     if at_home:
                         continue
+                acted_units.add(ranger.id)
+                continue
+            # v3 被动机制(最高优先级,第二节):敌满血游侠进射程→换血/逃;先锋贴脸/dist2
+            # → 单杀舞步动作。命中即中断当前主动任务(assault/dance 分派)。在 MEDIVAC 之后、
+            # assault 分派之前介入。
+            if not t4_imminent and self._resolve_ranger_passive(
+                turn, planner, ranger, ledger, decisions
+            ):
                 acted_units.add(ranger.id)
                 continue
             # 发现敌情后固定四人分工：两名游侠只负责预瞄卡位，另外两名
@@ -7137,52 +7243,13 @@ class SmartTactic:
                 )
                 acted_units.add(ranger.id)
                 continue
-            # Mode B:游侠单杀先锋舞步(在 legal 射击之前介入,T4 核心告急时跳过)。
+            # Mode B:游侠单杀先锋舞步(被动 B/C 的 fallback,被动未接管时介入)。
             if not t4_imminent:
                 dance_enemy = self._find_vanguard_dance_target(turn, ranger)
                 if dance_enemy is not None:
                     if self._resolve_vanguard_dance(
                         turn, planner, ranger, dance_enemy, ledger, decisions
                     ):
-                        acted_units.add(ranger.id)
-                        continue
-            # Mode A:45°支援游侠射敌原位(相持时原位无人瞄)。
-            # 置于通用 legal 之前→支援游侠瞄原位胜出;其他游侠 fall through 走打分制。
-            # 仅当本格已对敌原位有合法射击线(横/竖/45°对角,距离 1-3,无障碍)才开火。
-            # ——旧条件 at_relay(reach 可达 8)允许"近 relay 格但未进合法射击线"就开火,
-            # 导致超射程(距离>3 或非对齐)的 SHOT_MISSED(看得见命中、实际无效)。
-            # 原设计"走不动但本格已有合法射击线"的语义完全由 has_line 覆盖;未到合法线时
-            # 落入下方 standoff_relay_advance 推进分支继续走过去。
-            if (
-                standoff_support_ranger_id == ranger.id
-                and strategic_standoff is not None
-                and standoff_relay_cell is not None
-                and standoff is not None
-            ):
-                support_enemy = standoff
-                contact = contacts_by_id.get(support_enemy.id)
-                # 若该敌是 T4 即将打 Core,让 LAST_STAND 接管(下个 medivac 循环会处理)。
-                if contact is None or not (contact.tier == "T4" and contact.core_eta <= 1):
-                    has_line = _is_legal_ranger_shot(
-                        ranger.position, support_enemy.position, planner.obstacles
-                    )
-                    if has_line and ledger.can_assign(support_enemy, predicted=False):
-                        cell = support_enemy.position
-                        on_blind_cell = ranger.position in self._enemy_blind_firing_cells(
-                            turn, cell, planner.obstacles
-                        )
-                        ranger.shoot(support_enemy, expected_cell=cell)
-                        ledger.assign(ranger, support_enemy, cell)
-                        self._mark_ranger_shot(support_enemy, cell, blind=on_blind_cell)
-                        decisions.append(
-                            f"ranger:{_short_id(ranger.id)} diagonal_support "
-                            f"target={_short_id(support_enemy.id)} "
-                            f"kind={strategic_standoff.kind} cell={cell}"
-                        )
-                        self.memory.decision_totals["ranger:diagonal_support"] += 1
-                        self.memory.decision_totals["ranger:shot"] += 1
-                        # 开火即清零停滞计数(支援生效,不是死追)。
-                        self.memory.standoff_support_stall.pop(str(ranger.id), None)
                         acted_units.add(ranger.id)
                         continue
             if legal:
@@ -7218,42 +7285,9 @@ class SmartTactic:
                 acted_units.add(ranger.id)
                 continue
 
-            # 对峙僵局换血位推进：优先于巡逻/支援移动，但不抢占已有合法射击
-            # （上一分支已 continue）与 MEDIVAC（更早分支已 continue）。
-            # 死追保护:relay_cell 随敌每 tick 移动,支援游侠可能永远到不了合法射击线
-            # → 反复推进却不开火 → 被从巡逻/作战剥离(贴墙不动不攻击)。连续未开火达阈值
-            # 即冷却该游侠若干 tick,回落常规巡逻/作战分支,不再死追移动靶。
-            if (
-                standoff_relay_ranger_id == ranger.id
-                and standoff_relay_cell is not None
-                and ranger.position != standoff_relay_cell
-            ):
-                stall = self.memory.standoff_support_stall.get(str(ranger.id), 0) + 1
-                if stall >= STANDOFF_SUPPORT_MAX_STALL_TICKS:
-                    self.memory.standoff_support_cooldown[str(ranger.id)] = (
-                        turn.tick + STANDOFF_SUPPORT_COOLDOWN_TICKS
-                    )
-                    self.memory.standoff_support_stall.pop(str(ranger.id), None)
-                    self.memory.decision_totals["ranger:standoff_relay_abandon"] += 1
-                    decisions.append(
-                        f"ranger:{_short_id(ranger.id)} standoff_relay_abandon "
-                        f"stall={stall}"
-                    )
-                    # 不 continue:回落下方常规巡逻/作战分支,本 tick 照常动起来。
-                else:
-                    self.memory.standoff_support_stall[str(ranger.id)] = stall
-                    if self._lightning_step_toward(
-                        turn, planner, ranger, standoff_relay_cell, "standoff_relay_advance"
-                    ):
-                        decisions.append(
-                            f"ranger:{_short_id(ranger.id)} standoff_relay_advance "
-                            f"target={_short_id(standoff.id) if standoff else '?'} "
-                            f"cell={standoff_relay_cell}"
-                        )
-                        self.memory.decision_totals["ranger:standoff_relay"] += 1
-                        acted_units.add(ranger.id)
-                        continue
-                    # 走不动(被卡)→ 放弃本 tick 指派,回落常规分支。
+            # v3:对峙僵局破局已折叠进偷袭小队(_execute_ranger_assault 的 fire_cell),
+            # 第三方 relay 推进分支与死追保护一并移除。standoff_relay_cell 仅保留用于
+            # LAST_STAND/legal 分支的盲区位判定。
             relief = relief_by_id.get(ranger.id)
             if relief is not None:
                 goal = relief.fire_position
